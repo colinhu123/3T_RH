@@ -35,7 +35,7 @@ impl Stencil6 {
     
 
     pub fn build_l(&self) -> Array2<f64> {
-        let (lambda,r) = self.build_r();
+        let (_lambda,r) = self.build_r();
         let l = linalg::inverse(&r);
         l
     }
@@ -130,11 +130,11 @@ impl Stencil6 {
             ];
             flux_plus[i] = weno(&stencil);
             let stencil = [
-                tmp1[i][1],
-                tmp1[i][2],
-                tmp1[i][3],
+                tmp1[i][5],
                 tmp1[i][4],
-                tmp1[i][5]
+                tmp1[i][3],
+                tmp1[i][2],
+                tmp1[i][1]
             ];
             flux_minus[i] = weno(&stencil);
         }
@@ -230,3 +230,196 @@ pub fn weno(stencil: &[f64; 5]) -> f64 {
 
     w0*u0 + w1*u1 + w2*u2
 }
+
+
+
+#[cfg(test)]
+mod tests {
+
+use super::*;
+
+
+#[test]
+    fn test_weno5_accuracy()
+    {
+
+        let grids = [
+            40usize,
+            80usize,
+            160usize,
+            320usize
+        ];
+
+
+        let mut errors: Vec<f64> = Vec::new();
+
+
+        for &nx in grids.iter()
+        {
+
+            let dx =
+                2.0*std::f64::consts::PI
+                /(nx as f64);
+
+
+            let mut error = 0.0;
+
+            let mut count = 0;
+
+
+
+            for j in 3..nx-3
+            {
+
+                let x =
+                    j as f64 * dx;
+
+
+                let stencil = [
+                    (x-2.0*dx).sin(),
+                    (x-dx).sin(),
+                    x.sin(),
+                    (x+dx).sin(),
+                    (x+2.0*dx).sin(),
+                ];
+
+
+                let numerical =
+                    weno(&stencil);
+
+
+                let exact =
+                    (x+0.5*dx).sin();
+
+
+
+                error +=
+                    (numerical-exact).abs();
+
+
+                count +=1;
+
+            }
+
+
+            errors.push(
+                error/(count as f64)
+            );
+
+        }
+
+
+
+        println!("errors = {:?}", errors);
+
+
+
+        // calculate convergence orders
+
+        let mut orders = Vec::new();
+
+
+        for i in 1..errors.len()
+        {
+
+            let order =
+                (errors[i-1]/errors[i])
+                .log2();
+
+
+            orders.push(order);
+
+        }
+
+
+        println!("orders = {:?}", orders);
+
+
+
+        // Ignore the first order because coarse grid
+        // may not be in asymptotic region
+
+        for order in orders.iter().skip(1)
+        {
+
+            assert!(
+                *order > 4.5,
+                "WENO order too low: {}",
+                order
+            );
+
+        }
+
+    }
+
+
+
+#[test]
+fn test_weno_constant()
+{
+
+let stencil=[
+    5.0,
+    5.0,
+    5.0,
+    5.0,
+    5.0
+];
+
+
+let result=weno(&stencil);
+
+
+assert!(
+    (result-5.0).abs()<1e-12
+);
+
+
+}
+
+#[test]
+fn test_eigen_inverse()
+{
+
+    let state =
+    state::State{
+        rho:1.0,
+        mom:0.5,
+        ee:3.0,
+        ei:2.0,
+        er:1.0,
+    };
+
+
+    let stencil =
+    Stencil6{
+        points:[
+            state,
+            state,
+            state,
+            state,
+            state,
+            state,
+        ]
+    };
+
+    let l = stencil.build_l();
+    let (_,r) = stencil.build_r();
+    let identity = l.dot(&r);
+
+    for i in 0..5 {
+        for j in 0..5 {
+            if i==j {
+                assert!((identity[[i,j]]-1.0).abs()<1e-10);
+            }
+            else {
+                assert!(identity[[i,j]].abs()<1e-10);
+            }
+
+        }
+
+    }
+
+}
+}
+

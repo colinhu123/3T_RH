@@ -1,7 +1,12 @@
+use ndarray::{Array1};
+
 pub const CVE: f64 = 1.0;
 pub const CVI: f64 = 1.0;
 pub const A  : f64 = 1.0;
 
+pub const GAMMA_I: f64 = 5.0/3.0;
+pub const GAMMA_E: f64 = 5.0/3.0;
+pub const GAMMA_R: f64 = 4.0/3.0;
 #[derive(Clone,Copy,Debug)]
 pub struct State {
     pub rho: f64,
@@ -12,6 +17,15 @@ pub struct State {
 }
 
 impl State {
+    pub fn new() -> Self {
+        Self {
+            rho: 0.0,
+            mom: 0.0,
+            ee: 0.0,
+            ei: 0.0,
+            er: 0.0,
+        }
+    }
     pub fn pressure_tot(&self) -> f64 {
         let pe = 2.0/3.0 * self.rho * self.ee;
         let pi = 2.0/3.0 * self.rho * self.ei;
@@ -55,6 +69,33 @@ impl State {
         let u = self.mom/self.rho;
         let er = self.er/self.rho - u*u/(6.0*self.rho);
         return (er*self.rho/A).powf(0.25);
+    }
+
+    pub fn roe_ave(&self, state: State) -> Self {
+        let rho1 = self.rho;
+        let rho2 = state.rho;
+        let denom = rho1 + rho2;
+        Self {
+            rho: (self.rho*rho1 +state.rho*rho2)/denom,
+            mom: (self.mom*rho1 + state.mom*rho2)/denom,
+            ee: (self.ee*rho1 + state.ee*rho2)/denom,
+            ei: (self.ei* rho1 + state.ei*rho2)/denom,
+            er: (self.er * rho1 + state.er * rho2) / denom,
+        }
+    }
+
+    pub fn state2arr(&self) -> [f64; 5] {
+        [self.rho, self.mom, self.ee, self.ei, self.er]
+    }
+
+    pub fn arr2state(arr: Array1<f64>) -> Self {
+        Self {
+            rho:arr[0],
+            mom: arr[1],
+            ee: arr[2],
+            ei: arr[3],
+            er: arr[4],
+        }
     }
 }
 

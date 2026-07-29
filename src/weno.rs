@@ -4,7 +4,7 @@ use crate::linalg;
 use crate::utils;
 
 pub struct Stencil6 {
-    points: [state::State; 6],
+    pub points: [state::State; 6],
 
 }
 
@@ -420,6 +420,34 @@ fn test_eigen_inverse()
 
     }
 
+}
+
+#[test]
+fn test_constant_state_preserving(){
+    let state =
+    state::State{
+        rho:1.0,
+        mom:0.5,
+        ee:3.0,
+        ei:2.0,
+        er:1.0,
+    };
+
+
+    let stencil =
+    Stencil6{
+        points:[
+            state,
+            state,
+            state,
+            state,
+            state,
+            state,
+        ]
+    };
+
+    let ans = stencil.reconstruction();
+    assert!(ans.mom == 1.0);
 }
 }
 

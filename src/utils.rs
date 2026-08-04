@@ -1,1 +1,1 @@
-pub const MAX_ITER: usize = 600;
+pub const DEFAULT_EPS: f64 = 1e-12;

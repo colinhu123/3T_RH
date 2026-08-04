@@ -1,6 +1,6 @@
 use crate::state;
 use ndarray::{Array1,Array2,array};
-use crate::linalg;
+use ndarray_linalg::Inverse;
 use crate::utils;
 
 pub struct Stencil6 {
@@ -14,12 +14,21 @@ impl Stencil6 {
     pub fn build_a(&self)->Array2<f64> {
         let state1 = self.points[3];
         let state2 = self.points[2];
-        let state_roe_ave = state2.roe_ave(state1);
-        let rho = state_roe_ave.rho;
-        let u = state_roe_ave.mom/rho;
-        let ee = state_roe_ave.ee/rho - rho*u*u/6.0;
-        let ei = state_roe_ave.ei/rho - rho*u*u/6.0;
-        let er = state_roe_ave.er/rho - rho*u*u/6.0;
+        let u1 = state1.mom/state1.rho;
+        let u2 = state2.mom/state2.rho;
+        let ee1 = state1.ee/state1.rho - u1*u1/6.0;
+        let ei1 = state1.ei/state1.rho - u1*u1/6.0;
+        let er1 = state1.er/state1.rho - u1*u1/6.0;
+        let ee2 = state2.ee/state2.rho - u2*u2/6.0;
+        let ei2 = state2.ei/state2.rho - u2*u2/6.0;
+        let er2 = state2.er/state2.rho - u2*u2/6.0;
+        let rho1 = state1.rho;
+        let rho2 = state2.rho;
+
+        let u = (u1*rho1 + u2*rho2)/(rho1+rho2);
+        let ee = (ee1*rho1 + ee2*rho2)/(rho1 + rho2);
+        let ei = (ei1*rho1 + ei2*rho2)/(rho1+rho2);
+        let er = (er1*rho1 + er2*rho2)/ (rho1+rho2);
 
         let gamma_sum = state::GAMMA_E + state::GAMMA_I + state::GAMMA_R;
 
@@ -36,18 +45,50 @@ impl Stencil6 {
 
     pub fn build_l(&self) -> Array2<f64> {
         let (_lambda,r) = self.build_r();
-        let l = linalg::inverse(&r);
+        let l = r.inv().unwrap();
         l
     }
 
     pub fn build_r(&self)-> (Array1<f64>,Array2<f64>) {
-        let (lambda, r) = linalg::eigen_qr(&self.build_a(), utils::MAX_ITER);
-        (lambda,r)
+        let state1 = self.points[3];
+        let state2 = self.points[2];
+        let u1 = state1.mom/state1.rho;
+        let u2 = state2.mom/state2.rho;
+        let ee1 = state1.ee/state1.rho - u1*u1/6.0;
+        let ei1 = state1.ei/state1.rho - u1*u1/6.0;
+        let er1 = state1.er/state1.rho - u1*u1/6.0;
+        let ee2 = state2.ee/state2.rho - u2*u2/6.0;
+        let ei2 = state2.ei/state2.rho - u2*u2/6.0;
+        let er2 = state2.er/state2.rho - u2*u2/6.0;
+        let rho1 = state1.rho.sqrt();
+        let rho2 = state2.rho.sqrt();
+
+        let u = (u1*rho1 + u2*rho2)/(rho1+rho2);
+        let ee = (ee1*rho1 + ee2*rho2)/(rho1 + rho2);
+        let ei = (ei1*rho1 + ei2*rho2)/(rho1+rho2);
+        let er = (er1*rho1 + er2*rho2)/ (rho1+rho2);
+
+        let gi = state::GAMMA_I - 1.0;
+        let ge = state::GAMMA_E - 1.0;
+        let gr = state::GAMMA_R - 1.0;
+
+        let cs = (state::GAMMA_E*ge*ee + state::GAMMA_I*gi*ei + state::GAMMA_R*gr*er).sqrt();
+
+        let gt = gi + ge + gr;
+        let r = array![
+        [1.0, 1.0, 1.0, 1.0, 1.0],
+        [u-cs, u, u, u, u+cs ],
+        [state::GAMMA_E*ee+u.powi(2)/6.0-u*cs/3.0,gt*u.powi(2)/(6.0*ge),-gr,gi,state::GAMMA_E*ee+u.powi(2)/6.0+u*cs/3.0],
+        [state::GAMMA_I*ei+u.powi(2)/6.0-u*cs/3.0,gr,gt*u.powi(2)/(6.0*gi),-ge,state::GAMMA_I*ei+u.powi(2)/6.0+u*cs/3.0],
+        [state::GAMMA_R*er+u.powi(2)/6.0-u*cs/3.0,-gi,ge,gt*u.powi(2)/(6.0*gr),state::GAMMA_R*er+u.powi(2)/6.0+u*cs/3.0],
+        ];
+        let lambda = array![u-cs,u,u,u,u+cs];
+
+       (lambda,r)
     }
 
-    pub fn con2char(&self) -> Self {
+    pub fn con2char(&self,l:&Array2<f64>) -> Self {
         let mut new_stencil: [state::State; 6] = [state::State::new(); 6];
-        let l = self.build_l();
         for i in 0..6 {
         let tmp_k: Array1<f64> = Array1::from_vec(
             self.points[i].state2arr().to_vec()
@@ -91,25 +132,27 @@ impl Stencil6 {
         [rho_list, mom_list,ee_list,ei_list,er_list]
     }
 
-    pub fn reconstruction(&self) -> state::State {
-        let flux_l = self.state2flux().con2char().points;
-        let state_l = self.con2char().points;
+    pub fn reconstruction(&self,gloabl_alpha: f64) -> state::State {
+        let l = self.build_l();
+        let flux_l = self.state2flux().con2char(&l).points;
+        let state_l = self.con2char(&l).points;
+
+        //let flux_stencil = self.state2flux();
         let (lambda,r) = self.build_r();
         let mut f_plus_stencil = [state::State::new(); 6];
         let mut f_minus_stencil = [state::State::new(); 6];
-        //build F plus stencil
         for i in 0..6 {
-            f_plus_stencil[i] = state::State {rho:0.5*(flux_l[i].rho +lambda[0]*state_l[i].rho),
-                                                mom: 0.5*(flux_l[i].mom + lambda[1]*state_l[i].mom),
-                                                ee: 0.5*(flux_l[i].ee + lambda[2]*state_l[i].ee),
-                                                ei: 0.5*(flux_l[i].ei + lambda[3]*state_l[i].ei),
-                                                er: 0.5*(flux_l[i].er + lambda[4]*state_l[i].er)};
+            f_plus_stencil[i] = state::State {rho:0.5*(flux_l[i].rho +gloabl_alpha*state_l[i].rho),
+                                                mom: 0.5*(flux_l[i].mom + gloabl_alpha*state_l[i].mom),
+                                                ee: 0.5*(flux_l[i].ee + gloabl_alpha*state_l[i].ee),
+                                                ei: 0.5*(flux_l[i].ei + gloabl_alpha*state_l[i].ei),
+                                                er: 0.5*(flux_l[i].er + gloabl_alpha*state_l[i].er)};
 
-            f_minus_stencil[i] = state::State {rho:0.5*(flux_l[i].rho - lambda[0]*state_l[i].rho),
-                                                mom: 0.5*(flux_l[i].mom - lambda[1]*state_l[i].mom),
-                                                ee: 0.5*(flux_l[i].ee - lambda[2]*state_l[i].ee),
-                                                ei: 0.5*(flux_l[i].ei - lambda[3]*state_l[i].ei),
-                                                er: 0.5*(flux_l[i].er - lambda[4]*state_l[i].er)};
+            f_minus_stencil[i] = state::State {rho:0.5*(flux_l[i].rho - gloabl_alpha*state_l[i].rho),
+                                                mom: 0.5*(flux_l[i].mom - gloabl_alpha*state_l[i].mom),
+                                                ee: 0.5*(flux_l[i].ee - gloabl_alpha*state_l[i].ee),
+                                                ei: 0.5*(flux_l[i].ei - gloabl_alpha*state_l[i].ei),
+                                                er: 0.5*(flux_l[i].er - gloabl_alpha*state_l[i].er)};
 
         }
 
@@ -128,7 +171,7 @@ impl Stencil6 {
                 tmp[i][3],
                 tmp[i][4],
             ];
-            flux_plus[i] = weno(&stencil);
+            flux_plus[i] = weno5(&stencil);
             let stencil = [
                 tmp1[i][5],
                 tmp1[i][4],
@@ -136,7 +179,7 @@ impl Stencil6 {
                 tmp1[i][2],
                 tmp1[i][1]
             ];
-            flux_minus[i] = weno(&stencil);
+            flux_minus[i] = weno5(&stencil);
         }
 
         let flux = state::State {rho: flux_plus[0]+flux_minus[0], 
@@ -158,77 +201,39 @@ impl Stencil6 {
 
 
 #[inline]
-pub fn weno(stencil: &[f64; 5]) -> f64 {
+pub fn weno5(stencil: &[f64; 5]) -> f64 {
 
-    let u_im2 = stencil[0];
-    let u_im1 = stencil[1];
-    let u_i   = stencil[2];
-    let u_ip1 = stencil[3];
-    let u_ip2 = stencil[4];
+    let u0 = stencil[0];
+    let u1 = stencil[1];
+    let u2 = stencil[2];
+    let u3 = stencil[3];
+    let u4 = stencil[4];
 
+    let beta0 = 13.0/12.0 * (u2 - 2.0*u3 + u4).powi(2)
+                                + 0.25*(3.0*u2 - 4.0*u3 + u4).powi(2);
+    let beta1 = 13.0/12.0*(u1 - 2.0*u2 + u3).powi(2)
+                    + 0.25*(u1 - u3).powi(2);
+    let beta2 = 13.0/12.0*(u0 - 2.0*u1 + u2).powi(2)
+                    + 0.25*(u0 - 4.0*u1 + 3.0*u2).powi(2);
+    let d0 = 0.3;
+    let d1 = 0.6;
+    let d2 = 0.1;
 
-    // candidate reconstruction
-    let u0 = 3.0/8.0*u_im2 
-           - 5.0/4.0*u_im1 
-           + 15.0/8.0*u_i;
+    let a0 = d0/(utils::DEFAULT_EPS + beta0).powi(2);
+    let a1 = d1/(utils::DEFAULT_EPS + beta1).powi(2);
+    let a2 = d2/(utils::DEFAULT_EPS + beta2).powi(2);
 
-    let u1 = -1.0/8.0*u_im1
-           + 3.0/4.0*u_i
-           + 3.0/8.0*u_ip1;
+    let sum_o = a0 + a1 + a2;
 
-    let u2 = 3.0/8.0*u_i
-           + 3.0/4.0*u_ip1
-           - 1.0/8.0*u_ip2;
+    let w0 = a0/sum_o;
+    let w1 = a1/sum_o;
+    let w2 = a2/sum_o;
 
+    let p0 = - u4 + 5.0*u3 + 2.0*u2;
+    let p1 = - u1 + 5.0*u2 + 2.0*u3;
+    let p2 = 2.0*u0 - 7.0*u1 + 11.0*u2;
 
-    // smoothness indicators
-    let beta0 = (1.0/3.0) * (
-          4.0*u_im2.powi(2)
-        -19.0*u_im2*u_im1
-        +25.0*u_im1.powi(2)
-        +11.0*u_im2*u_i
-        -31.0*u_im1*u_i
-        +10.0*u_i.powi(2)
-    );
-
-
-    let beta1 = (1.0/3.0) * (
-          4.0*u_im1.powi(2)
-        -13.0*u_im1*u_i
-        +13.0*u_i.powi(2)
-        +5.0*u_im1*u_ip1
-        -13.0*u_i*u_ip1
-        +4.0*u_ip1.powi(2)
-    );
-
-
-    let beta2 = (1.0/3.0) * (
-          10.0*u_i.powi(2)
-        -31.0*u_i*u_ip1
-        +25.0*u_ip1.powi(2)
-        +11.0*u_i*u_ip2
-        -19.0*u_ip1*u_ip2
-        +4.0*u_ip2.powi(2)
-    );
-
-
-    // nonlinear weights
-    let eps = 1e-6;
-
-    let alpha0 = 0.0625 / (eps + beta0).powi(2);
-    let alpha1 = 0.625 / (eps + beta1).powi(2);
-    let alpha2 = 0.3125 / (eps + beta2).powi(2);
-
-
-    let alpha_sum = alpha0 + alpha1 + alpha2;
-
-
-    let w0 = alpha0 / alpha_sum;
-    let w1 = alpha1 / alpha_sum;
-    let w2 = alpha2 / alpha_sum;
-
-
-    w0*u0 + w1*u1 + w2*u2
+    (w0*p0 + w1*p1 + w2*p2)/6.0
 }
 
 
@@ -238,121 +243,128 @@ mod tests {
 
 use super::*;
 
-
 #[test]
-    fn test_weno5_accuracy()
+fn test_weno5_accuracy()
+{
+
+    let grids = [
+        40usize,
+        80usize,
+        160usize,
+        320usize
+    ];
+
+
+    let mut errors: Vec<f64> = Vec::new();
+
+
+    for &nx in grids.iter()
     {
 
-        let grids = [
-            40usize,
-            80usize,
-            160usize,
-            320usize
-        ];
+        let dx =
+            2.0*std::f64::consts::PI
+            /(nx as f64);
 
 
-        let mut errors: Vec<f64> = Vec::new();
+        let mut error = 0.0;
+
+        let mut count = 0;
 
 
-        for &nx in grids.iter()
+
+        for j in 3..nx-3
         {
 
-            let dx =
-                2.0*std::f64::consts::PI
-                /(nx as f64);
+            let x =
+                j as f64 * dx;
+
+            // h_{i+1/2}: stencil centered at x
+            let stencil_r = [
+                (x-2.0*dx).sin(),
+                (x-dx).sin(),
+                x.sin(),
+                (x+dx).sin(),
+                (x+2.0*dx).sin(),
+            ];
+
+            // h_{i-1/2}: same stencil shape, shifted back by dx
+            let xm = x - dx;
+            let stencil_l = [
+                (xm-2.0*dx).sin(),
+                (xm-dx).sin(),
+                xm.sin(),
+                (xm+dx).sin(),
+                (xm+2.0*dx).sin(),
+            ];
+
+            let h_iphalf =
+                weno5(&stencil_r);
+
+            let h_imhalf =
+                weno5(&stencil_l);
+
+            let numerical =
+                (h_iphalf - h_imhalf) / dx;
+
+            let exact =
+                x.cos();
 
 
-            let mut error = 0.0;
 
-            let mut count = 0;
+            error +=
+                (numerical-exact).abs();
 
-
-
-            for j in 3..nx-3
-            {
-
-                let x =
-                    j as f64 * dx;
-
-
-                let stencil = [
-                    (x-2.0*dx).sin(),
-                    (x-dx).sin(),
-                    x.sin(),
-                    (x+dx).sin(),
-                    (x+2.0*dx).sin(),
-                ];
-
-
-                let numerical =
-                    weno(&stencil);
-
-
-                let exact =
-                    (x+0.5*dx).sin();
-
-
-
-                error +=
-                    (numerical-exact).abs();
-
-
-                count +=1;
-
-            }
-
-
-            errors.push(
-                error/(count as f64)
-            );
+            count +=1;
 
         }
 
 
-
-        println!("errors = {:?}", errors);
-
-
-
-        // calculate convergence orders
-
-        let mut orders = Vec::new();
-
-
-        for i in 1..errors.len()
-        {
-
-            let order =
-                (errors[i-1]/errors[i])
-                .log2();
-
-
-            orders.push(order);
-
-        }
-
-
-        println!("orders = {:?}", orders);
-
-
-
-        // Ignore the first order because coarse grid
-        // may not be in asymptotic region
-
-        for order in orders.iter().skip(1)
-        {
-
-            assert!(
-                *order > 4.5,
-                "WENO order too low: {}",
-                order
-            );
-
-        }
+        errors.push(
+            error/(count as f64)
+        );
 
     }
 
 
+
+    // calculate convergence orders
+
+    let mut orders = Vec::new();
+
+
+    for i in 1..errors.len()
+    {
+
+        let order =
+            (errors[i-1]/errors[i])
+            .log2();
+
+
+        orders.push(order);
+
+    }
+
+
+    println!("errors = {:?}", errors);
+    println!("orders = {:?}", orders);
+
+
+
+    // Ignore the first order because coarse grid
+    // may not be in asymptotic region
+
+    for order in orders.iter().skip(1)
+    {
+
+        assert!(
+            *order > 4.5,
+            "WENO order too low: {}",
+            order
+        );
+
+    }
+
+}
 
 #[test]
 fn test_weno_constant()
@@ -367,7 +379,7 @@ let stencil=[
 ];
 
 
-let result=weno(&stencil);
+let result=weno5(&stencil);
 
 
 assert!(
@@ -423,7 +435,8 @@ fn test_eigen_inverse()
 }
 
 #[test]
-fn test_constant_state_preserving(){
+fn test_constant_flux_preserving(){
+
     let state =
     state::State{
         rho:1.0,
@@ -434,20 +447,48 @@ fn test_constant_state_preserving(){
     };
 
 
-    let stencil =
-    Stencil6{
-        points:[
-            state,
-            state,
-            state,
-            state,
-            state,
-            state,
-        ]
+    let stencil=Stencil6{
+        points:[state;6]
     };
 
-    let ans = stencil.reconstruction();
-    assert!(ans.mom == 1.0);
+
+    let ans=stencil.reconstruction(100.0);
+    let flux=state.flux();
+
+
+    assert!((ans.rho-flux.rho).abs()<1e-10);
+    assert!((ans.mom-flux.mom).abs()<1e-10);
+    assert!((ans.ee-flux.ee).abs()<1e-10);
+    assert!((ans.ei-flux.ei).abs()<1e-10);
+    assert!((ans.er-flux.er).abs()<1e-10);
+}
+
+#[test]
+fn test_characteristic_projection()
+{
+    let state =
+    state::State{
+        rho:1.0,
+        mom:0.5,
+        ee:3.0,
+        ei:2.0,
+        er:1.0,
+    };
+
+
+    let stencil=Stencil6{
+        points:[state;6]
+    };
+
+
+    let l=stencil.build_l();
+    let (_,r)=stencil.build_r();
+
+
+    let id=l.dot(&r);
+
+
+    println!("{:?}",id);
 }
 }
 

@@ -97,9 +97,40 @@ impl State {
             er: arr[4],
         }
     }
+
+    pub fn add(&self, s2: State) -> Self {
+        Self {
+            rho: self.rho + s2.rho,
+            mom: self.mom + s2.mom,
+            ee:self.ee + s2.ee,
+            ei:self.ei + s2.ei,
+            er:self.er + s2.er,
+        }
+    }
+
+    pub fn scalar_prod(&self, scalar: f64) -> Self {
+        Self {
+            rho: self.rho*scalar,
+            mom: self.mom*scalar,
+            ee: self.ee*scalar,
+            ei: self.ei * scalar,
+            er: self.er * scalar,
+        }
+    }
 }
 
 
 
+///flux1: value at i - 1/2
+/// flux2: value at i + 1/2
+pub fn update(flux1: State, flux2: State) -> State {
+    State {
+        rho: - (flux2.rho - flux1.rho),
+        mom: - (flux2.mom - flux1.mom),
+        ee: - (flux2.ee - flux1.ee),
+        ei: - (flux2.ee - flux1.ee),
+        er: - (flux2.er - flux1.er),
+    }
+}
 
 

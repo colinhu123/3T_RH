@@ -1,76 +1,259 @@
 mod state;
 mod weno;
-mod linalg;
 mod utils;
-use ndarray::{array, Array2, Array1};
 mod noncon;
 
-fn constant_stencil(s: state::State) -> [state::State; 7] {
-        [s; 7]
+use std::fs::{File, create_dir_all};
+use std::io::Write;
+
+const CFL: f64 = 0.3;
+
+fn noncon_stencil_extractor(u: &Vec<state::State>,i: usize) -> [state::State; 9] {
+    let nx = u.len();
+    let mut stencil = [state::State::new(); 9];
+    for j in 0..9 {
+        let n = (i + nx - 4 + j) % nx;
+        stencil[j] = u[n];
+    }
+    stencil
+}
+
+fn weno_stencil_extractor(u: &Vec<state::State>, i: usize) -> weno::Stencil6 {
+    //here i range is 0..(nx+1)
+    let nx = u.len();
+    let mut points = [state::State::new(); 6];
+    for j in 0..6 {
+        let n = (i + nx - 3 + j) % nx;
+        points[j] = u[n];
     }
 
-
-fn main() {
-
-    let a: Array2<f64> = array![
-        [4.0, 1.0, 0.0, 0.0, 0.0],
-        [1.0, 3.0, 1.0, 0.0, 0.0],
-        [0.0, 1.0, 2.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0, 3.0, 1.0],
-        [0.0, 0.0, 0.0, 1.0, 4.0],
-    ];
-
-
-    let k = array![[1.0],[1.0],[1.0],[1.0],[1.0]];
-
-    let ans = a.dot(&k);
-
-    println!{"{:?}",ans};
-
-    let s = state::State{
-            rho: 1.0,
-            mom: 0.5,
-            ee: 2.0,
-            ei: 2.0,
-            er: 2.0,
-    };
-
-        let stencil = constant_stencil(s);
-
-        let result = noncon::nonconservative(
-            &stencil,
-            1.0,
-        );
-
-        let result = noncon::dNdx(&stencil,1.0);
-        let result = noncon::upwind_jump_left(&stencil);
-
-        println!("{:?}",result);
-
-        let state =
-    state::State{
-        rho:1.0,
-        mom:0.5,
-        ee:3.0,
-        ei:2.0,
-        er:1.0,
-    };
-
-
-    let stencil =
-    weno::Stencil6{
-        points:[
-            state,
-            state,
-            state,
-            state,
-            state,
-            state,
-        ]
-    };
-
-    let ans = stencil.reconstruction();
-    println!("{:?}",ans);
+    weno::Stencil6 {
+        points: points,
+    }
 }
 
 
+fn l(
+    u: &Vec<state::State>,
+    global_alpha: f64,
+    dx: f64
+) -> Vec<state::State> {
+
+    let nx = u.len();
+
+    let mut flux = vec![
+        state::State::new();
+        nx + 1
+    ];
+    let mut qp1 = vec![
+        state::State::new();
+        nx
+    ];
+
+    for i in 0..(nx+1) {
+
+        let stencil =
+            weno_stencil_extractor(&u, i);
+
+        flux[i] =
+            stencil.reconstruction(global_alpha);
+    }
+
+    for i in 0..nx {
+        let k1 = state::update(flux[i], flux[i+1]);
+        let sten = noncon_stencil_extractor(&u, i);
+        let k2 = noncon::nonconservative(&sten, dx);
+        qp1[i] = k1.add(k2);
+    }
+    qp1
+}
+
+
+fn rk3_ssp(u: &Vec<state::State>, global_alpha: f64, dx: f64, dt: f64)->Vec<state::State> {
+    let nx = u.len();
+
+    let l1 = l(u,global_alpha,dx);
+    let mut u1 = vec![
+        state::State::new();
+        nx
+    ];
+    for i in 0..nx {
+        let k1 = l1[i].scalar_prod(dt);
+        u1[i] = k1.add(u[i]);
+    }
+
+    let mut u2 = vec![
+        state::State::new();
+        nx
+    ];
+    let l2 = l(&u1,global_alpha,dx);
+    for i in 0..nx {
+        let k1 = u1[i].add(l2[i]).scalar_prod(dt/4.0);
+        u2[i] = u[i].scalar_prod(0.75).add(k1);
+    }
+
+    let mut u3 = vec![
+        state::State::new();
+        nx
+    ];
+    let l3 = l(&u2,global_alpha, dx);
+    for i in 0..nx {
+        let k1 = u2[i].add(l3[i]).scalar_prod(2.0*dt/3.0);
+        u3[i] = u[i].scalar_prod(1.0/3.0).add(k1);
+    }
+
+    u3
+}
+
+fn init() -> Vec<state::State>{
+    let nx = 400;
+    let mut u = vec![state::State::new(); nx];
+
+    let s1 = state::State {
+        rho: 0.445,
+        mom: 3.964,
+        ee: 3.964,
+        ei: 3.964,
+        er: 7.928,
+    };
+
+    let s2 = state::State {
+        rho:0.5,
+        mom: 0.0,
+        ee: 0.57,
+        ei: 0.57,
+        er: 1.14,
+    };
+
+    for i in 0..nx {
+        if i < 100 {
+            u[i] = s1;
+        }
+        else if i > 300 {
+            u[i] = s1;
+        }
+        else {
+            u[i] = s2;
+        }
+    }
+
+    u
+
+}
+
+fn calc_global_alpha(u: &Vec<state::State>) ->f64 {
+    let nx = u.len();
+
+    let mut alpha_max = 0.0;
+
+    for i in 0..nx {
+
+        let ee = u[i].ee;
+        let ei = u[i].ei;
+        let er = u[i].er;
+        let gi = state::GAMMA_I - 1.0;
+        let ge = state::GAMMA_E - 1.0;
+        let gr = state::GAMMA_R - 1.0;
+        let cs = (state::GAMMA_E*ge*ee + state::GAMMA_I*gi*ei + state::GAMMA_R*gr*er).sqrt();
+
+        let alpha = cs + (u[i].mom/u[i].rho).abs();
+
+        if alpha > alpha_max {
+            alpha_max = alpha;
+        }
+        else {
+            continue;
+        }
+    }
+    alpha_max
+}
+
+fn save_data(
+    u: &Vec<state::State>,
+    filename: &str
+) {
+
+    // create data folder if it does not exist
+    create_dir_all("data")
+        .expect("Cannot create data directory");
+
+
+    let path = format!("data/{}", filename);
+
+
+    let mut file =
+        File::create(path)
+        .expect("Cannot create output file");
+
+
+    // header
+    writeln!(
+        file,
+        "x,rho,mom,ee,ei,er"
+    ).unwrap();
+
+
+    let nx = u.len();
+
+
+    for i in 0..nx {
+
+        let x =
+            i as f64 / (nx-1) as f64;
+
+
+        writeln!(
+            file,
+            "{},{},{},{},{},{}",
+            x,
+            u[i].rho,
+            u[i].mom,
+            u[i].ee,
+            u[i].ei,
+            u[i].er
+        ).unwrap();
+    }
+
+}
+
+fn main() {
+
+    let mut u = init();
+
+
+    save_data(
+        &u,
+        "initial.dat"
+    );
+
+
+    let dx = 1.0/400.0;
+
+
+    for n in 0..10 {
+
+        let alpha = calc_global_alpha(&u);
+
+        let dt = dx/alpha*CFL;
+        println!("{:?}", dt);
+
+        u =
+            rk3_ssp(
+                &u,
+                alpha,
+                dx,
+                dt
+            );
+
+
+        let filename =
+            format!("solution_{:04}.dat", n);
+
+
+        save_data(
+            &u,
+            &filename
+        );
+    }
+
+}

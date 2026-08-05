@@ -3,6 +3,7 @@ use ndarray::{Array1,Array2,array};
 use ndarray_linalg::Inverse;
 use crate::utils;
 
+#[derive(Clone,Copy,Debug)]
 pub struct Stencil6 {
     pub points: [state::State; 6],
 

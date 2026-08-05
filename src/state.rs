@@ -84,6 +84,20 @@ impl State {
         }
     }
 
+    pub fn primi2con(rho: f64, u: f64, pe: f64, pi: f64, pr: f64) -> Self {
+        let ee1 = pe/((GAMMA_E-1.0)*rho);
+        let ei1 = pi/((GAMMA_I-1.0)*rho);
+        let er1 = pr/((GAMMA_R-1.0)*rho);
+
+        Self {
+            rho: rho,
+            mom: rho*u,
+            ee: rho*ee1 + rho*u*u/6.0,
+            ei: rho*ei1 + rho*u*u/6.0,
+            er: rho*er1 + rho*u*u/6.0,
+        }
+    }
+
     pub fn state2arr(&self) -> [f64; 5] {
         [self.rho, self.mom, self.ee, self.ei, self.er]
     }
@@ -128,7 +142,7 @@ pub fn update(flux1: State, flux2: State) -> State {
         rho: - (flux2.rho - flux1.rho),
         mom: - (flux2.mom - flux1.mom),
         ee: - (flux2.ee - flux1.ee),
-        ei: - (flux2.ee - flux1.ee),
+        ei: - (flux2.ei - flux1.ei),
         er: - (flux2.er - flux1.er),
     }
 }

@@ -1,1 +1,1 @@
-pub const DEFAULT_EPS: f64 = 1e-12;
+pub const DEFAULT_EPS: f64 = 1e-6;

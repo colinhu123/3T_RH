@@ -2,11 +2,12 @@ mod state;
 mod weno;
 mod utils;
 mod noncon;
-
-use std::fs::{File, create_dir_all};
+use std::fs::{File, create_dir_all, remove_dir_all};
 use std::io::Write;
 
-const CFL: f64 = 0.1;
+use ndarray::Array2;
+
+const CFL: f64 = 0.3;
 
 fn noncon_stencil_extractor(u: &Vec<state::State>,i: usize) -> [state::State; 9] {
     let nx = u.len();
@@ -57,7 +58,7 @@ fn l(
             //println!("{:?}",stencil);
 
         flux[i] =
-            stencil.reconstruction(global_alpha);
+            stencil.reconstruction(global_alpha, true);
     }
     //println!("{:?}",flux);
     for i in 0..nx {
@@ -120,7 +121,7 @@ fn init() -> (Vec<state::State>,usize){
         mom: 0.0,
         ee: 0.285,
         ei: 0.285,
-        er: 1.14,
+        er: 0.571,
     };
 
     for i in 0..nx {
@@ -217,7 +218,24 @@ fn save_data(
 
 }
 
+fn clear_data_folder() {
+
+    let path = "data";
+
+    if std::path::Path::new(path).exists() {
+
+        remove_dir_all(path)
+            .expect("Failed to remove old data folder");
+
+    }
+
+    create_dir_all(path)
+        .expect("Failed to create data folder");
+}
+
 fn main() {
+    
+    clear_data_folder();
 
     let  (mut u,nx) = init();
 
@@ -230,10 +248,13 @@ fn main() {
 
     let dx = 1.0/nx as f64;
 
+    let mut t = 0.0;
 
-    for n in 0..1000 {
+    let t_f = 0.05;
 
-        let alpha = calc_global_alpha(&u);
+    for n in 0..800 {
+
+        let alpha = 2.0*calc_global_alpha(&u);
 
         let dt = dx/alpha*CFL;
         println!("{:?}", dt);
@@ -255,29 +276,19 @@ fn main() {
             &u,
             &filename
         );
+
+        t += dt;
+
+        if t >= t_f {
+            println!("t_final has reached");
+            break;
+        }
     }
-
 }
 
 
 
-fn calc_cs(state1: state::State) -> f64{
-    let u = state1.mom/state1.rho;
-    let ee = state1.ee/state1.rho - u*u/6.0;
-    let ei = state1.ei/state1.rho - u*u/6.0;
-    let er = state1.er/state1.rho - u*u/6.0;
-    let gi = state::GAMMA_I - 1.0;
-    let ge = state::GAMMA_E - 1.0;
-    let gr = state::GAMMA_R - 1.0;
-    let cs = (state::GAMMA_E*ge*ee + state::GAMMA_I*gi*ei + state::GAMMA_R*gr*er).sqrt();
-    cs
-}
- 
 //fn main() {
-//    let u = init();
-//    let l = l(&u,100.0,1.0/40.0);
-//    //println!("{:?}",l);
-//
 //    let s1 = state::State {
 //        rho: 0.445,
 //        mom: 0.31061,
@@ -289,14 +300,10 @@ fn calc_cs(state1: state::State) -> f64{
 //    let stencil = weno::Stencil6 {
 //        points: [s1; 6],
 //    };
-//    println!("{:?}",stencil);
-//    let r = stencil.build_r();
-//    let l = stencil.build_l();
-//    println!("L for this stencil is {:?}",l);
-//    println!("cs in this stencil is: {}",calc_cs(s1));
 //
-//    let flux1 = stencil.reconstruction(10.0);
-//
-//    println!("{:?}", flux1);
-//    println!("{:?}", s1.flux());
+//    let (lambda,r) = stencil.build_r();
+//    let gamma = Array2::from_diag(&lambda);
+//    let a = stencil.build_a();
+//    println!("{:?}",a.dot(&r));
+//    println!("{:?}",r.dot(&gamma));
 //}

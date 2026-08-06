@@ -27,16 +27,18 @@ impl State {
         }
     }
     pub fn pressure_tot(&self) -> f64 {
-        let pe = 2.0/3.0 * self.rho * self.ee;
-        let pi = 2.0/3.0 * self.rho * self.ei;
-        let pr = 1.0/3.0 * self.rho * self.er;
+        let u = self.mom/self.rho;
+        let pe = 2.0/3.0 * (self.ee - self.rho * u * u/6.0);
+        let pi = 2.0/3.0 * (self.ei - self.rho * u * u/6.0);
+        let pr = 1.0/3.0 * (self.er - self.rho * u * u/6.0);
         pe+pi+pr
     }
 
     pub fn pressure_spilit(&self) -> (f64,f64,f64) {
-        let pe = 2.0/3.0 * self.rho * self.ee;
-        let pi = 2.0/3.0 * self.rho * self.ei;
-        let pr = 1.0/3.0 * self.rho * self.er;
+        let u = self.mom/self.rho;
+        let pe = 2.0/3.0 * (self.ee - self.rho * u * u/6.0);
+        let pi = 2.0/3.0 * (self.ei - self.rho * u * u/6.0);
+        let pr = 1.0/3.0 * (self.er - self.rho * u * u/6.0);
         (pe, pi, pr)
     }
 

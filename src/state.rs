@@ -145,3 +145,28 @@ pub fn update(flux1: State, flux2: State) -> State {
 }
 
 
+
+
+#[cfg(test)]
+mod test {
+    use crate::state::State;
+
+    fn close(a: f64, b: f64) -> bool{
+        if (a-b).abs() < 1e-4 {
+            true
+        }
+        else {
+            false
+        }
+    }
+
+    #[test]
+    fn test_primi2con() {
+        let s1 = State::primi2con(0.445, 0.698, 1.176, 1.176, 1.176);
+
+        assert!(close(s1.rho,0.445));
+        assert!(close(s1.mom, 0.31061));
+        assert!(close(s1.ee, 1.800134));
+        assert!(close(s1.er, 3.56413429));
+    }
+}

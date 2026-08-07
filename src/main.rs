@@ -168,6 +168,37 @@ fn init() -> (Vec<state::State>,usize){
 
 }
 
+fn init_2()-> (Vec<state::State>,usize) {
+
+    let nx = 800;
+    let mut u = vec![state::State::new(); nx];
+
+    let p1 = 100.0;
+    let s1 = state::State::primi2con(1.0, 0.0, p1/3.0, p1/3.0, p1/3.0);
+    let p2 = 0.01;
+    let s2 = state::State::primi2con(1.0, 0.0, p2/3.0, p2/3.0, p2/3.0);
+
+    for i in 0..nx {
+        if i < (0.05*nx as f64) as usize {
+            u[i] = s1;
+        }
+        else if i < (0.45 * nx as f64) as usize {
+            u[i] = s2;
+        }
+        else if i < (0.55 * nx as f64) as usize {
+            u[i] = s1;
+        }
+        else if i < (0.95* nx as f64) as usize {
+            u[i] = s2;
+        }
+        else {
+            u[i] = s1
+        }
+    }
+    (u,nx)
+
+}
+
 fn calc_global_alpha(u: &Vec<state::State>) ->f64 {
     let nx = u.len();
 
@@ -274,15 +305,15 @@ fn main() {
     );
 
 
-    let dx = 1.0/nx as f64;
+    let dx = 40.0/nx as f64;
 
     let mut t = 0.0;
 
-    let t_f = 0.05;
+    let t_f = 1.0;
 
-    for n in 0..800 {
+    for n in 0..1600 {
 
-        let alpha = 2.0*calc_global_alpha(&u);
+        let alpha = calc_global_alpha(&u);
 
         let dt = dx/alpha*CFL;
         println!("{:?}", dt);

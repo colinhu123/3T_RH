@@ -25,7 +25,7 @@ def read_file(filename):
     data = pd.read_csv(filename)
 
     x = data["x"].values
-    rho = data["mom"].values
+    rho = data["rho"].values
 
     return x, rho
 

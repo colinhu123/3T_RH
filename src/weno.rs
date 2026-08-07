@@ -2,6 +2,11 @@ use crate::{constant, state};
 use ndarray::{Array1,Array2,array};
 use ndarray_linalg::Inverse;
 
+pub enum ReconstructionType {
+    Conservative,
+    CharAnaly,
+    CharNum,
+}
 
 #[derive(Clone,Copy,Debug)]
 pub struct Stencil6 {
@@ -48,42 +53,6 @@ impl Stencil6 {
         let (_lambda,r) = self.build_r_roe_ave();
         let l = r.inv().unwrap();
         l
-    }
-
-    pub fn build_r_arth_ave(&self) -> (Array1<f64>, Array2<f64>) {
-        let state1 = self.points[3];
-        let state2 = self.points[2];
-        let s = state::State {
-            rho: 0.5*(state1.rho + state2.rho),
-            mom: 0.5*(state1.mom + state2.mom),
-            ee: 0.5*(state1.ee + state2.ee),
-            ei: 0.5*(state1.ei + state2.ei),
-            er: 0.5*(state1.er + state2.er),
-        };
-
-        let u = s.mom/s.rho;
-        let ee = s.ee/s.rho - u * u /6.0;
-        let ei = s.ei/s.rho - u*u / 6.0;
-        let er = s.er/s.rho - u*u/6.0;
-
-        let gi = constant::GAMMA_I - 1.0;
-        let ge = constant::GAMMA_E - 1.0;
-        let gr = constant::GAMMA_R - 1.0;
-
-        let cs = (constant::GAMMA_E*ge*ee + constant::GAMMA_I*gi*ei + constant::GAMMA_R*gr*er).sqrt();
-
-        let gt = gi + ge + gr;
-        let r = array![
-        [1.0, 1.0, 1.0, 1.0, 1.0],
-        [u-cs, u, u, u, u+cs ],
-        [constant::GAMMA_E*ee+u.powi(2)/6.0-u*cs/3.0,gt*u.powi(2)/(6.0*ge),-gr,gi,constant::GAMMA_E*ee+u.powi(2)/6.0+u*cs/3.0],
-        [constant::GAMMA_I*ei+u.powi(2)/6.0-u*cs/3.0,gr,gt*u.powi(2)/(6.0*gi),-ge,constant::GAMMA_I*ei+u.powi(2)/6.0+u*cs/3.0],
-        [constant::GAMMA_R*er+u.powi(2)/6.0-u*cs/3.0,-gi,ge,gt*u.powi(2)/(6.0*gr),constant::GAMMA_R*er+u.powi(2)/6.0+u*cs/3.0],
-        ];
-        let lambda = array![u-cs,u,u,u,u+cs];
-
-       (lambda,r)
-
     }
 
     pub fn build_r_roe_ave(&self)-> (Array1<f64>,Array2<f64>) {
@@ -169,7 +138,7 @@ impl Stencil6 {
         [rho_list, mom_list,ee_list,ei_list,er_list]
     }
 
-    pub fn reconstruction(&self,global_alpha: f64,recon_type: bool) -> state::State {
+    pub fn reconstruction(&self,recon_type: bool) -> state::State {
         let l = self.build_l();
         let (flux_l, state_l): ([state::State; 6], [state::State; 6]) = if recon_type {
         (self.state2flux().con2char(&l).points, self.con2char(&l).points)
@@ -177,16 +146,18 @@ impl Stencil6 {
         (self.state2flux().points, self.points)
     };
 
+        //let flux_stencil = self.state2flux();
+        let (lambda, r) = self.build_r_roe_ave();
+
         let mut f_plus_stencil = [state::State::new(); 6];
         let mut f_minus_stencil = [state::State::new(); 6];
 
-        //let flux_stencil = self.state2flux();
-        let (lambda, r) = self.build_r_roe_ave();
-        let a0 = lambda[0].abs().max(global_alpha);
-        let a1 = lambda[1].abs().max(global_alpha);
-        let a2 = lambda[2].abs().max(global_alpha);
-        let a3 = lambda[3].abs().max(global_alpha);
-        let a4 = lambda[4].abs().max(global_alpha);
+
+        let a0 = lambda[0].abs();
+        let a1 = lambda[1].abs();
+        let a2 = lambda[2].abs();
+        let a3 = lambda[3].abs();
+        let a4 = lambda[4].abs();
 
         for i in 0..6 {
             f_plus_stencil[i] = state::State {
@@ -471,7 +442,7 @@ fn test_eigen_inverse()
     };
 
     let l = stencil.build_l();
-    let (_,r) = stencil.build_r_arth_ave();
+    let (_,r) = stencil.build_r_roe_ave();
     let identity = l.dot(&r);
 
     for i in 0..5 {
@@ -507,7 +478,7 @@ fn test_constant_flux_preserving(){
     };
 
 
-    let ans=stencil.reconstruction(100.0,true);
+    let ans=stencil.reconstruction(true);
     let flux=state.flux();
 
 
@@ -537,7 +508,7 @@ fn test_characteristic_projection()
 
 
     let l=stencil.build_l();
-    let (_,r)=stencil.build_r_arth_ave();
+    let (_,r)=stencil.build_r_roe_ave();
 
 
     let id=l.dot(&r);

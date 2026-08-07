@@ -14,3 +14,5 @@ pub const GAMMA_R: f64 = 4.0/3.0;
 
 pub const OMEGA_EI: f64 = 1.0;
 pub const OMEGA_ER: f64 = 1.0;
+
+pub const LAMBDA: f64 = 0.5;

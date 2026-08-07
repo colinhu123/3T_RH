@@ -1,6 +1,6 @@
 mod state;
 mod weno;
-
+mod dt;
 mod noncon;
 mod source;
 mod diffusion;
@@ -40,9 +40,9 @@ fn weno_stencil_extractor(u: &Vec<state::State>, i: usize) -> weno::Stencil6 {
 
 fn diffusion_stencil_extractor(u: &Vec<state::State>, i: usize) -> diffusion::DiffusionStencil {
     let nx = u.len();
-    let mut points = [state::State::new(); 5];
-    for j in 0..5 {
-        let n = (i + nx - 2 + j) % nx;
+    let mut points = [state::State::new(); 6];
+    for j in 0..6 {
+        let n = (i + nx - 3 + j) % nx;
         points[j] = u[n];
     }
 
@@ -52,7 +52,6 @@ fn diffusion_stencil_extractor(u: &Vec<state::State>, i: usize) -> diffusion::Di
 
 fn l(
     u: &Vec<state::State>,
-    global_alpha: f64,
     dx: f64
 ) -> Vec<state::State> {
 
@@ -79,7 +78,7 @@ fn l(
             //println!("{:?}",stencil);
 
         flux[i] =
-            stencil.reconstruction(global_alpha, true);
+            stencil.reconstruction(true);
 
         let sten = diffusion_stencil_extractor(&u, i);
 
@@ -93,17 +92,17 @@ fn l(
         let k2 = noncon::nonconservative(&sten, dx);
         let s = source::source(u[i]);
         let dif = state::update(diffu[i], diffu[i+1]).scalar_prod(-1.0);
-        let dif = dif.scalar_prod(1.0/dx);
+        let dif = dif.scalar_prod(1.0/dx).scalar_prod(1.0/dx);
         qp1[i] = k1.add(k2).add(s).add(dif);
     }
     qp1
 }
 
 
-fn rk3_ssp(u: &Vec<state::State>, global_alpha: f64, dx: f64, dt: f64)->Vec<state::State> {
+fn rk3_ssp(u: &Vec<state::State>, dx: f64, dt: f64)->Vec<state::State> {
     let nx = u.len();
 
-    let l1 = l(u,global_alpha,dx);
+    let l1 = l(u,dx);
     let mut u1 = vec![
         state::State::new();
         nx
@@ -114,7 +113,7 @@ fn rk3_ssp(u: &Vec<state::State>, global_alpha: f64, dx: f64, dt: f64)->Vec<stat
     }
 
     let mut u2 = vec![state::State::new(); nx];
-    let l2 = l(&u1, global_alpha, dx);
+    let l2 = l(&u1, dx);
     for i in 0..nx {
         let state_term = u1[i].scalar_prod(0.25);
         let flux_term = l2[i].scalar_prod(dt/4.0);
@@ -122,7 +121,7 @@ fn rk3_ssp(u: &Vec<state::State>, global_alpha: f64, dx: f64, dt: f64)->Vec<stat
     }
 
     let mut u3 = vec![state::State::new(); nx];
-    let l3 = l(&u2, global_alpha, dx);
+    let l3 = l(&u2, dx);
     for i in 0..nx {
         let state_term = u2[i].scalar_prod(2.0/3.0);
         let flux_term = l3[i].scalar_prod(2.0*dt/3.0);
@@ -199,34 +198,22 @@ fn init_2()-> (Vec<state::State>,usize) {
 
 }
 
-fn calc_global_alpha(u: &Vec<state::State>) ->f64 {
+fn calc_global_alpha(u: &Vec<state::State>,dx: f64) ->f64 {
     let nx = u.len();
 
-    let mut alpha_max = 0.0;
+    let mut global_dt = 10.0;
 
     for i in 0..nx {
 
-        let state1 = u[i];
-        let u = state1.mom/state1.rho;
-
-        let ee = state1.ee/state1.rho - u*u/6.0;
-        let ei = state1.ei/state1.rho - u*u/6.0;
-        let er = state1.er/state1.rho - u*u/6.0;
-        let gi = constant::GAMMA_I - 1.0;
-        let ge = constant::GAMMA_E - 1.0;
-        let gr = constant::GAMMA_R - 1.0;
-        let cs = (constant::GAMMA_E*ge*ee + constant::GAMMA_I*gi*ei + constant::GAMMA_R*gr*er).sqrt();
-
-        let alpha = cs + (state1.mom/state1.rho).abs();
-
-        if alpha > alpha_max {
-            alpha_max = alpha;
+        let dt = dt::get_local_dt(u[i], dx);
+        if dt < global_dt {
+            global_dt = dt;
         }
         else {
             continue;
         }
     }
-    alpha_max
+    global_dt
 }
 
 fn save_data(
@@ -313,15 +300,12 @@ fn main() {
 
     for n in 0..1600 {
 
-        let alpha = calc_global_alpha(&u);
-
-        let dt = dx/alpha*CFL;
+        let dt = calc_global_alpha(&u,dx);
         println!("{:?}", dt);
 
         u =
             rk3_ssp(
                 &u,
-                alpha,
                 dx,
                 dt
             );

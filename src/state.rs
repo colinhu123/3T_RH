@@ -1,12 +1,7 @@
 use ndarray::{Array1};
+use crate::constant;
 
-pub const CVE: f64 = 1.0;
-pub const CVI: f64 = 1.0;
-pub const A  : f64 = 1.0;
 
-pub const GAMMA_I: f64 = 5.0/3.0;
-pub const GAMMA_E: f64 = 5.0/3.0;
-pub const GAMMA_R: f64 = 4.0/3.0;
 #[derive(Clone,Copy,Debug)]
 pub struct State {
     pub rho: f64,
@@ -57,20 +52,20 @@ impl State {
         }
     }
 
-    pub fn te(&self) -> f64 {
+    pub fn te(&self) -> f64 {//this three method has physics problem
         let u = self.mom/self.rho;
-        self.ee/(self.rho*CVE) - u * u / (6.0 * CVE)
+        self.ee/(self.rho*constant::CVE) - u * u / (6.0 * constant::CVE)
     }
 
     pub fn ti(&self) -> f64 {
         let u = self.mom / self.rho;
-        self.ei/(self.rho * CVI) - u*u/(6.0 *CVI)
+        self.ei/(self.rho * constant::CVI) - u*u/(6.0 *constant::CVI)
     }
 
     pub fn tr(&self) -> f64 {
         let u = self.mom/self.rho;
-        let er = self.er/self.rho - u*u/(6.0*self.rho);
-        return (er*self.rho/A).powf(0.25);
+        let er = self.er/self.rho - u*u/(6.0);
+        return (er*self.rho/constant::A).powf(0.25);
     }
 
     pub fn roe_ave(&self, state: State) -> Self {
@@ -87,9 +82,9 @@ impl State {
     }
 
     pub fn primi2con(rho: f64, u: f64, pe: f64, pi: f64, pr: f64) -> Self {
-        let ee1 = pe/((GAMMA_E-1.0)*rho);
-        let ei1 = pi/((GAMMA_I-1.0)*rho);
-        let er1 = pr/((GAMMA_R-1.0)*rho);
+        let ee1 = pe/((constant::GAMMA_E-1.0)*rho);
+        let ei1 = pi/((constant::GAMMA_I-1.0)*rho);
+        let er1 = pr/((constant::GAMMA_R-1.0)*rho);
 
         Self {
             rho: rho,

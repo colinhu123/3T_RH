@@ -1,7 +1,7 @@
-use crate::state;
+use crate::{constant, state};
 use ndarray::{Array1,Array2,array};
 use ndarray_linalg::Inverse;
-use crate::utils;
+
 
 #[derive(Clone,Copy,Debug)]
 pub struct Stencil6 {
@@ -31,14 +31,14 @@ impl Stencil6 {
         let ei = (ei1*rho1 + ei2*rho2)/(rho1+rho2);
         let er = (er1*rho1 + er2*rho2)/ (rho1+rho2);
 
-        let gamma_sum = state::GAMMA_E + state::GAMMA_I + state::GAMMA_R;
+        let gamma_sum = constant::GAMMA_E + constant::GAMMA_I + constant::GAMMA_R;
 
         let a: Array2<f64> = array![
             [0.0, 1.0, 0.0, 0.0, 0.0],
-            [(gamma_sum-9.0)*u*u/6.0, -(gamma_sum - 9.0)*u/3.0, state::GAMMA_E-1.0, state::GAMMA_I - 1.0, state::GAMMA_R - 1.0],
-            [-state::GAMMA_E*ee*u+(gamma_sum-6.0)/18.0*u.powf(3.0), state::GAMMA_E*ee-(2.0*gamma_sum-9.0)/18.0*u.powf(2.0), (state::GAMMA_E + 2.0)/3.0*u, (state::GAMMA_I-1.0)/3.0*u,(state::GAMMA_R - 1.0)/3.0*u],
-            [-state::GAMMA_I*ei*u + (gamma_sum-6.0)/18.0*u.powf(3.0), state::GAMMA_I*ei - (2.0*gamma_sum-9.0)/18.0*u.powf(2.0),(state::GAMMA_E - 1.0)/3.0*u, (state::GAMMA_I+2.0)/3.0*u,(state::GAMMA_R - 1.0)/3.0*u],
-            [-state::GAMMA_R*er*u + (gamma_sum-6.0)/18.0*u.powf(3.0), state::GAMMA_R*er - (2.0*gamma_sum-9.0)/18.0*u.powf(2.0),(state::GAMMA_E-1.0)/3.0*u,(state::GAMMA_I-1.0)/3.0*u,(state::GAMMA_R+2.0)/3.0*u],
+            [(gamma_sum-9.0)*u*u/6.0, -(gamma_sum - 9.0)*u/3.0, constant::GAMMA_E-1.0, constant::GAMMA_I - 1.0, constant::GAMMA_R - 1.0],
+            [-constant::GAMMA_E*ee*u+(gamma_sum-6.0)/18.0*u.powf(3.0), constant::GAMMA_E*ee-(2.0*gamma_sum-9.0)/18.0*u.powf(2.0), (constant::GAMMA_E + 2.0)/3.0*u, (constant::GAMMA_I-1.0)/3.0*u,(constant::GAMMA_R - 1.0)/3.0*u],
+            [-constant::GAMMA_I*ei*u + (gamma_sum-6.0)/18.0*u.powf(3.0), constant::GAMMA_I*ei - (2.0*gamma_sum-9.0)/18.0*u.powf(2.0),(constant::GAMMA_E - 1.0)/3.0*u, (constant::GAMMA_I+2.0)/3.0*u,(constant::GAMMA_R - 1.0)/3.0*u],
+            [-constant::GAMMA_R*er*u + (gamma_sum-6.0)/18.0*u.powf(3.0), constant::GAMMA_R*er - (2.0*gamma_sum-9.0)/18.0*u.powf(2.0),(constant::GAMMA_E-1.0)/3.0*u,(constant::GAMMA_I-1.0)/3.0*u,(constant::GAMMA_R+2.0)/3.0*u],
         ];
         a
     }
@@ -66,19 +66,19 @@ impl Stencil6 {
         let ei = s.ei/s.rho - u*u / 6.0;
         let er = s.er/s.rho - u*u/6.0;
 
-        let gi = state::GAMMA_I - 1.0;
-        let ge = state::GAMMA_E - 1.0;
-        let gr = state::GAMMA_R - 1.0;
+        let gi = constant::GAMMA_I - 1.0;
+        let ge = constant::GAMMA_E - 1.0;
+        let gr = constant::GAMMA_R - 1.0;
 
-        let cs = (state::GAMMA_E*ge*ee + state::GAMMA_I*gi*ei + state::GAMMA_R*gr*er).sqrt();
+        let cs = (constant::GAMMA_E*ge*ee + constant::GAMMA_I*gi*ei + constant::GAMMA_R*gr*er).sqrt();
 
         let gt = gi + ge + gr;
         let r = array![
         [1.0, 1.0, 1.0, 1.0, 1.0],
         [u-cs, u, u, u, u+cs ],
-        [state::GAMMA_E*ee+u.powi(2)/6.0-u*cs/3.0,gt*u.powi(2)/(6.0*ge),-gr,gi,state::GAMMA_E*ee+u.powi(2)/6.0+u*cs/3.0],
-        [state::GAMMA_I*ei+u.powi(2)/6.0-u*cs/3.0,gr,gt*u.powi(2)/(6.0*gi),-ge,state::GAMMA_I*ei+u.powi(2)/6.0+u*cs/3.0],
-        [state::GAMMA_R*er+u.powi(2)/6.0-u*cs/3.0,-gi,ge,gt*u.powi(2)/(6.0*gr),state::GAMMA_R*er+u.powi(2)/6.0+u*cs/3.0],
+        [constant::GAMMA_E*ee+u.powi(2)/6.0-u*cs/3.0,gt*u.powi(2)/(6.0*ge),-gr,gi,constant::GAMMA_E*ee+u.powi(2)/6.0+u*cs/3.0],
+        [constant::GAMMA_I*ei+u.powi(2)/6.0-u*cs/3.0,gr,gt*u.powi(2)/(6.0*gi),-ge,constant::GAMMA_I*ei+u.powi(2)/6.0+u*cs/3.0],
+        [constant::GAMMA_R*er+u.powi(2)/6.0-u*cs/3.0,-gi,ge,gt*u.powi(2)/(6.0*gr),constant::GAMMA_R*er+u.powi(2)/6.0+u*cs/3.0],
         ];
         let lambda = array![u-cs,u,u,u,u+cs];
 
@@ -105,19 +105,19 @@ impl Stencil6 {
         let ei = (ei1*rho1 + ei2*rho2)/(rho1+rho2);
         let er = (er1*rho1 + er2*rho2)/ (rho1+rho2);
 
-        let gi = state::GAMMA_I - 1.0;
-        let ge = state::GAMMA_E - 1.0;
-        let gr = state::GAMMA_R - 1.0;
+        let gi = constant::GAMMA_I - 1.0;
+        let ge = constant::GAMMA_E - 1.0;
+        let gr = constant::GAMMA_R - 1.0;
 
-        let cs = (state::GAMMA_E*ge*ee + state::GAMMA_I*gi*ei + state::GAMMA_R*gr*er).sqrt();
+        let cs = (constant::GAMMA_E*ge*ee + constant::GAMMA_I*gi*ei + constant::GAMMA_R*gr*er).sqrt();
 
         let gt = gi + ge + gr;
         let r = array![
         [1.0, 1.0, 1.0, 1.0, 1.0],
         [u-cs, u, u, u, u+cs ],
-        [state::GAMMA_E*ee+u.powi(2)/6.0-u*cs/3.0,gt*u.powi(2)/(6.0*ge),-gr,gi,state::GAMMA_E*ee+u.powi(2)/6.0+u*cs/3.0],
-        [state::GAMMA_I*ei+u.powi(2)/6.0-u*cs/3.0,gr,gt*u.powi(2)/(6.0*gi),-ge,state::GAMMA_I*ei+u.powi(2)/6.0+u*cs/3.0],
-        [state::GAMMA_R*er+u.powi(2)/6.0-u*cs/3.0,-gi,ge,gt*u.powi(2)/(6.0*gr),state::GAMMA_R*er+u.powi(2)/6.0+u*cs/3.0],
+        [constant::GAMMA_E*ee+u.powi(2)/6.0-u*cs/3.0,gt*u.powi(2)/(6.0*ge),-gr,gi,constant::GAMMA_E*ee+u.powi(2)/6.0+u*cs/3.0],
+        [constant::GAMMA_I*ei+u.powi(2)/6.0-u*cs/3.0,gr,gt*u.powi(2)/(6.0*gi),-ge,constant::GAMMA_I*ei+u.powi(2)/6.0+u*cs/3.0],
+        [constant::GAMMA_R*er+u.powi(2)/6.0-u*cs/3.0,-gi,ge,gt*u.powi(2)/(6.0*gr),constant::GAMMA_R*er+u.powi(2)/6.0+u*cs/3.0],
         ];
         let lambda = array![u-cs,u,u,u,u+cs];
 
@@ -268,9 +268,9 @@ pub fn weno5(stencil: &[f64; 5]) -> f64 {
     let d1 = 0.6;
     let d2 = 0.3;
 
-    let a0 = d0/(utils::DEFAULT_EPS + beta0).powi(2);
-    let a1 = d1/(utils::DEFAULT_EPS + beta1).powi(2);
-    let a2 = d2/(utils::DEFAULT_EPS + beta2).powi(2);
+    let a0 = d0/(constant::DEFAULT_EPS + beta0).powi(2);
+    let a1 = d1/(constant::DEFAULT_EPS + beta1).powi(2);
+    let a2 = d2/(constant::DEFAULT_EPS + beta2).powi(2);
 
     //let tau5 = (beta0-beta2).abs();
 

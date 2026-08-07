@@ -1,11 +1,16 @@
 mod state;
 mod weno;
-mod utils;
+
 mod noncon;
+mod source;
+mod diffusion;
+mod constant;
+
+
 use std::fs::{File, create_dir_all, remove_dir_all};
 use std::io::Write;
 
-use ndarray::Array2;
+
 
 const CFL: f64 = 0.3;
 
@@ -33,6 +38,17 @@ fn weno_stencil_extractor(u: &Vec<state::State>, i: usize) -> weno::Stencil6 {
     }
 }
 
+fn diffusion_stencil_extractor(u: &Vec<state::State>, i: usize) -> diffusion::DiffusionStencil {
+    let nx = u.len();
+    let mut points = [state::State::new(); 5];
+    for j in 0..5 {
+        let n = (i + nx - 2 + j) % nx;
+        points[j] = u[n];
+    }
+
+    diffusion::DiffusionStencil { points: points }
+}
+
 
 fn l(
     u: &Vec<state::State>,
@@ -51,6 +67,11 @@ fn l(
         nx
     ];
 
+    let mut diffu = vec![
+        state::State::new();
+        nx + 1
+    ];
+
     for i in 0..(nx+1) {
 
         let stencil =
@@ -59,6 +80,10 @@ fn l(
 
         flux[i] =
             stencil.reconstruction(global_alpha, true);
+
+        let sten = diffusion_stencil_extractor(&u, i);
+
+        diffu[i] = sten.build_diffusion();
     }
     //println!("{:?}",flux);
     for i in 0..nx {
@@ -66,7 +91,10 @@ fn l(
         let k1 = k1.scalar_prod(1.0/dx);
         let sten = noncon_stencil_extractor(&u, i);
         let k2 = noncon::nonconservative(&sten, dx);
-        qp1[i] = k1.add(k2);
+        let s = source::source(u[i]);
+        let dif = state::update(diffu[i], diffu[i+1]).scalar_prod(-1.0);
+        let dif = dif.scalar_prod(1.0/dx);
+        qp1[i] = k1.add(k2).add(s).add(dif);
     }
     qp1
 }
@@ -153,10 +181,10 @@ fn calc_global_alpha(u: &Vec<state::State>) ->f64 {
         let ee = state1.ee/state1.rho - u*u/6.0;
         let ei = state1.ei/state1.rho - u*u/6.0;
         let er = state1.er/state1.rho - u*u/6.0;
-        let gi = state::GAMMA_I - 1.0;
-        let ge = state::GAMMA_E - 1.0;
-        let gr = state::GAMMA_R - 1.0;
-        let cs = (state::GAMMA_E*ge*ee + state::GAMMA_I*gi*ei + state::GAMMA_R*gr*er).sqrt();
+        let gi = constant::GAMMA_I - 1.0;
+        let ge = constant::GAMMA_E - 1.0;
+        let gr = constant::GAMMA_R - 1.0;
+        let cs = (constant::GAMMA_E*ge*ee + constant::GAMMA_I*gi*ei + constant::GAMMA_R*gr*er).sqrt();
 
         let alpha = cs + (state1.mom/state1.rho).abs();
 

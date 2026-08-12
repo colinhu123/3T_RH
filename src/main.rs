@@ -5,14 +5,11 @@ mod noncon;
 mod source;
 mod diffusion;
 mod constant;
-
-
+//mod tdma;
+//mod compact;
 use std::fs::{File, create_dir_all, remove_dir_all};
 use std::io::Write;
 
-
-
-const CFL: f64 = 0.3;
 
 fn noncon_stencil_extractor(u: &Vec<state::State>,i: usize) -> [state::State; 9] {
     let nx = u.len();
@@ -167,7 +164,7 @@ fn init() -> (Vec<state::State>,usize){
 
 }
 
-fn init_2()-> (Vec<state::State>,usize) {
+fn _init_2()-> (Vec<state::State>,usize) {
 
     let nx = 800;
     let mut u = vec![state::State::new(); nx];
@@ -301,7 +298,7 @@ fn main() {
     for n in 0..1600 {
 
         let dt = calc_global_alpha(&u,dx);
-        println!("{:?}", dt);
+        //println!("{:?}", dt);
 
         u =
             rk3_ssp(

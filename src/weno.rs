@@ -2,12 +2,6 @@ use crate::{constant, state};
 use ndarray::{Array1,Array2,array};
 use ndarray_linalg::Inverse;
 
-pub enum ReconstructionType {
-    Conservative,
-    CharAnaly,
-    CharNum,
-}
-
 #[derive(Clone,Copy,Debug)]
 pub struct Stencil6 {
     pub points: [state::State; 6],
@@ -17,7 +11,7 @@ pub struct Stencil6 {
 
 impl Stencil6 {
 
-    pub fn build_a(&self)->Array2<f64> {
+    pub fn _build_a(&self)->Array2<f64> {
         let state1 = self.points[3];
         let state2 = self.points[2];
         let u1 = state1.mom/state1.rho;

@@ -68,7 +68,7 @@ impl State {
         return (er*self.rho/constant::A).powf(0.25);
     }
 
-    pub fn roe_ave(&self, state: State) -> Self {
+    pub fn _roe_ave(&self, state: State) -> Self {
         let rho1 = self.rho;
         let rho2 = state.rho;
         let denom = rho1 + rho2;

@@ -5,345 +5,545 @@ mod noncon;
 mod source;
 mod diffusion;
 mod constant;
-//mod tdma;
-//mod compact;
-use std::fs::{File, create_dir_all, remove_dir_all};
-use std::io::Write;
+mod io;
 
+use rayon::prelude::*;
 
-fn noncon_stencil_extractor(u: &Vec<state::State>,i: usize) -> [state::State; 9] {
+type Grid = Vec<Vec<state::State>>;
+
+fn noncon_stencil_extractor(
+    u: &Grid,
+    i: usize,
+    j: usize,
+    dir: state::Direction,
+) -> [state::State; 9] {
     let nx = u.len();
+    let ny = u[0].len();
+
     let mut stencil = [state::State::new(); 9];
-    for j in 0..9 {
-        let n = (i + nx - 4 + j) % nx;
-        stencil[j] = u[n];
+
+    for k in 0..9 {
+        match dir {
+            state::Direction::X => {
+                let ii = (i + nx - 4 + k) % nx;
+                stencil[k] = u[ii][j];
+            }
+
+            state::Direction::Y => {
+                let jj = (j + ny - 4 + k) % ny;
+                stencil[k] = u[i][jj];
+            }
+        }
     }
+
     stencil
 }
 
-fn weno_stencil_extractor(u: &Vec<state::State>, i: usize) -> weno::Stencil6 {
-    //here i range is 0..(nx+1)
+fn weno_stencil_extractor(
+    u: &Grid,
+    i: usize,
+    j: usize,
+    dir: state::Direction,
+) -> weno::Stencil6 {
     let nx = u.len();
+    let ny = u[0].len();
+
     let mut points = [state::State::new(); 6];
-    for j in 0..6 {
-        let n = (i + nx - 3 + j) % nx;
-        points[j] = u[n];
+
+    for k in 0..6 {
+        match dir {
+            state::Direction::X => {
+                let ii = (i + nx - 3 + k) % nx;
+                points[k] = u[ii][j];
+            }
+
+            state::Direction::Y => {
+                let jj = (j + ny - 3 + k) % ny;
+                points[k] = u[i][jj];
+            }
+        }
     }
 
     weno::Stencil6 {
-        points: points,
+        points,
+        dir,
     }
 }
 
-fn diffusion_stencil_extractor(u: &Vec<state::State>, i: usize) -> diffusion::DiffusionStencil {
+fn diffusion_stencil_extractor(
+    u: &Grid,
+    i: usize,
+    j: usize,
+    dir: state::Direction,
+) -> diffusion::DiffusionStencil {
     let nx = u.len();
+    let ny = u[0].len();
+
     let mut points = [state::State::new(); 6];
-    for j in 0..6 {
-        let n = (i + nx - 3 + j) % nx;
-        points[j] = u[n];
+
+    for k in 0..6 {
+        match dir {
+            state::Direction::X => {
+                let ii = (i + nx - 3 + k) % nx;
+                points[k] = u[ii][j];
+            }
+
+            state::Direction::Y => {
+                let jj = (j + ny - 3 + k) % ny;
+                points[k] = u[i][jj];
+            }
+        }
     }
 
-    diffusion::DiffusionStencil { points: points }
+    diffusion::DiffusionStencil {
+        points,
+        dir,
+    }
 }
 
 
 fn l(
-    u: &Vec<state::State>,
-    dx: f64
-) -> Vec<state::State> {
-
+    u: &Grid,
+    dx: f64,
+    dy: f64,
+) -> Grid {
     let nx = u.len();
+    let ny = u[0].len();
 
-    let mut flux = vec![
-        state::State::new();
-        nx + 1
-    ];
-    let mut qp1 = vec![
-        state::State::new();
-        nx
-    ];
+    // ============================================================
+    // X interface flux + diffusion
+    // ============================================================
 
-    let mut diffu = vec![
-        state::State::new();
-        nx + 1
-    ];
+    let flux_x: Grid =
+        (0..=nx)
+            .into_par_iter()
+            .map(|i| {
+                let ii = i % nx;
 
-    for i in 0..(nx+1) {
+                (0..ny)
+                    .map(|j| {
+                        let stencil =
+                            weno_stencil_extractor(
+                                u,
+                                ii,
+                                j,
+                                state::Direction::X,
+                            );
 
-        let stencil =
-            weno_stencil_extractor(&u, i);
-            //println!("{:?}",stencil);
+                        stencil.reconstruction(true)
+                    })
+                    .collect()
+            })
+            .collect();
 
-        flux[i] =
-            stencil.reconstruction(true);
+    let diff_x: Grid =
+        (0..=nx)
+            .into_par_iter()
+            .map(|i| {
+                let ii = i % nx;
 
-        let sten = diffusion_stencil_extractor(&u, i);
+                (0..ny)
+                    .map(|j| {
+                        let stencil =
+                            diffusion_stencil_extractor(
+                                u,
+                                ii,
+                                j,
+                                state::Direction::X,
+                            );
 
-        diffu[i] = sten.build_diffusion();
-    }
-    //println!("{:?}",flux);
-    for i in 0..nx {
-        let k1 = state::update(flux[i], flux[i+1]);
-        let k1 = k1.scalar_prod(1.0/dx);
-        let sten = noncon_stencil_extractor(&u, i);
-        let k2 = noncon::nonconservative(&sten, dx);
-        let s = source::source(u[i]);
-        let dif = state::update(diffu[i], diffu[i+1]).scalar_prod(-1.0);
-        let dif = dif.scalar_prod(1.0/dx).scalar_prod(1.0/dx);
-        qp1[i] = k1.add(k2).add(s).add(dif);
-    }
-    qp1
+                        stencil.build_diffusion()
+                    })
+                    .collect()
+            })
+            .collect();
+
+    // ============================================================
+    // Y interface flux + diffusion
+    // ============================================================
+
+    let flux_y: Grid =
+        (0..nx)
+            .into_par_iter()
+            .map(|i| {
+                (0..=ny)
+                    .map(|j| {
+                        let jj = j % ny;
+
+                        let stencil =
+                            weno_stencil_extractor(
+                                u,
+                                i,
+                                jj,
+                                state::Direction::Y,
+                            );
+
+                        stencil.reconstruction(true)
+                    })
+                    .collect()
+            })
+            .collect();
+
+    let diff_y: Grid =
+        (0..nx)
+            .into_par_iter()
+            .map(|i| {
+                (0..=ny)
+                    .map(|j| {
+                        let jj = j % ny;
+
+                        let stencil =
+                            diffusion_stencil_extractor(
+                                u,
+                                i,
+                                jj,
+                                state::Direction::Y,
+                            );
+
+                        stencil.build_diffusion()
+                    })
+                    .collect()
+            })
+            .collect();
+
+    // ============================================================
+    // Cell-centered RHS
+    // ============================================================
+
+    (0..nx)
+        .into_par_iter()
+        .map(|i| {
+            (0..ny)
+                .map(|j| {
+                    // --------------------------------------------
+                    // Conservative flux divergence
+                    // --------------------------------------------
+
+                    let fx =
+                        state::update(
+                            flux_x[i][j],
+                            flux_x[i + 1][j],
+                        )
+                        .scalar_prod(1.0 / dx);
+
+                    let fy =
+                        state::update(
+                            flux_y[i][j],
+                            flux_y[i][j + 1],
+                        )
+                        .scalar_prod(1.0 / dy);
+
+                    // --------------------------------------------
+                    // Nonconservative X
+                    // --------------------------------------------
+
+                    let stencil_x =
+                        noncon_stencil_extractor(
+                            u,
+                            i,
+                            j,
+                            state::Direction::X,
+                        );
+
+                    let nc_x =
+                        noncon::nonconservative_x(
+                            &stencil_x,
+                            dx,
+                        );
+
+                    // --------------------------------------------
+                    // Nonconservative Y
+                    // --------------------------------------------
+
+                    let stencil_y =
+                        noncon_stencil_extractor(
+                            u,
+                            i,
+                            j,
+                            state::Direction::Y,
+                        );
+
+                    let nc_y =
+                        noncon::nonconservative_y(
+                            &stencil_y,
+                            dy,
+                        );
+
+                    // --------------------------------------------
+                    // Source
+                    // --------------------------------------------
+
+                    let s =
+                        source::source(u[i][j]);
+
+                    // --------------------------------------------
+                    // Diffusion
+                    // --------------------------------------------
+
+                    let dif_x =
+                        state::update(
+                            diff_x[i][j],
+                            diff_x[i + 1][j],
+                        )
+                        .scalar_prod(-1.0 / (dx * dx));
+
+                    let dif_y =
+                        state::update(
+                            diff_y[i][j],
+                            diff_y[i][j + 1],
+                        )
+                        .scalar_prod(-1.0 / (dy * dy));
+
+                    // --------------------------------------------
+                    // Total
+                    // --------------------------------------------
+
+                    fx
+                        .add(fy)
+                        .add(nc_x)
+                        .add(nc_y)
+                        .add(s)
+                        .add(dif_x)
+                        .add(dif_y)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 
-fn rk3_ssp(u: &Vec<state::State>, dx: f64, dt: f64)->Vec<state::State> {
+fn rk3_ssp(
+    u: &Grid,
+    dx: f64,
+    dy: f64,
+    dt: f64,
+) -> Grid {
     let nx = u.len();
+    let ny = u[0].len();
 
-    let l1 = l(u,dx);
-    let mut u1 = vec![
-        state::State::new();
-        nx
-    ];
-    for i in 0..nx {
-        let k1 = l1[i].scalar_prod(dt);
-        u1[i] = k1.add(u[i]);
-    }
+    // ============================================================
+    // Stage 1
+    // ============================================================
 
-    let mut u2 = vec![state::State::new(); nx];
-    let l2 = l(&u1, dx);
-    for i in 0..nx {
-        let state_term = u1[i].scalar_prod(0.25);
-        let flux_term = l2[i].scalar_prod(dt/4.0);
-        u2[i] = u[i].scalar_prod(0.75).add(state_term).add(flux_term);
-    }
+    let l1 = l(u, dx, dy);
 
-    let mut u3 = vec![state::State::new(); nx];
-    let l3 = l(&u2, dx);
-    for i in 0..nx {
-        let state_term = u2[i].scalar_prod(2.0/3.0);
-        let flux_term = l3[i].scalar_prod(2.0*dt/3.0);
-        u3[i] = u[i].scalar_prod(1.0/3.0).add(state_term).add(flux_term);
-    }
+    let u1: Grid =
+        (0..nx)
+            .into_par_iter()
+            .map(|i| {
+                (0..ny)
+                    .map(|j| {
+                        u[i][j]
+                            .add(
+                                l1[i][j]
+                                    .scalar_prod(dt)
+                            )
+                    })
+                    .collect()
+            })
+            .collect();
 
-    u3
+    // ============================================================
+    // Stage 2
+    // ============================================================
+
+    let l2 = l(&u1, dx, dy);
+
+    let u2: Grid =
+        (0..nx)
+            .into_par_iter()
+            .map(|i| {
+                (0..ny)
+                    .map(|j| {
+                        u[i][j]
+                            .scalar_prod(0.75)
+                            .add(
+                                u1[i][j]
+                                    .scalar_prod(0.25)
+                            )
+                            .add(
+                                l2[i][j]
+                                    .scalar_prod(dt / 4.0)
+                            )
+                    })
+                    .collect()
+            })
+            .collect();
+
+    // ============================================================
+    // Stage 3
+    // ============================================================
+
+    let l3 = l(&u2, dx, dy);
+
+    (0..nx)
+        .into_par_iter()
+        .map(|i| {
+            (0..ny)
+                .map(|j| {
+                    u[i][j]
+                        .scalar_prod(1.0 / 3.0)
+                        .add(
+                            u2[i][j]
+                                .scalar_prod(2.0 / 3.0)
+                        )
+                        .add(
+                            l3[i][j]
+                                .scalar_prod(
+                                    2.0 * dt / 3.0
+                                )
+                        )
+                })
+                .collect()
+        })
+        .collect()
 }
 
-fn init() -> (Vec<state::State>,usize){
+fn init() -> (Grid, usize, usize) {
     let nx = 400;
-    let mut u = vec![state::State::new(); nx];
+    let ny = 100;
+
+    let mut u =
+        vec![
+            vec![state::State::new(); ny];
+            nx
+        ];
 
     let s1 = state::State {
         rho: 0.445,
-        mom: 0.31061,
+        mom_x: 0.31061,
+        mom_y: 0.0,
         ee: 1.8,
         ei: 1.8,
         er: 3.564,
     };
 
     let s2 = state::State {
-        rho:0.5,
-        mom: 0.0,
+        rho: 0.5,
+        mom_x: 0.0,
+        mom_y: 0.0,
         ee: 0.285,
         ei: 0.285,
         er: 0.571,
     };
 
     for i in 0..nx {
-        if i < (0.25*nx as f64) as usize {
-            u[i] = s1;
-        }
-        else if i > (0.75*nx as f64) as usize {
-            u[i] = s1;
-        }
-        else {
-            u[i] = s2;
-        }
-    }
-
-    (u, nx)
-
-}
-
-fn _init_2()-> (Vec<state::State>,usize) {
-
-    let nx = 800;
-    let mut u = vec![state::State::new(); nx];
-
-    let p1 = 100.0;
-    let s1 = state::State::primi2con(1.0, 0.0, p1/3.0, p1/3.0, p1/3.0);
-    let p2 = 0.01;
-    let s2 = state::State::primi2con(1.0, 0.0, p2/3.0, p2/3.0, p2/3.0);
-
-    for i in 0..nx {
-        if i < (0.05*nx as f64) as usize {
-            u[i] = s1;
-        }
-        else if i < (0.45 * nx as f64) as usize {
-            u[i] = s2;
-        }
-        else if i < (0.55 * nx as f64) as usize {
-            u[i] = s1;
-        }
-        else if i < (0.95* nx as f64) as usize {
-            u[i] = s2;
-        }
-        else {
-            u[i] = s1
+        for j in 0..ny {
+            if i < (0.25 * nx as f64) as usize {
+                u[i][j] = s1;
+            } else if i >
+                (0.75 * nx as f64) as usize
+            {
+                u[i][j] = s1;
+            } else {
+                u[i][j] = s2;
+            }
         }
     }
-    (u,nx)
 
+    (u, nx, ny)
 }
 
-fn calc_global_alpha(u: &Vec<state::State>,dx: f64) ->f64 {
+
+
+fn calc_global_dt(
+    u: &Grid,
+    dx: f64,
+    dy: f64,
+) -> f64 {
     let nx = u.len();
+    let ny = u[0].len();
 
-    let mut global_dt = 10.0;
+    let mut global_dt = f64::INFINITY;
 
     for i in 0..nx {
-
-        let dt = dt::get_local_dt(u[i], dx);
-        if dt < global_dt {
-            global_dt = dt;
-        }
-        else {
-            continue;
+        for j in 0..ny {
+            let dt_x =
+                dt::get_local_dt(
+                    u[i][j],
+                    dx,
+                    dy,
+                );
+            global_dt =
+                global_dt
+                .min(dt_x)
         }
     }
+
     global_dt
 }
 
-fn save_data(
-    u: &Vec<state::State>,
-    filename: &str
-) {
-
-    // create data folder if it does not exist
-    create_dir_all("data")
-        .expect("Cannot create data directory");
-
-
-    let path = format!("data/{}", filename);
-
-
-    let mut file =
-        File::create(path)
-        .expect("Cannot create output file");
-
-
-    // header
-    writeln!(
-        file,
-        "x,rho,mom,ee,ei,er"
-    ).unwrap();
-
-
-    let nx = u.len();
-
-
-    for i in 0..nx {
-
-        let x =
-            i as f64 / (nx-1) as f64;
-
-
-        writeln!(
-            file,
-            "{},{},{},{},{},{}",
-            x,
-            u[i].rho,
-            u[i].mom,
-            u[i].ee,
-            u[i].ei,
-            u[i].er
-        ).unwrap();
-    }
-
-}
-
-fn clear_data_folder() {
-
-    let path = "data";
-
-    if std::path::Path::new(path).exists() {
-
-        remove_dir_all(path)
-            .expect("Failed to remove old data folder");
-
-    }
-
-    create_dir_all(path)
-        .expect("Failed to create data folder");
-}
 
 fn main() {
-    
-    clear_data_folder();
+    io::clear_data_folder();
 
-    let  (mut u,nx) = init();
+    let (mut u, nx, ny) = init();
 
+    let lx = 40.0;
+    let ly = 10.0;
 
-    save_data(
+    let dx = lx / nx as f64;
+    let dy = ly / ny as f64;
+
+    io::save_data(
         &u,
-        "solution_0000.dat"
+        "solution_0000.dat",
+        lx,
+        ly,
     );
 
-
-    let dx = 40.0/nx as f64;
-
     let mut t = 0.0;
+    let t_final = 1.0;
 
-    let t_f = 1.0;
+    let mut n = 0usize;
 
-    for n in 0..1600 {
-
-        let dt = calc_global_alpha(&u,dx);
-        //println!("{:?}", dt);
-
-        u =
-            rk3_ssp(
+    while t < t_final {
+        let mut dt =
+            calc_global_dt(
                 &u,
                 dx,
-                dt
+                dy,
             );
 
+        // Do not step beyond final time
+        if t + dt > t_final {
+            dt = t_final - t;
+        }
 
-        let filename =
-            format!("solution_{:04}.dat", n+1);
-
-
-        save_data(
+        u = rk3_ssp(
             &u,
-            &filename
+            dx,
+            dy,
+            dt,
         );
 
         t += dt;
+        n += 1;
 
-        if t >= t_f {
-            println!("t_final has reached");
-            break;
-        }
+        println!(
+            "step = {}, t = {:.8e}, dt = {:.8e}",
+            n,
+            t,
+            dt
+        );
+
+        let filename =
+            format!(
+                "solution_{:04}.dat",
+                n
+            );
+
+        io::save_data(
+            &u,
+            &filename,
+            lx,
+            ly,
+        );
     }
+
+    println!(
+        "Finished: t = {}, steps = {}",
+        t,
+        n
+    );
 }
-
-
-
-//fn main() {
-//    let s1 = state::State {
-//        rho: 0.445,
-//        mom: 0.31061,
-//        ee: 1.8,
-//        ei: 1.8,
-//        er: 3.564,
-//    };
-//
-//    let stencil = weno::Stencil6 {
-//        points: [s1; 6],
-//    };
-//
-//    let (lambda,r) = stencil.build_r();
-//    let gamma = Array2::from_diag(&lambda);
-//    let a = stencil.build_a();
-//    println!("{:?}",a.dot(&r));
-//    println!("{:?}",r.dot(&gamma));
-//}

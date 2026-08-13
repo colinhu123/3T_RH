@@ -1,9 +1,10 @@
-use crate::state::State;
+use crate::state::{self, State};
 use crate::constant;
 
 
 pub struct DiffusionStencil {
     pub points: [State; 6],
+    pub dir: state::Direction,
 }
 
 impl DiffusionStencil {
@@ -23,7 +24,8 @@ impl DiffusionStencil {
 
         State {
             rho: 0.0,
-            mom: 0.0,
+            mom_x: 0.0,
+            mom_y: 0.0,
             ee: ee_term/180.0,
             ei: ei_term/180.0,
             er: er_term/180.0,

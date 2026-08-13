@@ -10,7 +10,8 @@ pub fn n_vector(u: &state::State) -> state::State {
 
     state::State {
         rho: 0.0,
-        mom: 0.0,
+        mom_x: 0.0,
+        mom_y: 0.0,
         ee: 2.0*pe - pi - pr,
         ei: 2.0*pi - pe - pr,
         er: 2.0*pr - pe - pi,
@@ -54,7 +55,7 @@ fn q_pulse(b: &[f64; 7]) -> f64 {
 /// pressure-split components, computed from a 7-point stencil
 /// [i-3, i-2, i-1, i, i+1, i+2, i+3] (index 3 = i is unused, matching
 /// the reference deN()).
-pub fn dNdx(stencil: &[state::State; 7], dx: f64) -> state::State {
+pub fn dN(stencil: &[state::State; 7], dx: f64) -> state::State {
     let mut pe = [0.0; 7];
     let mut pi = [0.0; 7];
     let mut pr = [0.0; 7];
@@ -71,7 +72,8 @@ pub fn dNdx(stencil: &[state::State; 7], dx: f64) -> state::State {
 
     state::State {
         rho: 0.0,
-        mom: 0.0,
+        mom_x: 0.0,
+        mom_y: 0.0,
         ee: 2.0*dpe - dpi - dpr,
         ei: 2.0*dpi - dpe - dpr,
         er: 2.0*dpr - dpe - dpi,
@@ -109,7 +111,8 @@ fn n_jump(stencil8: &[state::State; 8]) -> state::State {
 
     state::State {
         rho: 0.0,
-        mom: 0.0,
+        mom_x: 0.0,
+        mom_y: 0.0,
         ee: jump_component(&n_ee),
         ei: jump_component(&n_ei),
         er: jump_component(&n_er),
@@ -126,57 +129,108 @@ fn n_jump(stencil8: &[state::State; 8]) -> state::State {
 ///
 /// Matches N1_cal() in the reference C++ implementation, including the
 /// division of the upwind jump terms by dx.
-pub fn nonconservative(stencil: &[state::State; 9], dx: f64) -> state::State {
+pub fn nonconservative_direction(
+    stencil: &[state::State; 9],
+    ds: f64,
+    dir: state::Direction,
+) -> state::State {
     let center = &stencil[4];
-    let u = center.mom / center.rho;
+    let v = dir.velocity(center);
 
     let deriv_stencil: [state::State; 7] = [
-        stencil[1], stencil[2], stencil[3], stencil[4],
-        stencil[5], stencil[6], stencil[7],
+        stencil[1],
+        stencil[2],
+        stencil[3],
+        stencil[4],
+        stencil[5],
+        stencil[6],
+        stencil[7],
     ];
-    let derivative = dNdx(&deriv_stencil, dx);
 
-    // N0(i-1): jump at interface i-1/2
-    let stencil_im1: [state::State; 8] = [
-        stencil[0], stencil[1], stencil[2], stencil[3],
-        stencil[4], stencil[5], stencil[6], stencil[7],
+    let derivative = dN(&deriv_stencil, ds);
+
+    let stencil_m: [state::State; 8] = [
+        stencil[0],
+        stencil[1],
+        stencil[2],
+        stencil[3],
+        stencil[4],
+        stencil[5],
+        stencil[6],
+        stencil[7],
     ];
-    let n0_im1 = n_jump(&stencil_im1);
 
-    // N0(i): jump at interface i+1/2
-    let stencil_i: [state::State; 8] = [
-        stencil[1], stencil[2], stencil[3], stencil[4],
-        stencil[5], stencil[6], stencil[7], stencil[8],
+    let stencil_p: [state::State; 8] = [
+        stencil[1],
+        stencil[2],
+        stencil[3],
+        stencil[4],
+        stencil[5],
+        stencil[6],
+        stencil[7],
+        stencil[8],
     ];
-    let n0_i = n_jump(&stencil_i);
 
-    let statejm = stencil[3]; // i-1
-    let statejp = stencil[5]; // i+1
-    let ujm = statejm.mom / statejm.rho;
-    let ujp = statejp.mom / statejp.rho;
+    let jump_m = n_jump(&stencil_m);
+    let jump_p = n_jump(&stencil_p);
 
-    // Eq. (3.6a): max{u_{i-1}, u_i, 0}
-    let coef_left = u.max(ujm).max(0.0) / 3.0;
-    // Eq. (3.6b): min{u_i, u_{i+1}, 0}
-    let coef_right = u.min(ujp).min(0.0) / 3.0;
+    let vm = dir.velocity(&stencil[3]);
+    let vp = dir.velocity(&stencil[5]);
+
+    let coef_left = v.max(vm).max(0.0) / 3.0;
+    let coef_right = v.min(vp).min(0.0) / 3.0;
 
     state::State {
         rho: 0.0,
-        mom: 0.0,
-        ee: u/3.0*derivative.ee + (coef_left*n0_im1.ee + coef_right*n0_i.ee)/dx,
-        ei: u/3.0*derivative.ei + (coef_left*n0_im1.ei + coef_right*n0_i.ei)/dx,
-        er: u/3.0*derivative.er + (coef_left*n0_im1.er + coef_right*n0_i.er)/dx,
+        mom_x: 0.0,
+        mom_y: 0.0,
+
+        ee: v/3.0 * derivative.ee
+            + (coef_left*jump_m.ee + coef_right*jump_p.ee) / ds,
+
+        ei: v/3.0 * derivative.ei
+            + (coef_left*jump_m.ei + coef_right*jump_p.ei) / ds,
+
+        er: v/3.0 * derivative.er
+            + (coef_left*jump_m.er + coef_right*jump_p.er) / ds,
     }
 }
 
+pub fn nonconservative_x(
+    stencil: &[state::State; 9],
+    dx: f64,
+) -> state::State {
+    nonconservative_direction(stencil, dx, state::Direction::X)
+}
+
+pub fn nonconservative_y(
+    stencil: &[state::State; 9],
+    dy: f64,
+) -> state::State {
+    nonconservative_direction(stencil, dy, state::Direction::Y)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::State;
 
-    fn make_state(rho: f64, mom: f64, ee: f64, ei: f64, er: f64) -> State {
-        State { rho, mom, ee, ei, er }
+    fn make_state(
+        rho: f64,
+        mom_x: f64,
+        mom_y: f64,
+        ee: f64,
+        ei: f64,
+        er: f64,
+    ) -> State {
+        State {
+            rho,
+            mom_x,
+            mom_y,
+            ee,
+            ei,
+            er,
+        }
     }
 
     fn constant_stencil7(s: State) -> [State; 7] {
@@ -191,13 +245,26 @@ mod tests {
         [s; 9]
     }
 
+    // ============================================================
+    // n_vector
+    // ============================================================
+
     #[test]
     fn test_n_vector_zero_pressure() {
-        let s = make_state(1.0, 0.0, 0.0, 0.0, 0.0);
+        let s = make_state(
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        );
+
         let n = n_vector(&s);
 
         assert_eq!(n.rho, 0.0);
-        assert_eq!(n.mom, 0.0);
+        assert_eq!(n.mom_x, 0.0);
+        assert_eq!(n.mom_y, 0.0);
         assert_eq!(n.ee, 0.0);
         assert_eq!(n.ei, 0.0);
         assert_eq!(n.er, 0.0);
@@ -206,102 +273,365 @@ mod tests {
     #[test]
     fn test_n_vector_pressure_split_inverse() {
         /*
-         The transformation is:
+        The transformation is:
 
-         Ne = 2Pe - Pi - Pr
-         Ni = 2Pi - Pe - Pr
-         Nr = 2Pr - Pe - Pi
+        Ne = 2Pe - Pi - Pr
+        Ni = 2Pi - Pe - Pr
+        Nr = 2Pr - Pe - Pi
         */
 
-        let s = make_state(1.0, 0.0, 5.0, 5.0, 5.0);
+        let s = make_state(
+            1.0,
+            0.0,
+            0.0,
+            5.0,
+            5.0,
+            5.0,
+        );
+
         let n = n_vector(&s);
 
-        assert!((n.ee - 5.0/3.0).abs() < 1e-12);
-        assert!((n.ei - 5.0/3.0).abs() < 1e-12);
-        assert!((n.er + 10.0/3.0).abs() < 1e-12);
+        assert!((n.ee - 5.0 / 3.0).abs() < 1e-12);
+        assert!((n.ei - 5.0 / 3.0).abs() < 1e-12);
+        assert!((n.er + 10.0 / 3.0).abs() < 1e-12);
     }
+
+    // ============================================================
+    // sixth_order_derivative
+    // ============================================================
 
     #[test]
     fn test_sixth_order_derivative_constant_function() {
-        let result = sixth_order_derivative(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.1);
+        let result = sixth_order_derivative(
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.1,
+        );
+
         assert!(result.abs() < 1e-14);
     }
 
     #[test]
     fn test_sixth_order_derivative_linear_function() {
         /*
-        For f(x)=x:
-        qm3=-3, qm2=-2, qm1=-1, qp1=1, qp2=2, qp3=3
+        For f(s) = s:
+
+        qm3 = -3
+        qm2 = -2
+        qm1 = -1
+        qp1 =  1
+        qp2 =  2
+        qp3 =  3
+
         derivative should be 1.
         */
-        let result = sixth_order_derivative(-3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 1.0);
+
+        let result = sixth_order_derivative(
+            -3.0,
+            -2.0,
+            -1.0,
+            1.0,
+            2.0,
+            3.0,
+            1.0,
+        );
+
         assert!((result - 1.0).abs() < 1e-12);
     }
 
+    // ============================================================
+    // dN
+    // ============================================================
+
     #[test]
-    fn test_dNdx_constant_state() {
-        let s = make_state(1.0, 0.0, 3.0, 3.0, 3.0);
+    fn test_dN_constant_state() {
+        let s = make_state(
+            1.0,
+            0.0,
+            0.0,
+            3.0,
+            3.0,
+            3.0,
+        );
+
         let stencil = constant_stencil7(s);
-        let result = dNdx(&stencil, 1.0);
+
+        let result = dN(&stencil, 1.0);
+
+        assert_eq!(result.rho, 0.0);
+        assert_eq!(result.mom_x, 0.0);
+        assert_eq!(result.mom_y, 0.0);
 
         assert!(result.ee.abs() < 1e-14);
         assert!(result.ei.abs() < 1e-14);
         assert!(result.er.abs() < 1e-14);
     }
 
+    // ============================================================
+    // n_jump
+    // ============================================================
+
     #[test]
     fn test_n_jump_constant_state() {
-        let s = make_state(1.0, 0.5, 2.0, 2.0, 2.0);
+        let s = make_state(
+            1.0,
+            0.5,
+            0.7,
+            2.0,
+            2.0,
+            2.0,
+        );
+
         let stencil = constant_stencil8(s);
+
         let jump = n_jump(&stencil);
+
+        assert_eq!(jump.rho, 0.0);
+        assert_eq!(jump.mom_x, 0.0);
+        assert_eq!(jump.mom_y, 0.0);
 
         assert!(jump.ee.abs() < 1e-10);
         assert!(jump.ei.abs() < 1e-10);
         assert!(jump.er.abs() < 1e-10);
     }
 
+    // ============================================================
+    // Direction
+    // ============================================================
+
     #[test]
-    fn test_nonconservative_constant_state() {
-        let s = make_state(1.0, 0.5, 2.0, 2.0, 2.0);
+    fn test_direction_velocity_x() {
+        let s = make_state(
+            2.0,
+            6.0,
+            10.0,
+            1.0,
+            1.0,
+            1.0,
+        );
+
+        let velocity = state::Direction::X.velocity(&s);
+
+        assert!((velocity - 3.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn test_direction_velocity_y() {
+        let s = make_state(
+            2.0,
+            6.0,
+            10.0,
+            1.0,
+            1.0,
+            1.0,
+        );
+
+        let velocity = state::Direction::Y.velocity(&s);
+
+        assert!((velocity - 5.0).abs() < 1e-14);
+    }
+
+    // ============================================================
+    // nonconservative: constant state
+    // ============================================================
+
+    #[test]
+    fn test_nonconservative_x_constant_state() {
+        let s = make_state(
+            1.0,
+            0.5,
+            0.8,
+            2.0,
+            2.0,
+            2.0,
+        );
+
         let stencil = constant_stencil9(s);
-        let result = nonconservative(&stencil, 1.0);
+
+        let result = nonconservative_x(&stencil, 1.0);
 
         /*
-        A uniform state has:
-            dNdx = 0
+        Uniform state:
+
+            dN/dx = 0
             jumps = 0
-        Therefore the non-conservative contribution vanishes.
+
+        Therefore the x-direction nonconservative
+        contribution vanishes.
         */
+
+        assert_eq!(result.rho, 0.0);
+        assert_eq!(result.mom_x, 0.0);
+        assert_eq!(result.mom_y, 0.0);
+
         assert!(result.ee.abs() < 1e-10);
         assert!(result.ei.abs() < 1e-10);
         assert!(result.er.abs() < 1e-10);
     }
 
     #[test]
-    fn test_nonconservative_zero_velocity() {
-        let stencil = [
-            make_state(1.0, 0.0, 0.9, 1.9, 2.9),
-            make_state(1.0, 0.0, 1.0, 2.0, 3.0),
-            make_state(1.0, 0.0, 1.1, 2.1, 3.1),
-            make_state(1.0, 0.0, 1.2, 2.2, 3.2),
-            make_state(1.0, 0.0, 1.3, 2.3, 3.3),
-            make_state(1.0, 0.0, 1.4, 2.4, 3.4),
-            make_state(1.0, 0.0, 1.5, 2.5, 3.5),
-            make_state(1.0, 0.0, 1.6, 2.6, 3.6),
-            make_state(1.0, 0.0, 1.7, 2.7, 3.7),
-        ];
+    fn test_nonconservative_y_constant_state() {
+        let s = make_state(
+            1.0,
+            0.5,
+            0.8,
+            2.0,
+            2.0,
+            2.0,
+        );
 
-        let result = nonconservative(&stencil, 1.0);
+        let stencil = constant_stencil9(s);
+
+        let result = nonconservative_y(&stencil, 1.0);
 
         /*
-        Since u=0 everywhere, both the u/3*dNdx term and the upwind
-        coefficients (max/min against 0 with equal-sign neighbors) vanish,
-        so the whole nonconservative contribution should be exactly zero.
+        Uniform state:
+
+            dN/dy = 0
+            jumps = 0
+
+        Therefore the y-direction nonconservative
+        contribution vanishes.
         */
-        assert!(result.rho == 0.0);
-        assert!(result.mom == 0.0);
+
+        assert_eq!(result.rho, 0.0);
+        assert_eq!(result.mom_x, 0.0);
+        assert_eq!(result.mom_y, 0.0);
+
         assert!(result.ee.abs() < 1e-10);
         assert!(result.ei.abs() < 1e-10);
         assert!(result.er.abs() < 1e-10);
+    }
+
+    // ============================================================
+    // zero velocity
+    // ============================================================
+
+    #[test]
+    fn test_nonconservative_x_zero_velocity() {
+        let stencil = [
+            make_state(1.0, 0.0, 1.0, 0.9, 1.9, 2.9),
+            make_state(1.0, 0.0, 1.0, 1.0, 2.0, 3.0),
+            make_state(1.0, 0.0, 1.0, 1.1, 2.1, 3.1),
+            make_state(1.0, 0.0, 1.0, 1.2, 2.2, 3.2),
+            make_state(1.0, 0.0, 1.0, 1.3, 2.3, 3.3),
+            make_state(1.0, 0.0, 1.0, 1.4, 2.4, 3.4),
+            make_state(1.0, 0.0, 1.0, 1.5, 2.5, 3.5),
+            make_state(1.0, 0.0, 1.0, 1.6, 2.6, 3.6),
+            make_state(1.0, 0.0, 1.0, 1.7, 2.7, 3.7),
+        ];
+
+        /*
+        mom_x = 0 everywhere.
+
+        mom_y is deliberately nonzero.
+
+        Therefore this checks that Direction::X really
+        uses mom_x rather than mom_y.
+        */
+
+        let result = nonconservative_x(&stencil, 1.0);
+
+        assert_eq!(result.rho, 0.0);
+        assert_eq!(result.mom_x, 0.0);
+        assert_eq!(result.mom_y, 0.0);
+
+        assert!(result.ee.abs() < 1e-10);
+        assert!(result.ei.abs() < 1e-10);
+        assert!(result.er.abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_nonconservative_y_zero_velocity() {
+        let stencil = [
+            make_state(1.0, 1.0, 0.0, 0.9, 1.9, 2.9),
+            make_state(1.0, 1.0, 0.0, 1.0, 2.0, 3.0),
+            make_state(1.0, 1.0, 0.0, 1.1, 2.1, 3.1),
+            make_state(1.0, 1.0, 0.0, 1.2, 2.2, 3.2),
+            make_state(1.0, 1.0, 0.0, 1.3, 2.3, 3.3),
+            make_state(1.0, 1.0, 0.0, 1.4, 2.4, 3.4),
+            make_state(1.0, 1.0, 0.0, 1.5, 2.5, 3.5),
+            make_state(1.0, 1.0, 0.0, 1.6, 2.6, 3.6),
+            make_state(1.0, 1.0, 0.0, 1.7, 2.7, 3.7),
+        ];
+
+        /*
+        mom_y = 0 everywhere.
+
+        mom_x is deliberately nonzero.
+
+        Therefore this checks that Direction::Y really
+        uses mom_y rather than mom_x.
+        */
+
+        let result = nonconservative_y(&stencil, 1.0);
+
+        assert_eq!(result.rho, 0.0);
+        assert_eq!(result.mom_x, 0.0);
+        assert_eq!(result.mom_y, 0.0);
+
+        assert!(result.ee.abs() < 1e-10);
+        assert!(result.ei.abs() < 1e-10);
+        assert!(result.er.abs() < 1e-10);
+    }
+
+    // ============================================================
+    // wrapper consistency
+    // ============================================================
+
+    #[test]
+    fn test_x_wrapper_matches_direction_function() {
+        let stencil = [
+            make_state(1.0, 0.5, 0.8, 0.9, 1.9, 2.9),
+            make_state(1.0, 0.5, 0.8, 1.0, 2.0, 3.0),
+            make_state(1.0, 0.5, 0.8, 1.1, 2.1, 3.1),
+            make_state(1.0, 0.5, 0.8, 1.2, 2.2, 3.2),
+            make_state(1.0, 0.5, 0.8, 1.3, 2.3, 3.3),
+            make_state(1.0, 0.5, 0.8, 1.4, 2.4, 3.4),
+            make_state(1.0, 0.5, 0.8, 1.5, 2.5, 3.5),
+            make_state(1.0, 0.5, 0.8, 1.6, 2.6, 3.6),
+            make_state(1.0, 0.5, 0.8, 1.7, 2.7, 3.7),
+        ];
+
+        let a = nonconservative_x(&stencil, 0.5);
+        let b = nonconservative_direction(
+            &stencil,
+            0.5,
+            state::Direction::X,
+        );
+
+        assert!((a.ee - b.ee).abs() < 1e-14);
+        assert!((a.ei - b.ei).abs() < 1e-14);
+        assert!((a.er - b.er).abs() < 1e-14);
+    }
+
+    #[test]
+    fn test_y_wrapper_matches_direction_function() {
+        let stencil = [
+            make_state(1.0, 0.5, 0.8, 0.9, 1.9, 2.9),
+            make_state(1.0, 0.5, 0.8, 1.0, 2.0, 3.0),
+            make_state(1.0, 0.5, 0.8, 1.1, 2.1, 3.1),
+            make_state(1.0, 0.5, 0.8, 1.2, 2.2, 3.2),
+            make_state(1.0, 0.5, 0.8, 1.3, 2.3, 3.3),
+            make_state(1.0, 0.5, 0.8, 1.4, 2.4, 3.4),
+            make_state(1.0, 0.5, 0.8, 1.5, 2.5, 3.5),
+            make_state(1.0, 0.5, 0.8, 1.6, 2.6, 3.6),
+            make_state(1.0, 0.5, 0.8, 1.7, 2.7, 3.7),
+        ];
+
+        let a = nonconservative_y(&stencil, 0.25);
+        let b = nonconservative_direction(
+            &stencil,
+            0.25,
+            state::Direction::Y,
+        );
+
+        assert!((a.ee - b.ee).abs() < 1e-14);
+        assert!((a.ei - b.ei).abs() < 1e-14);
+        assert!((a.er - b.er).abs() < 1e-14);
     }
 }

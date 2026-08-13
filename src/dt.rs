@@ -2,12 +2,13 @@ use crate::state::State;
 use crate::constant::*;
 
 
-pub fn get_local_dt(state1: State, dx: f64) -> f64 {
-    let u = state1.mom/state1.rho;
+pub fn get_local_dt(state1: State, dx: f64, dy: f64) -> f64 {
+    let u = state1.mom_x/state1.rho;
+    let v = state1.mom_y/state1.rho;
 
-    let ee = state1.ee/state1.rho - u*u/6.0;
-    let ei = state1.ei/state1.rho - u*u/6.0;
-    let er = state1.er/state1.rho - u*u/6.0;
+    let ee = state1.ee/state1.rho - (u.powi(2) + v.powi(2))/6.0;
+    let ei = state1.ei/state1.rho - (u.powi(2) + v.powi(2))/6.0;
+    let er = state1.er/state1.rho - (u.powi(2) + v.powi(2))/6.0;
     let gi = GAMMA_I - 1.0;
     let ge = GAMMA_E - 1.0;
     let gr = GAMMA_R - 1.0;
@@ -29,6 +30,6 @@ pub fn get_local_dt(state1: State, dx: f64) -> f64 {
     let sj = alpha1.max(alpha2);
     let dj = (KAPPA_E/(CVE*state1.rho)).max(KAPPA_I/(CVI*state1.rho)).max(KAPPA_R/A);
 
-    let vj = cs/dx + 2.0*dj/(dx.powi(2)) + sj;
+    let vj = (u.abs()+cs)/dx + 2.0*dj/(dx.powi(2)+dy.powi(2)) + sj + (v.abs() + cs)/dy;
     LAMBDA/vj
 }

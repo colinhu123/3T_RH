@@ -12,7 +12,8 @@ pub fn source(s: State) -> State {
 
     State {
         rho: 0.0,
-        mom: 0.0,
+        mom_x: 0.0,
+        mom_y: 0.0,
         ee: -constant::OMEGA_EI*(te-ti) - constant::OMEGA_ER*(te.powi(4) - tr.powi(4)),
         ei: constant::OMEGA_EI*(te - ti),
         er: constant::OMEGA_ER*(te.powi(4) - tr.powi(4)),

@@ -3,22 +3,31 @@ use crate::state;
 use std::fs::{File, create_dir_all, remove_dir_all};
 use std::io::Write;
 
-type Grid = Vec<Vec<state::State>>;
 pub fn save_data(
-    u: &Grid,
+    u: &crate::field::Field,
     filename: &str,
     lx: f64,
     ly: f64,
 ) {
+    use std::fs::{
+        create_dir_all,
+        File,
+    };
+
+
     create_dir_all("data")
-        .expect("Cannot create data directory");
+        .expect(
+            "Cannot create data directory"
+        );
 
     let path =
         format!("data/{}", filename);
 
     let mut file =
         File::create(path)
-        .expect("Cannot create output file");
+        .expect(
+            "Cannot create output file"
+        );
 
     writeln!(
         file,
@@ -26,40 +35,46 @@ pub fn save_data(
     )
     .unwrap();
 
-    let nx = u.len();
-    let ny = u[0].len();
+    let nx = u.nx();
+    let ny = u.ny();
 
     let dx = lx / nx as f64;
     let dy = ly / ny as f64;
 
     for j in 0..ny {
         for i in 0..nx {
+            let state =
+                u.get((
+                    i as isize,
+                    j as isize,
+                ));
+
             let x =
-                (i as f64 + 0.5) * dx;
+                (i as f64 + 0.5)
+                * dx;
 
             let y =
-                (j as f64 + 0.5) * dy;
+                (j as f64 + 0.5)
+                * dy;
 
             writeln!(
                 file,
                 "{},{},{},{},{},{},{},{}",
                 x,
                 y,
-                u[i][j].rho,
-                u[i][j].mom_x,
-                u[i][j].mom_y,
-                u[i][j].ee,
-                u[i][j].ei,
-                u[i][j].er,
+                state.rho,
+                state.mom_x,
+                state.mom_y,
+                state.ee,
+                state.ei,
+                state.er,
             )
             .unwrap();
         }
 
-        // Helpful for gnuplot structured-grid plots
         writeln!(file).unwrap();
     }
 }
-
 
 pub fn clear_data_folder() {
 

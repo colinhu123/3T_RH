@@ -11,9 +11,442 @@ pub struct Stencil6 {
 
 
 impl Stencil6 {
-    
 
     pub fn build_l(&self) -> Array2<f64> {
+
+
+    let state1 = self.points[3];
+    let state2 = self.points[2];
+    let u1 = state1.mom_x / state1.rho;
+    let u2 = state2.mom_x / state2.rho;
+    let v1 = state1.mom_y / state1.rho;
+    let v2 = state2.mom_y / state2.rho;
+    let w1_sq = u1.powi(2) + v1.powi(2);
+    let w2_sq = u2.powi(2) + v2.powi(2);
+
+    let ee1 =state1.ee / state1.rho- w1_sq / 6.0;
+    let ei1 =state1.ei / state1.rho- w1_sq / 6.0;
+    let er1 =state1.er / state1.rho- w1_sq / 6.0;
+    let ee2 =state2.ee / state2.rho- w2_sq / 6.0;
+    let ei2 =state2.ei / state2.rho- w2_sq / 6.0;
+    let er2 =state2.er / state2.rho- w2_sq / 6.0;
+
+    let rho1 = state1.rho.sqrt();
+    let rho2 = state2.rho.sqrt();
+    let rho_sum = rho1 + rho2;
+
+    let u = (u1 * rho1 + u2 * rho2)/ rho_sum;
+    let v = (v1 * rho1 + v2 * rho2)/ rho_sum;
+    let w2 = u.powi(2) + v.powi(2);
+    let ee = (ee1 * rho1 + ee2 * rho2)/ rho_sum;
+    let ei = (ei1 * rho1 + ei2 * rho2)/ rho_sum;
+    let er =(er1 * rho1 + er2 * rho2)/ rho_sum;
+
+
+
+    let gi = constant::GAMMA_I - 1.0;
+    let ge = constant::GAMMA_E - 1.0;
+    let gr = constant::GAMMA_R - 1.0;
+
+    let gt =gi + ge + gr;
+    let cs2 = constant::GAMMA_E * ge * ee+ constant::GAMMA_I * gi * ei+ constant::GAMMA_R * gr * er;
+    let cs = cs2.sqrt();
+
+
+    let he = 6.0 * gi * gr * (constant::GAMMA_I * ei- constant::GAMMA_R * er) + constant::GAMMA_E * gt * ee * w2;
+
+    let hi = 6.0 * ge * gr * (constant::GAMMA_R * er - constant::GAMMA_E * ee) + constant::GAMMA_I * gt * ei * w2;
+
+    let hr =6.0 * ge * gi* (constant::GAMMA_E * ee- constant::GAMMA_I * ei)+ constant::GAMMA_R* gt* er* w2;
+
+    let b = gt * (36.0 * ge * gi * gr+ gt * w2.powi(2))* cs2;
+
+    let acoustic_den = 12.0 * cs2;
+
+    match self.dir {
+        // ========================================================
+        // X direction
+        // ========================================================
+        state::Direction::X => {
+            array![
+                // ------------------------------------------------
+                // L_A^(1)
+                // acoustic: u - cs
+                // ------------------------------------------------
+                [
+                    (gt*w2 + 6.0*u*cs)
+                        / acoustic_den,
+
+                    (-2.0*gt*u - 6.0*cs)
+                        / acoustic_den,
+
+                    (-2.0*gt*v)
+                        / acoustic_den,
+
+                    6.0*ge
+                        / acoustic_den,
+
+                    6.0*gi
+                        / acoustic_den,
+
+                    6.0*gr
+                        / acoustic_den,
+                ],
+
+                // ------------------------------------------------
+                // L_A^(2)
+                // transverse velocity mode
+                // ------------------------------------------------
+                
+
+                // ------------------------------------------------
+                // L_A^(3)
+                // electron-energy mode
+                // ------------------------------------------------
+                [
+                    ge/gt
+                        - ge*w2/(6.0*cs2)
+                        - ge*gt*w2/b
+                            * (he - cs2*w2),
+
+                    ge*u/(3.0*cs2)
+                        + 2.0*ge*gt*u/b
+                            * (he - cs2*w2),
+
+                    // TYPO FIX:
+                    // this must use v in BOTH terms.
+                    ge*v/(3.0*cs2)
+                        + 2.0*ge*gt*v/b
+                            * (he - cs2*w2),
+
+                    -ge.powi(2)/(gt*cs2)
+                        - 6.0*ge/b
+                            * (
+                                ge*he
+                                - gt*cs2*w2
+                            ),
+
+                    -ge*gi/(gt*cs2)
+                        - 6.0*ge*gi/b
+                            * (
+                                he
+                                - 6.0*gr*cs2
+                            ),
+
+                    -ge*gr/(gt*cs2)
+                        - 6.0*ge*gr/b
+                            * (
+                                he
+                                + 6.0*gi*cs2
+                            ),
+                ],
+
+                // ------------------------------------------------
+                // L_A^(4)
+                // ion-energy mode
+                // ------------------------------------------------
+                [
+                    gi/gt
+                        - gi*w2/(6.0*cs2)
+                        - gi*gt*w2/b
+                            * (hi - cs2*w2),
+
+                    gi*u/(3.0*cs2)
+                        + 2.0*gi*gt*u/b
+                            * (hi - cs2*w2),
+
+                    gi*v/(3.0*cs2)
+                        + 2.0*gi*gt*v/b
+                            * (hi - cs2*w2),
+
+                    -gi*ge/(gt*cs2)
+                        - 6.0*gi*ge/b
+                            * (
+                                hi
+                                + 6.0*gr*cs2
+                            ),
+
+                    -gi.powi(2)/(gt*cs2)
+                        - 6.0*gi/b
+                            * (
+                                gi*hi
+                                - gt*cs2*w2
+                            ),
+
+                    -gi*gr/(gt*cs2)
+                        - 6.0*gi*gr/b
+                            * (
+                                hi
+                                - 6.0*ge*cs2
+                            ),
+                ],
+
+                // ------------------------------------------------
+                // L_A^(5)
+                // radiation-energy mode
+                // ------------------------------------------------
+                [
+                    gr/gt
+                        - gr*w2/(6.0*cs2)
+                        - gr*gt*w2/b
+                            * (hr - cs2*w2),
+
+                    gr*u/(3.0*cs2)
+                        + 2.0*gr*gt*u/b
+                            * (hr - cs2*w2),
+
+                    gr*v/(3.0*cs2)
+                        + 2.0*gr*gt*v/b
+                            * (hr - cs2*w2),
+
+                    -gr*ge/(gt*cs2)
+                        - 6.0*gr*ge/b
+                            * (
+                                hr
+                                - 6.0*gi*cs2
+                            ),
+
+                    -gr*gi/(gt*cs2)
+                        - 6.0*gr*gi/b
+                            * (
+                                hr
+                                + 6.0*ge*cs2
+                            ),
+
+                    -gr.powi(2)/(gt*cs2)
+                        - 6.0*gr/b
+                            * (
+                                gr*hr
+                                - gt*cs2*w2
+                            ),
+                ],
+                [
+                    -v,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+
+                // ------------------------------------------------
+                // L_A^(6)
+                // acoustic: u + cs
+                // ------------------------------------------------
+                [
+                    (gt*w2 - 6.0*u*cs)
+                        / acoustic_den,
+
+                    (-2.0*gt*u + 6.0*cs)
+                        / acoustic_den,
+
+                    (-2.0*gt*v)
+                        / acoustic_den,
+
+                    6.0*ge
+                        / acoustic_den,
+
+                    6.0*gi
+                        / acoustic_den,
+
+                    6.0*gr
+                        / acoustic_den,
+                ],
+            ]
+        }
+
+        // ========================================================
+        // Y direction
+        // ========================================================
+        state::Direction::Y => {
+            array![
+                // ------------------------------------------------
+                // L_B^(1)
+                // acoustic: v - cs
+                // ------------------------------------------------
+                [
+                    (gt*w2 + 6.0*v*cs)
+                        / acoustic_den,
+
+                    (-2.0*gt*u)
+                        / acoustic_den,
+
+                    (-2.0*gt*v - 6.0*cs)
+                        / acoustic_den,
+
+                    6.0*ge
+                        / acoustic_den,
+
+                    6.0*gi
+                        / acoustic_den,
+
+                    6.0*gr
+                        / acoustic_den,
+                ],
+
+                // ------------------------------------------------
+                // L_B^(2)
+                // transverse velocity mode
+                // ------------------------------------------------
+                [
+                    -u,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+
+                // ------------------------------------------------
+                // L_B^(3)
+                // electron-energy mode
+                // ------------------------------------------------
+                [
+                    ge/gt
+                        - ge*w2/(6.0*cs2)
+                        - ge*gt*w2/b
+                            * (he - cs2*w2),
+
+                    ge*u/(3.0*cs2)
+                        + 2.0*ge*gt*u/b
+                            * (he - cs2*w2),
+
+                    ge*v/(3.0*cs2)
+                        + 2.0*ge*gt*v/b
+                            * (he - cs2*w2),
+
+                    -ge.powi(2)/(gt*cs2)
+                        - 6.0*ge/b
+                            * (
+                                ge*he
+                                - gt*cs2*w2
+                            ),
+
+                    -ge*gi/(gt*cs2)
+                        - 6.0*ge*gi/b
+                            * (
+                                he
+                                - 6.0*gr*cs2
+                            ),
+
+                    -ge*gr/(gt*cs2)
+                        - 6.0*ge*gr/b
+                            * (
+                                he
+                                + 6.0*gi*cs2
+                            ),
+                ],
+
+                // ------------------------------------------------
+                // L_B^(4)
+                // ion-energy mode
+                // ------------------------------------------------
+                [
+                    gi/gt
+                        - gi*w2/(6.0*cs2)
+                        - gi*gt*w2/b
+                            * (hi - cs2*w2),
+
+                    gi*u/(3.0*cs2)
+                        + 2.0*gi*gt*u/b
+                            * (hi - cs2*w2),
+
+                    gi*v/(3.0*cs2)
+                        + 2.0*gi*gt*v/b
+                            * (hi - cs2*w2),
+
+                    -gi*ge/(gt*cs2)
+                        - 6.0*gi*ge/b
+                            * (
+                                hi
+                                + 6.0*gr*cs2
+                            ),
+
+                    -gi.powi(2)/(gt*cs2)
+                        - 6.0*gi/b
+                            * (
+                                gi*hi
+                                - gt*cs2*w2
+                            ),
+
+                    -gi*gr/(gt*cs2)
+                        - 6.0*gi*gr/b
+                            * (
+                                hi
+                                - 6.0*ge*cs2
+                            ),
+                ],
+
+                // ------------------------------------------------
+                // L_B^(5)
+                // radiation-energy mode
+                // ------------------------------------------------
+                [
+                    gr/gt
+                        - gr*w2/(6.0*cs2)
+                        - gr*gt*w2/b
+                            * (hr - cs2*w2),
+
+                    gr*u/(3.0*cs2)
+                        + 2.0*gr*gt*u/b
+                            * (hr - cs2*w2),
+
+                    gr*v/(3.0*cs2)
+                        + 2.0*gr*gt*v/b
+                            * (hr - cs2*w2),
+
+                    -gr*ge/(gt*cs2)
+                        - 6.0*gr*ge/b
+                            * (
+                                hr
+                                - 6.0*gi*cs2
+                            ),
+
+                    -gr*gi/(gt*cs2)
+                        - 6.0*gr*gi/b
+                            * (
+                                hr
+                                + 6.0*ge*cs2
+                            ),
+
+                    -gr.powi(2)/(gt*cs2)
+                        - 6.0*gr/b
+                            * (
+                                gr*hr
+                                - gt*cs2*w2
+                            ),
+                ],
+
+                // ------------------------------------------------
+                // L_B^(6)
+                // acoustic: v + cs
+                // ------------------------------------------------
+                [
+                    (gt*w2 - 6.0*v*cs)
+                        / acoustic_den,
+
+                    (-2.0*gt*u)
+                        / acoustic_den,
+
+                    (-2.0*gt*v + 6.0*cs)
+                        / acoustic_den,
+
+                    6.0*ge
+                        / acoustic_den,
+
+                    6.0*gi
+                        / acoustic_den,
+
+                    6.0*gr
+                        / acoustic_den,
+                ],
+            ]
+        }
+    }
+}
+    
+
+    pub fn _build_l_raw(&self) -> Array2<f64> {
         let (_lambda,r) = self.build_r_roe_ave();
         let l = r.inv().unwrap();
         l
@@ -26,12 +459,14 @@ impl Stencil6 {
         let u2 = state2.mom_x/state2.rho;
         let v1 = state1.mom_y/state1.rho;
         let v2 = state2.mom_y/state2.rho;
-        let ee1 = state1.ee/state1.rho - u1*u1/6.0;
-        let ei1 = state1.ei/state1.rho - u1*u1/6.0;
-        let er1 = state1.er/state1.rho - u1*u1/6.0;
-        let ee2 = state2.ee/state2.rho - u2*u2/6.0;
-        let ei2 = state2.ei/state2.rho - u2*u2/6.0;
-        let er2 = state2.er/state2.rho - u2*u2/6.0;
+        let w1_sq = u1.powi(2)+v1.powi(2);
+        let w2_sq = u2.powi(2) + v2.powi(2);
+        let ee1 = state1.ee/state1.rho - w1_sq/6.0;
+        let ei1 = state1.ei/state1.rho - w1_sq/6.0;
+        let er1 = state1.er/state1.rho - w1_sq/6.0;
+        let ee2 = state2.ee/state2.rho - w2_sq/6.0;
+        let ei2 = state2.ei/state2.rho - w2_sq/6.0;
+        let er2 = state2.er/state2.rho - w2_sq/6.0;
         let rho1 = state1.rho.sqrt();
         let rho2 = state2.rho.sqrt();
 
@@ -164,10 +599,10 @@ impl Stencil6 {
             f_minus_stencil[i] = state::State {
                 rho: 0.5*(flux_l[i].rho - a0*state_l[i].rho),
                 mom_x: 0.5*(flux_l[i].mom_x - a1*state_l[i].mom_x),
-                mom_y: 0.5*(flux_l[i].mom_y - state_l[i].mom_y),
-                ee:  0.5*(flux_l[i].ee  - a2*state_l[i].ee),
-                ei:  0.5*(flux_l[i].ei  - a3*state_l[i].ei),
-                er:  0.5*(flux_l[i].er  - a4*state_l[i].er),
+                mom_y: 0.5*(flux_l[i].mom_y - a2*state_l[i].mom_y),
+                ee:  0.5*(flux_l[i].ee  - a3*state_l[i].ee),
+                ei:  0.5*(flux_l[i].ei  - a4*state_l[i].ei),
+                er:  0.5*(flux_l[i].er  - a5*state_l[i].er),
             };
         }
 

@@ -521,6 +521,151 @@ fn init() -> Field {
     u
 }
 
+fn init_bubble() -> Field {
+    // ============================================================
+    // Computational domain
+    // ============================================================
+
+    let nx = 800;
+    let ny = 268;
+
+    let x0 = 0.0;
+    let y0 = 0.0;
+
+    let lx = 6.5;
+    let ly = 0.89;
+
+    let dx = lx / nx as f64;
+    let dy = ly / ny as f64;
+
+    let grid = GridInfo::new(
+        nx,
+        ny,
+        dx,
+        dy,
+        x0,
+        y0,
+    );
+
+    // ============================================================
+    // Initial states
+    // ============================================================
+
+    // Left/background state:
+    //
+    // rho = 1
+    // u = v = 0
+    // pe = pi = pr = 0.238095
+    let left_state = State::primi2con(
+        1.0,
+        0.0,
+        0.0,
+        0.238095,
+        0.238095,
+        0.238095,
+    );
+
+    // Post-shock/right state:
+    //
+    // rho = 1.3764
+    // u = -0.3336
+    // v = 0
+    // pe = pi = pr = 0.373762
+    let right_state = State::primi2con(
+        1.3764,
+        -0.3336,
+        0.0,
+        0.373762,
+        0.373762,
+        0.373762,
+    );
+
+    // Bubble:
+    //
+    // rho = 0.1819
+    // u = v = 0
+    // pe = pi = pr = 0.146972
+    let bubble_state = State::primi2con(
+        0.1819,
+        0.0,
+        0.0,
+        0.146972,
+        0.146972,
+        0.146972,
+    );
+
+    // ============================================================
+    // Boundary conditions
+    //
+    // Field BC ordering:
+    //
+    // [Bottom, Right, Top, Left]
+    // ============================================================
+
+    let bc = [
+        BCType::Wall,                  // Bottom: reflective
+        BCType::Constant(right_state), // Right:  Dirichlet
+        BCType::Wall,                  // Top:    reflective
+        BCType::Constant(left_state),  // Left:   Dirichlet
+    ];
+
+    let mut u = Field::new(
+        grid,
+        bc,
+    );
+
+    // ============================================================
+    // Bubble geometry
+    // ============================================================
+
+    let xc = 3.5;
+    let yc = 0.0;
+    let radius = 0.5;
+
+    let r2 = radius * radius;
+
+    // Shock/interface initially at x = 4.5
+    let shock_x = 4.5;
+
+    // ============================================================
+    // Fill physical cells
+    // ============================================================
+
+    for i in 0..nx {
+        for j in 0..ny {
+            let ii = i as isize;
+            let jj = j as isize;
+
+            // Cell-center coordinates
+            let x = grid.x(ii);
+            let y = grid.y(jj);
+
+            // Distance from bubble center
+            let bubble_distance2 =
+                (x - xc).powi(2)
+                + (y - yc).powi(2);
+
+            let state =
+                if bubble_distance2 <= r2 {
+                    // Bubble takes precedence over background state.
+                    bubble_state
+                } else if x < shock_x {
+                    // Pre-shock/background region
+                    left_state
+                } else {
+                    // Post-shock region
+                    right_state
+                };
+
+            u.set(
+                (ii, jj),
+                state,
+            );
+        }
+    }
+
+    u
+}
 
 
 fn calc_global_dt(
@@ -562,16 +707,23 @@ fn calc_global_dt(
 fn main() {
     io::clear_data_folder();
 
-    let mut u = init();
+    let mut u = init_bubble();
 
     let dx = u.grid().dx;
     let dy = u.grid().dy;
+    let lx = dx * u.nx() as f64;
+    let ly = dy * u.ny() as f64;
 
-    let lx =
-        dx * u.nx() as f64;
 
-    let ly =
-        dy * u.ny() as f64;
+    let mut t = 0.0;
+
+    let t_final = 1.1099;
+
+    // Physical-time interval between stored solutions.
+    let t_store_interval = 0.05;
+    let mut next_store_time = t_store_interval;
+    let mut n = 0usize;
+    let mut store_id = 0usize;
 
     io::save_data(
         &u,
@@ -580,15 +732,22 @@ fn main() {
         ly,
     );
 
-    let mut t = 0.0;
-    let t_final = 1.0;
-
-    let mut n = 0usize;
+    println!(
+        "stored solution_0000.dat at t = {:.8e}",
+        t
+    );
 
     while t < t_final {
-        let mut dt =
-            calc_global_dt(&u);
+        // CFL-limited time step
+        let dt_cfl = calc_global_dt(&u);
+        let mut dt = dt_cfl;
 
+        if next_store_time <= t_final
+            && t + dt > next_store_time
+        {
+            dt =
+                next_store_time - t;
+        }
         if t + dt > t_final {
             dt =
                 t_final - t;
@@ -606,16 +765,55 @@ fn main() {
         n += 1;
 
         println!(
-            "step = {}, t = {:.8e}, dt = {:.8e}",
+            "step = {}, t = {:.8e}, dt = {:.8e}, dt_cfl = {:.8e}",
             n,
             t,
-            dt
+            dt,
+            dt_cfl,
         );
+
+        let reached_store_time =
+            next_store_time <= t_final
+            && t >= next_store_time - 1e-12;
+
+        if reached_store_time {
+            store_id += 1;
+
+            let filename =
+                format!(
+                    "solution_{:04}.dat",
+                    store_id
+                );
+
+            io::save_data(
+                &u,
+                &filename,
+                lx,
+                ly,
+            );
+
+            println!(
+                "stored {} at t = {:.8e}",
+                filename,
+                t
+            );
+            next_store_time =
+                (store_id + 1) as f64
+                * t_store_interval;
+        }
+    }
+
+    let last_regular_store_time =
+        store_id as f64
+        * t_store_interval;
+
+    if (t - last_regular_store_time).abs() > 1e-12 {
+        store_id += 1;
 
         let filename =
             format!(
                 "solution_{:04}.dat",
-                n
+                store_id
             );
 
         io::save_data(
@@ -624,11 +822,18 @@ fn main() {
             lx,
             ly,
         );
+
+        println!(
+            "stored final solution {} at t = {:.8e}",
+            filename,
+            t
+        );
     }
 
     println!(
-        "Finished: t = {}, steps = {}",
+        "Finished: t = {:.8e}, steps = {}, stored = {}",
         t,
-        n
+        n,
+        store_id + 1,
     );
 }

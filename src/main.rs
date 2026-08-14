@@ -12,6 +12,7 @@ mod bc;
 use bc::BCType;
 use field::{Field, GridInfo};
 use state::{Direction, State};
+use rayon::prelude::*;
 
 #[inline]
 fn noncon_stencil_extractor(
@@ -124,20 +125,6 @@ fn l(
 
     let zero = State::new();
 
-    // RHS has the same grid and BC as U.
-    //
-    // BC actually won't normally be queried on RHS during this
-    // routine, but using the same grid keeps the RK interface simple.
-    let mut rhs = Field::new(
-        *u.grid(),
-        [
-            BCType::Periodic,
-            BCType::Periodic,
-            BCType::Periodic,
-            BCType::Periodic,
-        ],
-    );
-
     let mut flux_x =
         vec![vec![zero; ny]; nx + 1];
 
@@ -150,187 +137,191 @@ fn l(
     let mut diff_y =
         vec![vec![zero; ny + 1]; nx];
 
-    // ============================================================
-    // X interfaces
-    // ============================================================
+    flux_x
+        .par_iter_mut()
+        .zip(diff_x.par_iter_mut())
+        .enumerate()
+        .for_each(
+            |(i, (flux_row, diff_row))| {
+                let ii = i as isize;
 
-    for i in 0..=nx {
-        for j in 0..ny {
-            let ii = i as isize;
-            let jj = j as isize;
+                for j in 0..ny {
+                    let jj = j as isize;
 
-            let stencil =
-                weno_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::X,
-                );
+                    // WENO
+                    let stencil =
+                        weno_stencil_extractor(
+                            u,
+                            ii,
+                            jj,
+                            Direction::X,
+                        );
 
-            flux_x[i][j] =
-                stencil.reconstruction(true);
+                    flux_row[j] =
+                        stencil.reconstruction(true);
 
-            let stencil =
-                diffusion_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::X,
-                );
+                    // Diffusion
+                    let stencil =
+                        diffusion_stencil_extractor(
+                            u,
+                            ii,
+                            jj,
+                            Direction::X,
+                        );
 
-            diff_x[i][j] =
-                stencil.build_diffusion();
-        }
-    }
+                    diff_row[j] =
+                        stencil.build_diffusion();
+                }
+            },
+        );
 
-    // ============================================================
-    // Y interfaces
-    // ============================================================
+    flux_y
+        .par_iter_mut()
+        .zip(diff_y.par_iter_mut())
+        .enumerate()
+        .for_each(
+            |(i, (flux_row, diff_row))| {
+                let ii = i as isize;
 
-    for i in 0..nx {
-        for j in 0..=ny {
-            let ii = i as isize;
-            let jj = j as isize;
+                for j in 0..=ny {
+                    let jj = j as isize;
 
-            let stencil =
-                weno_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::Y,
-                );
+                    // WENO
+                    let stencil =
+                        weno_stencil_extractor(
+                            u,
+                            ii,
+                            jj,
+                            Direction::Y,
+                        );
 
-            flux_y[i][j] =
-                stencil.reconstruction(true);
+                    flux_row[j] =
+                        stencil.reconstruction(true);
 
-            let stencil =
-                diffusion_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::Y,
-                );
+                    // Diffusion
+                    let stencil =
+                        diffusion_stencil_extractor(
+                            u,
+                            ii,
+                            jj,
+                            Direction::Y,
+                        );
 
-            diff_y[i][j] =
-                stencil.build_diffusion();
-        }
-    }
+                    diff_row[j] =
+                        stencil.build_diffusion();
+                }
+            },
+        );
 
-    // ============================================================
-    // Cell-centered RHS
-    // ============================================================
+    let mut rhs =
+        u.empty_like();
 
-    for i in 0..nx {
-        for j in 0..ny {
-            let ii = i as isize;
-            let jj = j as isize;
+    // Because Field is flattened:
+    //
+    // linear = i * ny + j
+    //
+    // each Rayon worker receives a unique mutable State.
+    rhs.as_mut_slice()
+        .par_iter_mut()
+        .enumerate()
+        .for_each(
+            |(linear, out)| {
+                let i =
+                    linear / ny;
 
-            // ----------------------------------------------------
-            // Conservative flux
-            // ----------------------------------------------------
+                let j =
+                    linear % ny;
 
-            let fx =
-                state::update(
-                    flux_x[i][j],
-                    flux_x[i + 1][j],
-                )
-                .scalar_prod(1.0 / dx);
+                let ii =
+                    i as isize;
 
-            let fy =
-                state::update(
-                    flux_y[i][j],
-                    flux_y[i][j + 1],
-                )
-                .scalar_prod(1.0 / dy);
+                let jj =
+                    j as isize;
 
-            // ----------------------------------------------------
-            // Nonconservative X
-            // ----------------------------------------------------
+                let fx =
+                    state::update(
+                        flux_x[i][j],
+                        flux_x[i + 1][j],
+                    )
+                    .scalar_prod(
+                        1.0 / dx
+                    );
 
-            let stencil_x =
-                noncon_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::X,
-                );
+                let fy =
+                    state::update(
+                        flux_y[i][j],
+                        flux_y[i][j + 1],
+                    )
+                    .scalar_prod(
+                        1.0 / dy
+                    );
 
-            let nc_x =
-                noncon::nonconservative_x(
-                    &stencil_x,
-                    dx,
-                );
+                let stencil_x =
+                    noncon_stencil_extractor(
+                        u,
+                        ii,
+                        jj,
+                        Direction::X,
+                    );
 
-            // ----------------------------------------------------
-            // Nonconservative Y
-            // ----------------------------------------------------
+                let nc_x =
+                    noncon::nonconservative_x(
+                        &stencil_x,
+                        dx,
+                    );
+                let stencil_y =
+                    noncon_stencil_extractor(
+                        u,
+                        ii,
+                        jj,
+                        Direction::Y,
+                    );
 
-            let stencil_y =
-                noncon_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::Y,
-                );
+                let nc_y =
+                    noncon::nonconservative_y(
+                        &stencil_y,
+                        dy,
+                    );
 
-            let nc_y =
-                noncon::nonconservative_y(
-                    &stencil_y,
-                    dy,
-                );
+                let s =
+                    source::source(
+                        u.get((ii, jj))
+                    );
 
-            // ----------------------------------------------------
-            // Source
-            // ----------------------------------------------------
+                let dif_x =
+                    state::update(
+                        diff_x[i][j],
+                        diff_x[i + 1][j],
+                    )
+                    .scalar_prod(-1.0)
+                    .scalar_prod(
+                        1.0 / (dx * dx)
+                    );
 
-            let s =
-                source::source(
-                    u.get((ii, jj))
-                );
+                let dif_y =
+                    state::update(
+                        diff_y[i][j],
+                        diff_y[i][j + 1],
+                    )
+                    .scalar_prod(-1.0)
+                    .scalar_prod(
+                        1.0 / (dy * dy)
+                    );
 
-            // ----------------------------------------------------
-            // Diffusion
-            // ----------------------------------------------------
+                // =================================================
+                // Total RHS
+                // =================================================
 
-            let dif_x =
-                state::update(
-                    diff_x[i][j],
-                    diff_x[i + 1][j],
-                )
-                .scalar_prod(-1.0)
-                .scalar_prod(
-                    1.0 / (dx * dx)
-                );
-
-            let dif_y =
-                state::update(
-                    diff_y[i][j],
-                    diff_y[i][j + 1],
-                )
-                .scalar_prod(-1.0)
-                .scalar_prod(
-                    1.0 / (dy * dy)
-                );
-
-            // ----------------------------------------------------
-            // Total RHS
-            // ----------------------------------------------------
-
-            let value =
-                fx
+                *out =
+                    fx
                     .add(fy)
                     .add(nc_x)
                     .add(nc_y)
                     .add(s)
                     .add(dif_x)
                     .add(dif_y);
-
-            rhs.set(
-                (ii, jj),
-                value,
-            );
-        }
-    }
+            },
+        );
 
     rhs
 }
@@ -717,7 +708,7 @@ fn main() {
 
     let mut t = 0.0;
 
-    let t_final = 1.1099;
+    let t_final = 7.1571;
 
     // Physical-time interval between stored solutions.
     let t_store_interval = 0.05;

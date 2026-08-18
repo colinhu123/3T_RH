@@ -4,7 +4,7 @@ use std::fs::{File, create_dir_all, remove_dir_all};
 use std::io::Write;
 
 pub fn save_data(
-    u: &crate::field::Field,
+    u: &crate::field1::Field,
     filename: &str,
     lx: f64,
     ly: f64,
@@ -15,7 +15,7 @@ pub fn save_data(
     };
 
 
-    create_dir_all("data")
+    create_dir_all("data_new")
         .expect(
             "Cannot create data directory"
         );
@@ -35,8 +35,8 @@ pub fn save_data(
     )
     .unwrap();
 
-    let nx = u.nx();
-    let ny = u.ny();
+    let nx = u.grid.nx;
+    let ny = u.grid.ny;
 
     let dx = lx / nx as f64;
     let dy = ly / ny as f64;

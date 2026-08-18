@@ -7,3 +7,4 @@ edition = "2024"
 ndarray = "0.17.1"
 ndarray-linalg = { version = "0.18.0", features = ["openblas-system"] }
 rayon = "1.10"
+nalgebra = "0.33"

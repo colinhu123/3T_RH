@@ -17,4 +17,4 @@ pub const OMEGA_ER: f64 = 0.0;
 
 pub const LAMBDA: f64 = 0.5;
 
-pub const H: f64 = 0.3;
+pub const WENO_Q: f64 = 20.0;

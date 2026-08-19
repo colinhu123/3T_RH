@@ -1,5 +1,3 @@
-
-
 mod state;
 mod weno;
 mod dt;
@@ -13,45 +11,61 @@ mod bc;
 mod geometry;
 mod bc1;
 mod field1;
-
+mod ghost;
 use bc1::BCType;
 use field1::{Field, GridInfo};
 use geometry::{FluidSide, Point, Polygon};
 use state::{Direction, State};
 use rayon::prelude::*;
-use std::time::Instant;
+use ghost::GhostGrid;
 
+
+use std::sync::atomic::{AtomicBool, Ordering};
+static REPORTED_BAD_STATE: AtomicBool = AtomicBool::new(false);
+#[inline(always)] fn state_is_finite(s: State)
+->bool{s.rho.is_finite()&&s.mom_x.is_finite()&&s.mom_y.is_finite()&&s.ee.is_finite()&&s.ei.is_finite()&&s.er.is_finite()}
+#[inline(always)] fn internal_energies(s: State)
+->Option<(f64,f64,f64)>{
+    if !state_is_finite(s)||s.rho<=0.0{return None;} 
+    let ux=s.mom_x/s.rho; let uy=s.mom_y/s.rho; 
+    let k=(ux*ux+uy*uy)/6.0; 
+    Some((s.ee/s.rho-k,s.ei/s.rho-k,s.er/s.rho-k))}
+#[inline(always)] fn assert_admissible(s:State,idx:(isize,isize),where_:&str){
+    let e=internal_energies(s);
+    let bad=!state_is_finite(s)||s.rho<=0.0||e.map_or(true,|q|q.0<=0.0||q.1<=0.0||q.2<=0.0);
+    if bad{if !REPORTED_BAD_STATE.swap(true,Ordering::SeqCst){eprintln!("\nFIRST NON-PHYSICAL STATE\nwhere = {}\nidx = {:?}\nstate = {:?}\ninternal energies = {:?}\n",where_,idx,s,e);} panic!("non-physical state at {:?} in {}",idx,where_);}}
 
 #[inline]
 fn noncon_stencil_extractor(
     u: &Field,
+    ghosts: &GhostGrid,
     i: isize,
     j: isize,
     dir: Direction,
 ) -> [State; 9] {
     match dir {
         Direction::X => [
-            u.get((i - 4, j)),
-            u.get((i - 3, j)),
-            u.get((i - 2, j)),
-            u.get((i - 1, j)),
-            u.get((i,     j)),
-            u.get((i + 1, j)),
-            u.get((i + 2, j)),
-            u.get((i + 3, j)),
-            u.get((i + 4, j)),
+            ghosts.get_with_field(u, (i - 4, j)),
+            ghosts.get_with_field(u, (i - 3, j)),
+            ghosts.get_with_field(u, (i - 2, j)),
+            ghosts.get_with_field(u, (i - 1, j)),
+            ghosts.get_with_field(u, (i,     j)),
+            ghosts.get_with_field(u, (i + 1, j)),
+            ghosts.get_with_field(u, (i + 2, j)),
+            ghosts.get_with_field(u, (i + 3, j)),
+            ghosts.get_with_field(u, (i + 4, j)),
         ],
 
         Direction::Y => [
-            u.get((i, j - 4)),
-            u.get((i, j - 3)),
-            u.get((i, j - 2)),
-            u.get((i, j - 1)),
-            u.get((i, j)),
-            u.get((i, j + 1)),
-            u.get((i, j + 2)),
-            u.get((i, j + 3)),
-            u.get((i, j + 4)),
+            ghosts.get_with_field(u, (i, j - 4)),
+            ghosts.get_with_field(u, (i, j - 3)),
+            ghosts.get_with_field(u, (i, j - 2)),
+            ghosts.get_with_field(u, (i, j - 1)),
+            ghosts.get_with_field(u, (i, j)),
+            ghosts.get_with_field(u, (i, j + 1)),
+            ghosts.get_with_field(u, (i, j + 2)),
+            ghosts.get_with_field(u, (i, j + 3)),
+            ghosts.get_with_field(u, (i, j + 4)),
         ],
     }
 }
@@ -59,27 +73,28 @@ fn noncon_stencil_extractor(
 #[inline]
 fn weno_stencil_extractor(
     u: &Field,
+    ghosts: &GhostGrid,
     i: isize,
     j: isize,
     dir: Direction,
 ) -> weno::Stencil6 {
     let points = match dir {
         Direction::X => [
-            u.get((i - 3, j)),
-            u.get((i - 2, j)),
-            u.get((i - 1, j)),
-            u.get((i,     j)),
-            u.get((i + 1, j)),
-            u.get((i + 2, j)),
+            ghosts.get_with_field(u, (i - 3, j)),
+            ghosts.get_with_field(u, (i - 2, j)),
+            ghosts.get_with_field(u, (i - 1, j)),
+            ghosts.get_with_field(u, (i,     j)),
+            ghosts.get_with_field(u, (i + 1, j)),
+            ghosts.get_with_field(u, (i + 2, j)),
         ],
 
         Direction::Y => [
-            u.get((i, j - 3)),
-            u.get((i, j - 2)),
-            u.get((i, j - 1)),
-            u.get((i, j)),
-            u.get((i, j + 1)),
-            u.get((i, j + 2)),
+            ghosts.get_with_field(u, (i, j - 3)),
+            ghosts.get_with_field(u, (i, j - 2)),
+            ghosts.get_with_field(u, (i, j - 1)),
+            ghosts.get_with_field(u, (i, j)),
+            ghosts.get_with_field(u, (i, j + 1)),
+            ghosts.get_with_field(u, (i, j + 2)),
         ],
     };
 
@@ -92,27 +107,28 @@ fn weno_stencil_extractor(
 #[inline]
 fn diffusion_stencil_extractor(
     u: &Field,
+    ghosts: &GhostGrid,
     i: isize,
     j: isize,
     dir: Direction,
 ) -> diffusion::DiffusionStencil {
     let points = match dir {
         Direction::X => [
-            u.get((i - 3, j)),
-            u.get((i - 2, j)),
-            u.get((i - 1, j)),
-            u.get((i,     j)),
-            u.get((i + 1, j)),
-            u.get((i + 2, j)),
+            ghosts.get_with_field(u, (i - 3, j)),
+            ghosts.get_with_field(u, (i - 2, j)),
+            ghosts.get_with_field(u, (i - 1, j)),
+            ghosts.get_with_field(u, (i,     j)),
+            ghosts.get_with_field(u, (i + 1, j)),
+            ghosts.get_with_field(u, (i + 2, j)),
         ],
 
         Direction::Y => [
-            u.get((i, j - 3)),
-            u.get((i, j - 2)),
-            u.get((i, j - 1)),
-            u.get((i, j)),
-            u.get((i, j + 1)),
-            u.get((i, j + 2)),
+            ghosts.get_with_field(u, (i, j - 3)),
+            ghosts.get_with_field(u, (i, j - 2)),
+            ghosts.get_with_field(u, (i, j - 1)),
+            ghosts.get_with_field(u, (i, j)),
+            ghosts.get_with_field(u, (i, j + 1)),
+            ghosts.get_with_field(u, (i, j + 2)),
         ],
     };
 
@@ -125,212 +141,110 @@ fn diffusion_stencil_extractor(
 
 fn l(
     u: &Field,
+    ghosts: &mut GhostGrid,
     dx: f64,
     dy: f64,
 ) -> Vec<State> {
     let nx = u.grid.nx;
     let ny = u.grid.ny;
 
+    // Every unique ghost is reconstructed exactly once for this RK stage.
+    // Start with the serial version for correctness. After validating the
+    // cached solver, this can be changed to update_values_parallel(u).
+    let ghost_start = std::time::Instant::now();
+    ghosts.update_values_parallel(u);
+    eprintln!(
+        "DEBUG L: updated {} unique ghosts in {:?}",
+        ghosts.len(),
+        ghost_start.elapsed()
+    );
+
     let zero = State::new();
     let mut rhs = vec![zero; nx * ny];
 
-    eprintln!("DEBUG L: begin, nx={}, ny={}", nx, ny);
-
-    // ============================================================
-    // IMPORTANT:
-    // Temporarily SERIAL.
-    //
-    // We are testing whether Rayon + ghost reconstruction causes
-    // the apparent hang.
-    // ============================================================
-    for i in 0..nx {
-        eprintln!("DEBUG L: i = {}/{}", i, nx);
-
-        for j in 0..ny {
+    rhs.par_iter_mut()
+        .enumerate()
+        .for_each(|(linear, out)| {
+            let i = linear / ny;
+            let j = linear % ny;
             let ii = i as isize;
             let jj = j as isize;
             let idx = (ii, jj);
 
-            let linear = i * ny + j;
-
-            // Only calculate RHS for physical fluid cells.
             if !u.is_in_domain(idx) {
-                rhs[linear] = State::new();
-                continue;
+                *out = State::new();
+                return;
             }
 
-            // ====================================================
-            // Convective WENO flux
-            // ====================================================
+            let flux_l = weno_stencil_extractor(
+                u, ghosts, ii, jj, Direction::X,
+            ).reconstruction(true);
 
-            let flux_l =
-                weno_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::X,
-                )
-                .reconstruction(true);
+            let flux_r = weno_stencil_extractor(
+                u, ghosts, ii + 1, jj, Direction::X,
+            ).reconstruction(true);
 
-            let flux_r =
-                weno_stencil_extractor(
-                    u,
-                    ii + 1,
-                    jj,
-                    Direction::X,
-                )
-                .reconstruction(true);
+            let flux_b = weno_stencil_extractor(
+                u, ghosts, ii, jj, Direction::Y,
+            ).reconstruction(true);
 
-            let flux_b =
-                weno_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::Y,
-                )
-                .reconstruction(true);
+            let flux_t = weno_stencil_extractor(
+                u, ghosts, ii, jj + 1, Direction::Y,
+            ).reconstruction(true);
 
-            let flux_t =
-                weno_stencil_extractor(
-                    u,
-                    ii,
-                    jj + 1,
-                    Direction::Y,
-                )
-                .reconstruction(true);
-
-            let fx =
-                state::update(
-                    flux_l,
-                    flux_r,
-                )
+            let fx = state::update(flux_l, flux_r)
                 .scalar_prod(1.0 / dx);
-
-            let fy =
-                state::update(
-                    flux_b,
-                    flux_t,
-                )
+            let fy = state::update(flux_b, flux_t)
                 .scalar_prod(1.0 / dy);
 
-            // ====================================================
-            // Non-conservative terms
-            // ====================================================
+            let stencil_x = noncon_stencil_extractor(
+                u, ghosts, ii, jj, Direction::X,
+            );
+            let stencil_y = noncon_stencil_extractor(
+                u, ghosts, ii, jj, Direction::Y,
+            );
 
-            let stencil_x =
-                noncon_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::X,
-                );
+            let nc_x = noncon::nonconservative_x(&stencil_x, dx);
+            let nc_y = noncon::nonconservative_y(&stencil_y, dy);
 
-            let stencil_y =
-                noncon_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::Y,
-                );
+            // idx is guaranteed fluid here, so no ghost lookup is needed.
+            let source_term = source::source(
+                u.value[u.linear_index(idx)]
+            );
 
-            let nc_x =
-                noncon::nonconservative_x(
-                    &stencil_x,
-                    dx,
-                );
+            let diff_l = diffusion_stencil_extractor(
+                u, ghosts, ii, jj, Direction::X,
+            ).build_diffusion();
 
-            let nc_y =
-                noncon::nonconservative_y(
-                    &stencil_y,
-                    dy,
-                );
+            let diff_r = diffusion_stencil_extractor(
+                u, ghosts, ii + 1, jj, Direction::X,
+            ).build_diffusion();
 
-            // ====================================================
-            // Source
-            // ====================================================
+            let diff_b = diffusion_stencil_extractor(
+                u, ghosts, ii, jj, Direction::Y,
+            ).build_diffusion();
 
-            let source_term =
-                source::source(
-                    u.get(idx)
-                );
+            let diff_t = diffusion_stencil_extractor(
+                u, ghosts, ii, jj + 1, Direction::Y,
+            ).build_diffusion();
 
-            // ====================================================
-            // Diffusion
-            // ====================================================
+            let dif_x = state::update(diff_l, diff_r)
+                .scalar_prod(-1.0 / (dx * dx));
+            let dif_y = state::update(diff_b, diff_t)
+                .scalar_prod(-1.0 / (dy * dy));
 
-            let diff_l =
-                diffusion_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::X,
-                )
-                .build_diffusion();
-
-            let diff_r =
-                diffusion_stencil_extractor(
-                    u,
-                    ii + 1,
-                    jj,
-                    Direction::X,
-                )
-                .build_diffusion();
-
-            let diff_b =
-                diffusion_stencil_extractor(
-                    u,
-                    ii,
-                    jj,
-                    Direction::Y,
-                )
-                .build_diffusion();
-
-            let diff_t =
-                diffusion_stencil_extractor(
-                    u,
-                    ii,
-                    jj + 1,
-                    Direction::Y,
-                )
-                .build_diffusion();
-
-            let dif_x =
-                state::update(
-                    diff_l,
-                    diff_r,
-                )
-                .scalar_prod(
-                    -1.0 / (dx * dx)
-                );
-
-            let dif_y =
-                state::update(
-                    diff_b,
-                    diff_t,
-                )
-                .scalar_prod(
-                    -1.0 / (dy * dy)
-                );
-
-            // ====================================================
-            // Total RHS
-            // ====================================================
-
-            rhs[linear] =
-                fx
-                    .add(fy)
-                    .add(nc_x)
-                    .add(nc_y)
-                    .add(source_term)
-                    .add(dif_x)
-                    .add(dif_y);
-        }
-    }
-
-    eprintln!("DEBUG L: finished");
+            *out = fx
+                .add(fy)
+                .add(nc_x)
+                .add(nc_y)
+                .add(source_term)
+                .add(dif_x)
+                .add(dif_y);
+        });
 
     rhs
 }
+
 fn empty_like(u: &Field) -> Field {
     let outer = Polygon::new(u.outer_bound.points.clone(), FluidSide::Inside);
     let inner = Polygon::new(u.inner_bound.points.clone(), FluidSide::Outside);
@@ -348,6 +262,7 @@ fn empty_like(u: &Field) -> Field {
 
 fn rk3_ssp(
     u: &Field,
+    ghosts: &mut GhostGrid,
     dx: f64,
     dy: f64,
     dt: f64,
@@ -355,18 +270,20 @@ fn rk3_ssp(
     let nx = u.grid.nx;
     let ny = u.grid.ny;
 
-    let l1 = l(u, dx, dy);
+    let l1 = l(u, ghosts, dx, dy);
     let mut u1 = empty_like(u);
     for i in 0..nx {
         for j in 0..ny {
             let idx = (i as isize, j as isize);
             if !u.is_in_domain(idx) { continue; }
             let linear = i * ny + j;
+            let value = u.get(idx).add(l1[linear].scalar_prod(dt));
+            assert_admissible(value, idx, "RK1 state");
             u1.set(idx, u.get(idx).add(l1[linear].scalar_prod(dt)));
         }
     }
 
-    let l2 = l(&u1, dx, dy);
+    let l2 = l(&u1, ghosts, dx, dy);
     let mut u2 = empty_like(u);
     for i in 0..nx {
         for j in 0..ny {
@@ -377,11 +294,12 @@ fn rk3_ssp(
                 .scalar_prod(0.75)
                 .add(u1.get(idx).scalar_prod(0.25))
                 .add(l2[linear].scalar_prod(dt / 4.0));
+            assert_admissible(value, idx, "RK2 state");
             u2.set(idx, value);
         }
     }
 
-    let l3 = l(&u2, dx, dy);
+    let l3 = l(&u2, ghosts, dx, dy);
     let mut u3 = empty_like(u);
     for i in 0..nx {
         for j in 0..ny {
@@ -392,6 +310,7 @@ fn rk3_ssp(
                 .scalar_prod(1.0 / 3.0)
                 .add(u2.get(idx).scalar_prod(2.0 / 3.0))
                 .add(l3[linear].scalar_prod(2.0 * dt / 3.0));
+            assert_admissible(value, idx, "RK3 state");
             u3.set(idx, value);
         }
     }
@@ -405,8 +324,8 @@ fn init_bubble() -> Field {
     // Computational domain
     // ============================================================
 
-    let nx = 800;
-    let ny = 268;
+    let nx = 400;
+    let ny = 134;
 
     let x0 = 0.0;
     let y0 = 0.0;
@@ -619,13 +538,23 @@ fn main() {
     let lx = dx * u.grid.nx as f64;
     let ly = dy * u.grid.ny as f64;
 
+    let offsets =
+        ghost::default_stencil_offsets();
+
+    let mut ghosts =
+        ghost::GhostGrid::build(
+            &u,
+            &offsets,
+        );
+
+    ghosts.print_summary();
 
     let mut t = 0.0;
 
     let t_final = 7.1571;
 
     // Physical-time interval between stored solutions.
-    let t_store_interval = 0.05;
+    let t_store_interval = 0.02;
     let mut next_store_time = t_store_interval;
     let mut n = 0usize;
     let mut store_id = 0usize;
@@ -665,6 +594,7 @@ fn main() {
 
     u = rk3_ssp(
         &u,
+        &mut ghosts,
         dx,
         dy,
         dt,
@@ -750,4 +680,3 @@ fn main() {
 }
 
     
-

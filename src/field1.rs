@@ -1,6 +1,3 @@
-
-use ndarray_linalg::inner;
-
 use crate::bc1::{self, BCType};
 use crate::geometry::{self, FluidSide, Geometry, Point, Polygon};
 use crate::state::State;
@@ -163,7 +160,7 @@ impl Field {
     }
 
     #[inline(always)]
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [State] {
+    pub(crate) fn _as_mut_slice(&mut self) -> &mut [State] {
         &mut self.value
     }
 
@@ -184,7 +181,10 @@ impl Field {
             let project = if con1 == false {geometry::project(&self.outer_bound, p)} else {
                 geometry::project(&self.inner_bound, p)
             };
+
             bc1::set_ghost_point_value(idx, project, self)
+            //Space prepared for WENO extrapolation and ILW
+            //State::new()
         }
     }
 

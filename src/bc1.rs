@@ -8,11 +8,13 @@ use crate::{geometry, weno};
 use crate::weno::Stencil6;
 use crate::constant;
 
+const WALL_TAYLOR_ORDER: usize = 4;
+
 
 #[derive(Copy, Clone, Debug)]
 pub enum BCType {
     /// Mirror the state without changing momentum.
-    Symmetry,
+    ReflectiveWall,
     Wall,
     Periodic,
     Constant(State),
@@ -159,8 +161,8 @@ pub fn weno_extrapolation(
     let d4 = 1.0 - d0 - d1 - d2 - d3;
     let d = [d0, d1, d2, d3, d4];
 
-    let epsilon = 1.0e-6;
-    let q = 3.0;
+    let epsilon = constant::DEFAULT_EPS;
+    let q = constant::WENO_Q;
     let mut result = [0.0; 6];
 
     for m in 0..6 {
@@ -269,6 +271,18 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
     let bc = if con1 == false {&field.bc_outer} else {&field.bc_inner};
     let bc = bc[i];
 
+    if let BCType::Constant(value) = bc {
+        return value;
+    }
+
+    if let BCType::ReflectiveWall = bc {
+        return reflective_wall_value(
+            idx,
+            project,
+            field,
+        );
+    }
+
     let mut v = [[0.0; 6]; 5];
     // The characteristic matrix is evaluated at U_0, the interior grid
     // point nearest to the boundary foot P_0 (Tan et al., Sec. 2.3),
@@ -325,7 +339,7 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
             let d = project.distance;
             let mut u_ghost = u[0].clone();
             let mut coef = 1.0;
-            for k in 1..=4 {
+            for k in 1..=WALL_TAYLOR_ORDER {
                 coef *= d / (k as f64);
                 u_ghost = u_ghost + coef * &u[k];
             }
@@ -398,7 +412,7 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
             let d = project.distance;
             let mut u_ghost = u[0].clone();
             let mut coef = 1.0;
-            for k in 1..=4 {
+            for k in 1..=WALL_TAYLOR_ORDER {
                 coef *= d / (k as f64);
                 u_ghost = u_ghost + coef * &u[k];
             }
@@ -418,8 +432,117 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
                 er: u_ghost[5],
             }
         }
-        BCType::Constant(value) => value,
+        BCType::Constant(_) => unreachable!(),
         _ => state::State::new(),
+    }
+}
+
+fn reflective_wall_value(
+    idx: (isize, isize),
+    project: geometry::Projection,
+    field: &field1::Field,
+) -> state::State {
+    let n = project.normal;
+
+    // ------------------------------------------------------------
+    // Mirror the ghost point geometrically across the wall.
+    //
+    // project.distance = signed normal distance from ghost to P0.
+    //
+    // If Pg is the ghost point and P0 the wall foot,
+    //
+    //     Pi = 2 P0 - Pg
+    //
+    // ------------------------------------------------------------
+
+    let pg = geometry::Point {
+        x: field.grid.x(idx.0),
+        y: field.grid.y(idx.1),
+    };
+
+    let pi = geometry::Point {
+        x: 2.0 * project.point.x - pg.x,
+        y: 2.0 * project.point.y - pg.y,
+    };
+
+    // Nearest Cartesian grid point to the reflected position.
+    let (ic, jc) =
+        field.grid.coord2idx(pi);
+
+    // Search a small neighborhood in case coord2idx lands on a
+    // non-fluid point near an oblique polygon boundary.
+    let candidates = [
+        (ic, jc),
+        (ic - 1, jc),
+        (ic + 1, jc),
+        (ic, jc - 1),
+        (ic, jc + 1),
+        (ic - 1, jc - 1),
+        (ic - 1, jc + 1),
+        (ic + 1, jc - 1),
+        (ic + 1, jc + 1),
+    ];
+
+    let mut best = None;
+    let mut best_d2 = f64::INFINITY;
+
+    for q in candidates {
+        if !field.is_in_domain(q) {
+            continue;
+        }
+
+        let xq = field.grid.x(q.0);
+        let yq = field.grid.y(q.1);
+
+        let d2 =
+            (xq - pi.x).powi(2)
+            + (yq - pi.y).powi(2);
+
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best = Some(q);
+        }
+    }
+
+    let interior_idx =
+        best.unwrap_or_else(|| {
+            panic!(
+                "cannot find reflected interior point for ghost {:?}",
+                idx
+            )
+        });
+
+    // IMPORTANT:
+    // interior_idx has already been checked as fluid.
+    let s =
+        field.value[
+            field.linear_index(interior_idx)
+        ];
+
+    // ------------------------------------------------------------
+    // Reflect momentum relative to arbitrary polygon normal.
+    // ------------------------------------------------------------
+
+    let mom_n =
+        s.mom_x * n.x
+        + s.mom_y * n.y;
+
+    // m_g = m_i - 2 (m_i . n) n
+    let mom_x =
+        s.mom_x
+        - 2.0 * mom_n * n.x;
+
+    let mom_y =
+        s.mom_y
+        - 2.0 * mom_n * n.y;
+
+    state::State {
+        rho: s.rho,
+        mom_x,
+        mom_y,
+        ee: s.ee,
+        ei: s.ei,
+        er: s.er,
     }
 }
 

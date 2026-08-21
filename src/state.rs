@@ -38,18 +38,18 @@ impl State {
     pub fn pressure_tot(&self) -> f64 {
         let u = self.mom_x/self.rho;
         let v = self.mom_y/self.rho;
-        let pe = 2.0/3.0 * (self.ee - self.rho * (u.powi(2) + v.powi(2))/6.0);
-        let pi = 2.0/3.0 * (self.ei - self.rho * (u.powi(2) + v.powi(2))/6.0);
-        let pr = 1.0/3.0 * (self.er - self.rho * (u.powi(2) + v.powi(2))/6.0);
+        let pe = (constant::GAMMA_E - 1.0) * (self.ee - self.rho * (u.powi(2) + v.powi(2))/6.0);
+        let pi = (constant::GAMMA_I - 1.0) * (self.ei - self.rho * (u.powi(2) + v.powi(2))/6.0);
+        let pr = (constant::GAMMA_R - 1.0) * (self.er - self.rho * (u.powi(2) + v.powi(2))/6.0);
         pe+pi+pr
     }
 
     pub fn pressure_spilit(&self) -> (f64,f64,f64) {
         let u = self.mom_x/self.rho;
         let v = self.mom_y/self.rho;
-        let pe = 2.0/3.0 * (self.ee - self.rho * (u.powi(2) + v.powi(2))/6.0);
-        let pi = 2.0/3.0 * (self.ei - self.rho * (u.powi(2) + v.powi(2))/6.0);
-        let pr = 1.0/3.0 * (self.er - self.rho * (u.powi(2) + v.powi(2))/6.0);
+        let pe = (constant::GAMMA_E - 1.0) * (self.ee - self.rho * (u.powi(2) + v.powi(2))/6.0);
+        let pi = (constant::GAMMA_I - 1.0) * (self.ei - self.rho * (u.powi(2) + v.powi(2))/6.0);
+        let pr = (constant::GAMMA_R - 1.0) * (self.er - self.rho * (u.powi(2) + v.powi(2))/6.0);
         (pe, pi, pr)
     }
 
@@ -122,13 +122,15 @@ impl State {
         let ei1 = pi/((constant::GAMMA_I-1.0)*rho);
         let er1 = pr/((constant::GAMMA_R-1.0)*rho);
 
+        let kinetic_share = rho*(u*u + v*v)/66.0;
+        
         Self {
             rho: rho,
             mom_x: rho*u,
             mom_y: rho*v,
-            ee: rho*ee1 + rho*u*u/6.0,
-            ei: rho*ei1 + rho*u*u/6.0,
-            er: rho*er1 + rho*u*u/6.0,
+            ee: rho*ee1 + kinetic_share,
+            ei: rho*ei1 + kinetic_share,
+            er: rho*er1 + kinetic_share,
         }
     }
 

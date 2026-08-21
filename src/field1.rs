@@ -79,6 +79,7 @@ pub struct Field {
     pub inner_bound: Polygon,
     pub bc_inner: Vec<BCType>,
     pub bc_outer: Vec<BCType>,
+    pub time: f64,
 }
 
 impl Field {
@@ -89,6 +90,7 @@ impl Field {
         value: State,
         outer_bound: Polygon,
         inner_bound: Polygon,
+        time: f64,
     ) -> Self {
         assert!(outer_bound.fluid == FluidSide::Inside, "Wrong outer boundary setting");
         assert!(inner_bound.fluid == FluidSide::Outside, "Wrong inner boundary setting");
@@ -101,6 +103,7 @@ impl Field {
             inner_bound: inner_bound,
             bc_inner: bc_inner,
             bc_outer: bc_outer,
+            time: time,
         }
     }
 

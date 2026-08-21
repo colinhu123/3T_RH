@@ -6,18 +6,19 @@ mod source;
 mod diffusion;
 mod constant;
 mod io;
-mod field;
-mod bc;
 mod geometry;
 mod bc1;
 mod field1;
 mod ghost;
+mod init;
+
 use bc1::BCType;
 use field1::{Field, GridInfo};
 use geometry::{FluidSide, Point, Polygon};
 use state::{Direction, State};
 use rayon::prelude::*;
 use ghost::GhostGrid;
+
 
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,7 +153,7 @@ fn l(
     // Start with the serial version for correctness. After validating the
     // cached solver, this can be changed to update_values_parallel(u).
     let ghost_start = std::time::Instant::now();
-    ghosts.update_values_parallel(u);
+    ghosts.update_values_parallel(u, u.time);
     eprintln!(
         "DEBUG L: updated {} unique ghosts in {:?}",
         ghosts.len(),
@@ -256,6 +257,7 @@ fn empty_like(u: &Field) -> Field {
         State::new(),
         outer,
         inner,
+        u.time,
     )
 }
 
@@ -272,6 +274,7 @@ fn rk3_ssp(
 
     let l1 = l(u, ghosts, dx, dy);
     let mut u1 = empty_like(u);
+    u1.time = u.time + dt;
     for i in 0..nx {
         for j in 0..ny {
             let idx = (i as isize, j as isize);
@@ -285,6 +288,7 @@ fn rk3_ssp(
 
     let l2 = l(&u1, ghosts, dx, dy);
     let mut u2 = empty_like(u);
+    u2.time = u.time + 0.5 * dt;
     for i in 0..nx {
         for j in 0..ny {
             let idx = (i as isize, j as isize);
@@ -301,6 +305,7 @@ fn rk3_ssp(
 
     let l3 = l(&u2, ghosts, dx, dy);
     let mut u3 = empty_like(u);
+    u3.time = u.time + dt;
     for i in 0..nx {
         for j in 0..ny {
             let idx = (i as isize, j as isize);
@@ -319,177 +324,6 @@ fn rk3_ssp(
 }
 
 
-fn init_bubble() -> Field {
-    // ============================================================
-    // Computational domain
-    // ============================================================
-
-    let nx = 400;
-    let ny = 134;
-
-    let x0 = 0.0;
-    let y0 = 0.0;
-
-    let lx = 6.5;
-    let ly = 0.89;
-
-    let dx = lx / nx as f64;
-    let dy = ly / ny as f64;
-
-    let grid = GridInfo::new(
-        nx,
-        ny,
-        dx,
-        dy,
-        x0,
-        y0,
-    );
-
-    // ============================================================
-    // Initial states
-    // ============================================================
-
-    // Left/background state:
-    //
-    // rho = 1
-    // u = v = 0
-    // pe = pi = pr = 0.238095
-    let left_state = State::primi2con(
-        1.0,
-        0.0,
-        0.0,
-        0.238095,
-        0.238095,
-        0.238095,
-    );
-
-    // Post-shock/right state:
-    //
-    // rho = 1.3764
-    // u = -0.3336
-    // v = 0
-    // pe = pi = pr = 0.373762
-    let right_state = State::primi2con(
-        1.3764,
-        -0.3336,
-        0.0,
-        0.373762,
-        0.373762,
-        0.373762,
-    );
-
-    // Bubble:
-    //
-    // rho = 0.1819
-    // u = v = 0
-    // pe = pi = pr = 0.146972
-    let bubble_state = State::primi2con(
-        0.1819,
-        0.0,
-        0.0,
-        0.146972,
-        0.146972,
-        0.146972,
-    );
-
-    // ============================================================
-    // Boundary conditions
-    //
-    // Field BC ordering:
-    //
-    // [Bottom, Right, Top, Left]
-    // ============================================================
-
-    // Polygon edge ordering is [Bottom, Right, Top, Left].
-    let outer_bound = Polygon::new(
-        vec![
-            Point { x: x0,      y: y0 },
-            Point { x: x0 + lx, y: y0 },
-            Point { x: x0 + lx, y: y0 + ly },
-            Point { x: x0,      y: y0 + ly },
-        ],
-        FluidSide::Inside,
-    );
-    let bc_outer = vec![
-        BCType::Wall,
-        BCType::Constant(right_state),
-        BCType::Wall,
-        BCType::Constant(left_state),
-    ];
-
-    // This test has no solid embedded obstacle: keep the mandatory inner
-    // polygon far outside the computational domain so it excludes no cells.
-    let inner_bound = Polygon::new(
-        vec![
-            Point { x: -1002.0, y: -1002.0 },
-            Point { x: -1001.0, y: -1002.0 },
-            Point { x: -1001.0, y: -1001.0 },
-            Point { x: -1002.0, y: -1001.0 },
-        ],
-        FluidSide::Outside,
-    );
-    let bc_inner = vec![BCType::Wall; 4];
-
-    let mut u = Field::new(
-        grid,
-        bc_inner,
-        bc_outer,
-        State::new(),
-        outer_bound,
-        inner_bound,
-    );
-
-    // ============================================================
-    // Bubble geometry
-    // ============================================================
-
-    let xc = 3.5;
-    let yc = 0.0;
-    let radius = 0.5;
-
-    let r2 = radius * radius;
-
-    // Shock/interface initially at x = 4.5
-    let shock_x = 4.5;
-
-    // ============================================================
-    // Fill physical cells
-    // ============================================================
-
-    for i in 0..nx {
-        for j in 0..ny {
-            let ii = i as isize;
-            let jj = j as isize;
-
-            // Cell-center coordinates
-            let x = grid.x(ii);
-            let y = grid.y(jj);
-
-            // Distance from bubble center
-            let bubble_distance2 =
-                (x - xc).powi(2)
-                + (y - yc).powi(2);
-
-            let state =
-                if bubble_distance2 <= r2 {
-                    // Bubble takes precedence over background state.
-                    bubble_state
-                } else if x < shock_x {
-                    // Pre-shock/background region
-                    left_state
-                } else {
-                    // Post-shock region
-                    right_state
-                };
-
-            if u.is_in_domain((ii, jj)) {
-                u.set((ii, jj), state);
-            }
-        }
-    }
-
-    u
-}
 
 
 fn calc_global_dt(
@@ -529,154 +363,75 @@ fn calc_global_dt(
 
 
 fn main() {
-    io::clear_data_folder();
+    // Fresh: cargo run --release
+    // Restart from solution_0012.bin: cargo run --release -- 12
+    let restart_id=std::env::args().nth(1).map(|s|s.parse::<usize>().expect("restart id must be integer"));
+    if restart_id.is_none() {
+        io::clear_data_folder();
+    }
 
-    let mut u = init_bubble();
+    let mut u = init::init_cylinder();
 
-    let dx = u.grid.dx;
-    let dy = u.grid.dy;
-    let lx = dx * u.grid.nx as f64;
-    let ly = dy * u.grid.ny as f64;
+    let t_store_interval = 0.001_f64;
 
-    let offsets =
-        ghost::default_stencil_offsets();
+    // ---------------------------------------------------------
+    // Load restart file first
+    // ---------------------------------------------------------
+    if let Some(id) = restart_id {
+    let path = format!("data_new/solution_{:04}.bin", id);
+    io::load_data(&mut u, &path);
+    }
 
-    let mut ghosts =
-        ghost::GhostGrid::build(
-            &u,
-            &offsets,
-        );
+    let mut store_id = if restart_id.is_some() {
+            (u.time / t_store_interval).round() as usize
+        } else {
+            0
+    };
 
+    let dx=u.grid.dx; let dy=u.grid.dy;
+    let lx=dx*u.grid.nx as f64; let ly=dy*u.grid.ny as f64;
+    let offsets=ghost::default_stencil_offsets();
+    let mut ghosts=ghost::GhostGrid::build(&u,&offsets);
     ghosts.print_summary();
 
-    let mut t = 0.0;
+    let mut t=u.time;
+    let t_final=0.4_f64;
+    let mut next_store_time=(store_id+1) as f64*t_store_interval;
+    let mut n=0usize;
 
-    let t_final = 7.1571;
-
-    // Physical-time interval between stored solutions.
-    let t_store_interval = 0.02;
-    let mut next_store_time = t_store_interval;
-    let mut n = 0usize;
-    let mut store_id = 0usize;
-
-    io::save_data(
-        &u,
-        "solution_0000.dat",
-        lx,
-        ly,
-    );
-
-    println!(
-        "stored solution_0000.dat at t = {:.8e}",
-        t
-    );
-
-    while t < t_final {
-        eprintln!("DEBUG: entering step {}, t={}", n + 1, t);
-
-    eprintln!("DEBUG: calculating dt...");
-    let dt_cfl = calc_global_dt(&u);
-    eprintln!("DEBUG: dt done: {}", dt_cfl);
-
-    let mut dt = dt_cfl;
-
-    if next_store_time <= t_final
-        && t + dt > next_store_time
-    {
-        dt = next_store_time - t;
+    if restart_id.is_none() {
+        io::save_data(&u,"solution_0000.bin",lx,ly);
+        println!("stored solution_0000.bin at t = {:.8e}",t);
+    } else {
+        println!("Restarting from id={}, t={:.8e}; next output t={:.8e}",store_id,t,next_store_time);
     }
 
-    if t + dt > t_final {
-        dt = t_final - t;
-    }
+    while t < t_final-1e-14 {
+        let dt_cfl=calc_global_dt(&u);
+        let mut dt=0.05*dt_cfl;
+        if next_store_time<=t_final && t+dt>next_store_time { dt=next_store_time-t; }
+        if t+dt>t_final { dt=t_final-t; }
+        assert!(dt>0.0,"non-positive dt at t={}",t);
 
-    eprintln!("DEBUG: entering RK3, dt={}", dt);
+        u=rk3_ssp(&u,&mut ghosts,dx,dy,dt);
+        t=u.time; n+=1;
+        println!("step={}, t={:.8e}, dt={:.8e}, dt_cfl={:.8e}",n,t,dt,dt_cfl);
 
-    u = rk3_ssp(
-        &u,
-        &mut ghosts,
-        dx,
-        dy,
-        dt,
-    );
-
-    eprintln!("DEBUG: RK3 finished");
-
-        t += dt;
-        n += 1;
-
-        println!(
-            "step = {}, t = {:.8e}, dt = {:.8e}, dt_cfl = {:.8e}",
-            n,
-            t,
-            dt,
-            dt_cfl,
-        );
-
-        let reached_store_time =
-            next_store_time <= t_final
-            && t >= next_store_time - 1e-12;
-
-        if reached_store_time {
-            store_id += 1;
-
-            let filename =
-                format!(
-                    "solution_{:04}.dat",
-                    store_id
-                );
-
-            io::save_data(
-                &u,
-                &filename,
-                lx,
-                ly,
-            );
-
-            println!(
-                "stored {} at t = {:.8e}",
-                filename,
-                t
-            );
-            next_store_time =
-                (store_id + 1) as f64
-                * t_store_interval;
+        if next_store_time<=t_final && t>=next_store_time-1e-12 {
+            store_id+=1;
+            let filename=format!("solution_{:04}.bin",store_id);
+            io::save_data(&u,&filename,lx,ly);
+            println!("stored {} at t={:.8e}",filename,t);
+            next_store_time=(store_id+1) as f64*t_store_interval;
         }
     }
 
-    let last_regular_store_time =
-        store_id as f64
-        * t_store_interval;
-
-    if (t - last_regular_store_time).abs() > 1e-12 {
-        store_id += 1;
-
-        let filename =
-            format!(
-                "solution_{:04}.dat",
-                store_id
-            );
-
-        io::save_data(
-            &u,
-            &filename,
-            lx,
-            ly,
-        );
-
-        println!(
-            "stored final solution {} at t = {:.8e}",
-            filename,
-            t
-        );
+    let last_regular=store_id as f64*t_store_interval;
+    if (t-last_regular).abs()>1e-12 {
+        store_id+=1;
+        let filename=format!("solution_{:04}.bin",store_id);
+        io::save_data(&u,&filename,lx,ly);
+        println!("stored final {} at t={:.8e}",filename,t);
     }
-
-    println!(
-        "Finished: t = {:.8e}, steps = {}, stored = {}",
-        t,
-        n,
-        store_id + 1,
-    );
+    println!("Finished: t={:.8e}, restart-local steps={}, last id={}",t,n,store_id);
 }
-
-    

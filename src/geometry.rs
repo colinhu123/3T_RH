@@ -1,4 +1,3 @@
-use crate::state;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
@@ -91,16 +90,7 @@ pub struct Projection {
 }
 
 impl Projection {
-    pub fn major_direction(&self) -> state::Direction {
-        let nx = self.normal.x.abs();
-        let ny = self.normal.y.abs();
-        if nx > ny {
-        state::Direction::X
-        }
-        else {
-            state::Direction::Y
-        }
-    }
+    
 
     pub fn gloabl2local_coord(&self,p: Point) -> (f64, f64) {
         let p0 = self.point;

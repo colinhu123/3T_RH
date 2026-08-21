@@ -8,13 +8,13 @@ pub const CVE: f64 = 1.0;
 pub const CVI: f64 = 1.0;
 pub const A  : f64 = 1.0;
 
-pub const GAMMA_I: f64 = 5.0/3.0;
-pub const GAMMA_E: f64 = 5.0/3.0;
-pub const GAMMA_R: f64 = 4.0/3.0;
+pub const GAMMA_I: f64 = 1.4;
+pub const GAMMA_E: f64 = 1.4;
+pub const GAMMA_R: f64 = 1.4;
 
 pub const OMEGA_EI: f64 = 0.0;
 pub const OMEGA_ER: f64 = 0.0;
 
 pub const LAMBDA: f64 = 0.5;
 
-pub const WENO_Q: f64 = 20.0;
+pub const WENO_Q: f64 = 2.0;

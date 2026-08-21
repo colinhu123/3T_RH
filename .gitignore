@@ -2,10 +2,8 @@
 
 /data
 
-nx200.png
+/data_new
 
-nx400.png
+energy_split_history.csv
 
-nx600.png
-
-nx800.png
+energy_split_history.png

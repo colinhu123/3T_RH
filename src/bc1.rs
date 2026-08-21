@@ -7,18 +7,25 @@ use crate::state::{self, State};
 use crate::{geometry, weno};
 use crate::weno::Stencil6;
 use crate::constant;
+use std::sync::Arc;
 
 const WALL_TAYLOR_ORDER: usize = 4;
 
 
-#[derive(Copy, Clone, Debug)]
+pub type TimeBCFn = Arc<dyn Fn(geometry::Point, geometry::Vec2, f64) -> state::State + Send + Sync>;
+
+#[derive(Clone)]
 pub enum BCType {
     /// Mirror the state without changing momentum.
     ReflectiveWall,
     Wall,
     Periodic,
     Constant(State),
+    /// Prescribed boundary state U(P0,n,t).
+    TimeDependent(TimeBCFn),
     Outflow { p_inf: f64, sigma: f64, l_domain: f64 },
+    ZerothOrder,
+    FarField(State),
 }
 
 pub fn find_nearest_grid_point(project: geometry::Projection, field: &field1::Field) -> (isize, isize) {
@@ -162,7 +169,7 @@ pub fn weno_extrapolation(
     let d = [d0, d1, d2, d3, d4];
 
     let epsilon = constant::DEFAULT_EPS;
-    let q = constant::WENO_Q;
+    let q = constant::WENO_Q; // Double Mach reflection benchmark: paper uses q=20 for boundary stabilization
     let mut result = [0.0; 6];
 
     for m in 0..6 {
@@ -179,36 +186,7 @@ pub fn weno_extrapolation(
 
     result
 }
-/* 
-pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,field: &field1::Field)
--> state::State {
-    let p = geometry::Point { x: field.grid.x(idx.0), y: field.grid.y(idx.1) };
-    let con1 = field.outer_bound.is_fluid(p);
-    let polygon = if con1 == false {&field.outer_bound} else {&field.inner_bound};
-    let i = match geometry::find_boundary_side(project.point, polygon, constant::DEFAULT_EPS) {
-    Some(i) => i,
-    None => {
-        panic!("Boundary point {:?} does not lie on polygon boundary", project.point);
-    }
-};
-    let bc = if con1 == false {&field.bc_outer} else {&field.bc_inner};
-    let bc = bc[i];
-    let mut v = [[0.0; 6];5];
-    let (left,right,lambda) = build_local(project, idx, field);
-    for i in 0..5 {
-        v[i] = weno_extrapolation(project, field, i);
-    }
-    if bc == BCType::Wall {
-        let mut left0 = left.copy();
-        left0[[0,0]] = 0.0; left0[[0,1]] = 1.0; left0[[0,2]] = 0.0;
-        left0[[0,3]] = 0.0; left0[[0,4]] = 0.0; left0[[0,5]] = 0.0;
 
-    }
-
-    state::State::new()
-}
-
-*/
 
 fn local_pressure_and_a2(rho: f64, u: f64, v: f64, ee: f64, ei: f64, er: f64) -> (f64, f64) {
     let w2 = u * u + v * v;
@@ -257,8 +235,147 @@ fn solve6(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
     a.solve(b).expect("singular ILW/extrapolation system at boundary")
 }
 
+fn zeroth_order_value(
+    idx: (isize, isize),
+    project: geometry::Projection,
+    field: &field1::Field,
+) -> state::State {
+    // Ghost point Pg.
+    let pg = geometry::Point {
+        x: field.grid.x(idx.0),
+        y: field.grid.y(idx.1),
+    };
+
+    // Reflect Pg geometrically across the boundary:
+    //
+    //     Pi = 2 P0 - Pg
+    //
+    // Pi lies on the interior side and gives a natural
+    // interior sampling location for this ghost point.
+    let pi = geometry::Point {
+        x: 2.0 * project.point.x - pg.x,
+        y: 2.0 * project.point.y - pg.y,
+    };
+
+    // Cartesian index nearest to Pi.
+    let (ic, jc) = field.grid.coord2idx(pi);
+
+    // Search nearby cells because the nearest Cartesian point
+    // can occasionally lie outside the fluid for an oblique boundary.
+    let candidates = [
+        (ic, jc),
+        (ic - 1, jc),
+        (ic + 1, jc),
+        (ic, jc - 1),
+        (ic, jc + 1),
+        (ic - 1, jc - 1),
+        (ic - 1, jc + 1),
+        (ic + 1, jc - 1),
+        (ic + 1, jc + 1),
+    ];
+
+    let mut best = None;
+    let mut best_d2 = f64::INFINITY;
+
+    for q in candidates {
+        if !field.is_in_domain(q) {
+            continue;
+        }
+
+        let xq = field.grid.x(q.0);
+        let yq = field.grid.y(q.1);
+
+        let d2 =
+            (xq - pi.x).powi(2)
+            + (yq - pi.y).powi(2);
+
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best = Some(q);
+        }
+    }
+
+    let interior_idx = best.unwrap_or_else(|| {
+        panic!(
+            "cannot find interior point for zeroth-order ghost {:?}",
+            idx
+        )
+    });
+
+    // Zeroth-order extrapolation:
+    //
+    //     U_g = U_i
+    //
+    // IMPORTANT:
+    // Unlike ReflectiveWall, do NOT modify the normal momentum.
+    field.value[field.linear_index(interior_idx)]
+}
+
+fn periodic_value(
+    idx: (isize, isize),
+    project: geometry::Projection,
+    field: &field1::Field,
+) -> state::State {
+    let (i, j) = idx;
+
+    // This implementation is for the translating-shock test,
+    // where periodicity is only applied in the y direction.
+    //
+    // Physical periodic interval:
+    //
+    //     y in [y0, y0 + Ly)
+    //
+    // The polygon upper boundary itself is not a fluid grid point.
+    // Therefore the valid periodic y indices are
+    //
+    //     j = 0, ..., Np - 1.
+    //
+    // Find Np from the projected horizontal boundary.
+    let dy = field.grid.dy;
+
+    let y_bottom = field.grid.y0;
+
+    // For a top/bottom periodic boundary, project.point.y is
+    // either y_bottom or y_top.
+    //
+    // Determine Ly from the rectangular domain.
+    //
+    // Here the translating-shock case uses Ly = 0.5.
+    let ly = 0.5_f64;
+
+    let np =
+        (ly / dy).round() as isize;
+
+    debug_assert!(np > 0);
+
+    // Euclidean modulo:
+    //
+    //   -1   -> np-1
+    //   -2   -> np-2
+    //   np   -> 0
+    //   np+1 -> 1
+    let j_wrap = j.rem_euclid(np);
+
+    let wrapped_idx = (i, j_wrap);
+
+    if !field.is_in_domain(wrapped_idx) {
+        panic!(
+            "periodic wrapped point is not fluid: \
+             ghost={:?}, wrapped={:?}, np={}, P0=({:.8e},{:.8e})",
+            idx,
+            wrapped_idx,
+            np,
+            project.point.x,
+            project.point.y,
+        );
+    }
+
+    field.get(wrapped_idx)
+}
+
 pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,field: &field1::Field)
 -> state::State {
+    let t= field.time;
     let p = geometry::Point { x: field.grid.x(idx.0), y: field.grid.y(idx.1) };
     let con1 = field.outer_bound.is_fluid(p);
     let polygon = if con1 == false {&field.outer_bound} else {&field.inner_bound};
@@ -268,11 +385,14 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
             panic!("Boundary point {:?} does not lie on polygon boundary", project.point);
         }
     };
-    let bc = if con1 == false {&field.bc_outer} else {&field.bc_inner};
-    let bc = bc[i];
+    let bc_list = if con1 == false {&field.bc_outer} else {&field.bc_inner};
+    let bc = &bc_list[i];
 
     if let BCType::Constant(value) = bc {
-        return value;
+        return *value;
+    }
+    if let BCType::TimeDependent(f) = bc {
+        return f(project.point, project.normal, t);
     }
 
     if let BCType::ReflectiveWall = bc {
@@ -282,6 +402,22 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
             field,
         );
     }
+
+    if let BCType::ZerothOrder = bc {
+    return zeroth_order_value(
+        idx,
+        project,
+        field,
+    );
+    }
+
+    if let BCType::Periodic = bc {
+    return periodic_value(
+        idx,
+        project,
+        field,
+    );
+    }   
 
     let mut v = [[0.0; 6]; 5];
     // The characteristic matrix is evaluated at U_0, the interior grid
@@ -389,7 +525,7 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
 
             if lambda1 < 0.0 {
                 let m_local = (un0 / a).abs(); // TODO: swap for a stored global M_max if you track one
-                let l1 = sigma * (1.0 - m_local.powi(2)) * a / l_domain * (p0 - p_inf);
+                let l1 = *sigma * (1.0 - m_local.powi(2)) * a / *l_domain * (p0 - *p_inf);
                 rhs1[0] = l1 / lambda1;
             }
             // else: this boundary point is locally supersonic-out; row 0 is
@@ -431,8 +567,105 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
                 ei: u_ghost[4],
                 er: u_ghost[5],
             }
+        },
+        BCType::FarField(u_inf) => {
+    // Characteristic matrices are evaluated from the nearest
+    // interior state, exactly as in the existing BC machinery.
+    let idx_near = find_nearest_grid_point(project, field);
+    let (left, right, lambda) = build_local(project, idx_near, field);
+
+    // ------------------------------------------------------------
+    // Convert freestream state to the LOCAL (normal,tangential)
+    // coordinate system before applying L.
+    // ------------------------------------------------------------
+    let n = project.normal;
+
+    let uinf_local = rotate_state_to_local(*u_inf, n);
+    let uinf_arr =
+        Array1::from_vec(uinf_local.state2arr().to_vec());
+
+    let v_inf = left.dot(&uinf_arr);
+
+    // u[k] = kth normal derivative of conservative state
+    let mut u = vec![
+        Array1::zeros(6),
+        Array1::zeros(6),
+        Array1::zeros(6),
+        Array1::zeros(6),
+        Array1::zeros(6),
+    ];
+
+    // ------------------------------------------------------------
+    // k = 0
+    //
+    // outgoing characteristic : WENO extrapolation
+    // incoming characteristic : freestream
+    // ------------------------------------------------------------
+    let mut rhs0 =
+        Array1::from_vec(v[0].to_vec());
+
+    for m in 0..6 {
+        if lambda[m] < 0.0 {
+            rhs0[m] = v_inf[m];
         }
-        BCType::Constant(_) => unreachable!(),
+    }
+
+    u[0] = right.dot(&rhs0);
+
+    // ------------------------------------------------------------
+    // k = 1..4
+    //
+    // Far-field state is spatially constant, therefore incoming
+    // characteristic derivatives are zero.
+    // ------------------------------------------------------------
+    for k in 1..=4 {
+        let mut rhs_k =
+            Array1::from_vec(v[k].to_vec());
+
+        for m in 0..6 {
+            if lambda[m] < 0.0 {
+                rhs_k[m] = 0.0;
+            }
+        }
+
+        u[k] = right.dot(&rhs_k);
+    }
+
+    // ------------------------------------------------------------
+    // Taylor expansion from boundary foot P0 to ghost point
+    // ------------------------------------------------------------
+    let d = project.distance;
+
+    let mut u_ghost = u[0].clone();
+    let mut coef = 1.0;
+
+    for k in 1..=WALL_TAYLOR_ORDER {
+        coef *= d / (k as f64);
+        u_ghost = u_ghost + coef * &u[k];
+    }
+
+    // ------------------------------------------------------------
+    // local momentum -> global momentum
+    // ------------------------------------------------------------
+    let mom_n = u_ghost[1];
+    let mom_t = u_ghost[2];
+
+    let mom_x =
+        mom_n * n.x - mom_t * n.y;
+
+    let mom_y =
+        mom_n * n.y + mom_t * n.x;
+
+    state::State {
+        rho: u_ghost[0],
+        mom_x,
+        mom_y,
+        ee: u_ghost[3],
+        ei: u_ghost[4],
+        er: u_ghost[5],
+    }
+},
+        BCType::Constant(_) | BCType::TimeDependent(_) | BCType::ReflectiveWall => unreachable!(),
         _ => state::State::new(),
     }
 }
@@ -1198,6 +1431,7 @@ mod tests {
             value,
             outer,
             inner,
+            0.0,
         )
     }
 
@@ -1589,6 +1823,7 @@ mod tests {
             value,
             outer,
             inner,
+            0.0
         );
 
         // Point outside the hypotenuse x+y=1, away from vertices.

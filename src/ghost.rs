@@ -91,7 +91,7 @@ impl GhostGrid {
     }
 
     /// Correctness-first implementation: calculate every unique ghost once.
-    pub fn update_values(&mut self, field: &Field) {
+    pub fn update_values(&mut self, field: &Field, t: f64) {
         for id in 0..self.info.len() {
             let g = &self.info[id];
             self.values[id] =
@@ -103,7 +103,7 @@ impl GhostGrid {
 ///
 /// Each ghost is reconstructed once for the current RK stage.
 /// Fail immediately if bc1 produces a non-finite ghost state.
-pub fn update_values_parallel(&mut self, field: &Field) {
+pub fn update_values_parallel(&mut self, field: &Field, t: f64) {
     let info = &self.info;
 
     self.values

@@ -83,6 +83,12 @@ pub struct Field {
     /// Fluid mask over the Cartesian grid (linear index = i*ny + j),
     /// computed once at construction. `is_in_domain` reads this mask.
     pub fluid: Vec<bool>,
+    /// Analytic circular-arc overrides for selected outer/inner polygon
+    /// side ranges. The Polygon remains authoritative for the domain and
+    /// the fluid mask; the arcs only override boundary geometry
+    /// (P0, normal, distance) for ghosts attached to those sides.
+    pub outer_arcs: Vec<geometry::ArcOverride>,
+    pub inner_arcs: Vec<geometry::ArcOverride>,
 }
 
 impl Field {
@@ -124,6 +130,8 @@ impl Field {
             bc_outer: bc_outer,
             time: time,
             fluid: fluid,
+            outer_arcs: Vec::new(),
+            inner_arcs: Vec::new(),
         }
     }
 
@@ -146,7 +154,26 @@ impl Field {
             bc_outer: self.bc_outer.clone(),
             time: self.time,
             fluid: self.fluid.clone(),
+            outer_arcs: self.outer_arcs.clone(),
+            inner_arcs: self.inner_arcs.clone(),
         }
+    }
+
+    /// Find the analytic CircularArc overriding the given polygon side,
+    /// if any. Linear search: this is a cold/build-time operation.
+    pub fn arc_for_side(
+        &self,
+        boundary: crate::ghost::BoundaryKind,
+        side_id: usize,
+    ) -> Option<&geometry::CircularArc> {
+        let arcs = match boundary {
+            crate::ghost::BoundaryKind::Outer => &self.outer_arcs,
+            crate::ghost::BoundaryKind::Inner => &self.inner_arcs,
+        };
+
+        arcs.iter()
+            .find(|ov| ov.contains_side(side_id))
+            .map(|ov| &ov.arc)
     }
 
     pub fn is_in_domain(&self, idx: (isize, isize))-> bool {
@@ -251,6 +278,13 @@ impl Field {
             )
         };
 
+    let boundary =
+    if !outer_fluid {
+        crate::ghost::BoundaryKind::Outer
+    } else {
+        crate::ghost::BoundaryKind::Inner
+    };
+
     // ------------------------------------------------------------
     // First obtain the closest boundary point P0.
     //
@@ -284,7 +318,11 @@ impl Field {
     // ------------------------------------------------------------
     // IMPORTANT:
     //
-    // Recompute the normal from the SELECTED side.
+    // Final projection: if the selected polygon side belongs to an
+    // analytic CircularArc override, use the exact arc geometry
+    // (closest point, continuous normal, signed distance).
+    //
+    // Otherwise recompute the normal from the SELECTED side.
     //
     // Otherwise at a polygon vertex:
     //
@@ -294,38 +332,39 @@ impl Field {
     // which is inconsistent.
     // ------------------------------------------------------------
 
-    let normal =
-        polygon.outward_normal_of_side(
-            side_id,
-        );
-
-    let dx =
-        p.x - raw_project.point.x;
-
-    let dy =
-        p.y - raw_project.point.y;
-
-    let distance =
-        dx * normal.x
-        + dy * normal.y;
-
     let project =
+    if let Some(arc) =
+        self.arc_for_side(boundary, side_id)
+    {
+        arc.project(p)
+    }
+    else
+    {
+        let normal =
+            polygon.outward_normal_of_side(
+                side_id,
+            );
+
+        let dx =
+            p.x - raw_project.point.x;
+
+        let dy =
+            p.y - raw_project.point.y;
+
+        let distance =
+            dx * normal.x
+            + dy * normal.y;
+
         geometry::Projection {
             point: raw_project.point,
             normal,
             distance,
-        };
+        }
+    };
 
     // ------------------------------------------------------------
     // Reconstruct ghost using the BC side that WE selected.
     // ------------------------------------------------------------
-
-    let boundary =
-    if !outer_fluid {
-        crate::ghost::BoundaryKind::Outer
-    } else {
-        crate::ghost::BoundaryKind::Inner
-    };
 
     bc1::set_ghost_point_value(
         idx,

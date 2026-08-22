@@ -445,7 +445,7 @@ fn main() {
     let mut u3 = u.empty_like();
 
     let mut t=u.time;
-    let t_final=0.6_f64;
+    let t_final=1.0_f64;
     let mut next_store_time=(store_id+1) as f64*t_store_interval;
     let mut n=0usize;
 
@@ -565,8 +565,31 @@ mod parity {
                 y: field.grid.y(idx.1),
             };
             let poly = &field.outer_bound;
-            let project = geometry::project(poly, p);
-            let side = ghost::select_boundary_side(project.point, poly, &field.bc_outer);
+            let raw_project = geometry::project(poly, p);
+            let side = ghost::select_boundary_side(
+                raw_project.point,
+                poly,
+                &field.bc_outer,
+            );
+
+            // Same FINAL projection as the real solver:
+            // ArcOverride if the selected side belongs to an arc,
+            // selected-polygon-side geometry otherwise.
+            let project = if let Some(arc) =
+                field.arc_for_side(ghost::BoundaryKind::Outer, side)
+            {
+                arc.project(p)
+            } else {
+                let normal = poly.outward_normal_of_side(side);
+                let dx = p.x - raw_project.point.x;
+                let dy = p.y - raw_project.point.y;
+                geometry::Projection {
+                    point: raw_project.point,
+                    normal,
+                    distance: dx * normal.x + dy * normal.y,
+                }
+            };
+
             let pre = bc1::precompute_ghost_bc(&project, &field, &beta);
 
             let a = bc1::set_ghost_point_value(
@@ -587,5 +610,78 @@ mod parity {
             );
             state_close(&a, &b, 1e-10);
         }
+    }
+
+    #[test]
+    fn cylinder_arc_override_registration() {
+        let u = init::init_cylinder();
+
+        assert!(
+            u.outer_arcs.len() >= 1,
+            "cylinder must register at least one analytic arc"
+        );
+
+        let ov = &u.outer_arcs[0];
+
+        assert!((ov.arc.center.x - 0.0).abs() < 1e-12);
+        assert!((ov.arc.center.y - 0.0).abs() < 1e-12);
+        assert!((ov.arc.radius - 1.0).abs() < 1e-12);
+
+        for side in ov.side_start..=ov.side_end {
+            assert!(
+                matches!(&u.bc_outer[side], bc1::BCType::ReflectiveWall),
+                "arc side {} must keep its Wall BC",
+                side
+            );
+        }
+    }
+
+    #[test]
+    fn ghostgrid_stagnation_normal_exact() {
+        let field = init::init_cylinder();
+        let offsets = ghost::default_stencil_offsets();
+        let ghosts = ghost::GhostGrid::build(&field, &offsets);
+
+        // Ghost whose FINAL analytic P0 is closest to the stagnation
+        // point (-1, 0).
+        let mut best: Option<(&ghost::GhostInfo, f64)> = None;
+        for g in &ghosts.info {
+            let d = (g.project.point.x + 1.0).hypot(g.project.point.y);
+            if best.map_or(true, |(_, bd)| d < bd) {
+                best = Some((g, d));
+            }
+        }
+
+        let (g, d) = best.expect("no ghost found");
+        assert!(
+            d < 1e-6,
+            "stagnation ghost P0 = ({}, {}), dist to (-1,0) = {}",
+            g.project.point.x,
+            g.project.point.y,
+            d
+        );
+        assert!((g.project.normal.x - 1.0).abs() < 1e-9);
+        assert!(g.project.normal.y.abs() < 1e-9);
+
+        // Mirror symmetry for two solid-side ghosts at y = +/-0.2.
+        let j_up = ((0.2 - field.grid.y0) / field.grid.dy).round() as isize;
+        let j_dn = ((-0.2 - field.grid.y0) / field.grid.dy).round() as isize;
+        let i_ghost = ((-0.975 - field.grid.x0) / field.grid.dx).round() as isize;
+
+        let id_up = ghosts
+            .id((i_ghost, j_up))
+            .expect("upper mirror ghost missing");
+        let id_dn = ghosts
+            .id((i_ghost, j_dn))
+            .expect("lower mirror ghost missing");
+
+        let up = &ghosts.info[id_up];
+        let dn = &ghosts.info[id_dn];
+
+        assert!((up.project.point.x - dn.project.point.x).abs() < 1e-9);
+        assert!((up.project.point.y + dn.project.point.y).abs() < 1e-9);
+        assert!((up.project.normal.x - dn.project.normal.x).abs() < 1e-9);
+        assert!((up.project.normal.y + dn.project.normal.y).abs() < 1e-9);
+        assert!((up.project.distance - dn.project.distance).abs() < 1e-9);
     }
 }

@@ -17,10 +17,10 @@ OUTPUT_VIDEO = "density.mp4"
 
 # Video settings
 FPS = 20
-DPI = 150
+DPI = 450
 
 # Plot settings
-CMAP = "viridis"
+CMAP = "plasma"
 
 # If None, determine global limits from ALL frames.
 # This is strongly recommended for a scientific animation.

@@ -419,3 +419,375 @@ impl Geometry for Polygon {
         }
     }
 }
+
+// ============================================================================
+// Analytic circular arc boundary geometry.
+//
+// CircularArc is a GEOMETRIC OVERRIDE for selected Polygon side ranges.
+// It does NOT define a full 2D domain (no is_fluid), so it does not
+// implement the Geometry trait. Polygon remains the authoritative domain
+// representation and the fluid-mask source.
+// ============================================================================
+
+const ARC_ANGLE_TOL: f64 = 1e-12;
+
+#[inline]
+fn normalize_angle(theta: f64) -> f64 {
+    theta.rem_euclid(2.0 * std::f64::consts::PI)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CircularArc {
+    pub center: Point,
+    pub radius: f64,
+
+    /// Starting polar angle in radians (canonical internal form).
+    pub theta_start: f64,
+
+    /// Signed angular sweep in radians.
+    ///
+    /// sweep > 0 : counter-clockwise
+    /// sweep < 0 : clockwise
+    pub sweep: f64,
+
+    /// Determines the FLUID-DOMAIN outward normal direction.
+    pub fluid: FluidSide,
+}
+
+impl CircularArc {
+    /// Canonical low-level constructor.
+    pub fn new(
+        center: Point,
+        radius: f64,
+        theta_start: f64,
+        sweep: f64,
+        fluid: FluidSide,
+    ) -> Self {
+        assert!(radius > 0.0, "CircularArc radius must be positive");
+        assert!(
+            sweep.abs() > ARC_ANGLE_TOL,
+            "CircularArc sweep must be nonzero"
+        );
+        assert!(
+            sweep.abs() <= 2.0 * std::f64::consts::PI + ARC_ANGLE_TOL,
+            "CircularArc sweep must not exceed 2*pi"
+        );
+
+        Self {
+            center,
+            radius,
+            theta_start,
+            sweep,
+            fluid,
+        }
+    }
+
+    /// Preferred high-level constructor from three arc points.
+    ///
+    /// start/mid/end uniquely determine center and radius (when not
+    /// collinear); mid selects which of the two start->end arcs to keep.
+    /// The three points are used ONLY for construction: afterwards the
+    /// arc is fully described by the canonical (center, radius,
+    /// theta_start, sweep, fluid) representation.
+    pub fn from_three_points(
+        start: Point,
+        mid: Point,
+        end: Point,
+        fluid: FluidSide,
+    ) -> Self {
+        let (x1, y1) = (start.x, start.y);
+        let (x2, y2) = (mid.x, mid.y);
+        let (x3, y3) = (end.x, end.y);
+
+        // Twice the signed triangle area = 2 * det, in length^2 units.
+        let d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+
+        let chord_scale = [
+            (x1 - x2).hypot(y1 - y2),
+            (x2 - x3).hypot(y2 - y3),
+            (x1 - x3).hypot(y1 - y3),
+        ]
+        .into_iter()
+        .fold(0.0f64, f64::max)
+        .max(1.0);
+
+        assert!(
+            d.abs() > 1e-12 * chord_scale * chord_scale,
+            "CircularArc::from_three_points: points are (nearly) collinear"
+        );
+
+        // Circumcenter.
+        let r1 = x1 * x1 + y1 * y1;
+        let r2 = x2 * x2 + y2 * y2;
+        let r3 = x3 * x3 + y3 * y3;
+
+        let ux = (r1 * (y2 - y3) + r2 * (y3 - y1) + r3 * (y1 - y2)) / d;
+        let uy = (r1 * (x3 - x2) + r2 * (x1 - x3) + r3 * (x2 - x1)) / d;
+
+        let center = Point { x: ux, y: uy };
+        let radius = (x1 - ux).hypot(y1 - uy);
+
+        assert!(
+            radius > 0.0,
+            "CircularArc::from_three_points: zero-radius arc"
+        );
+
+        let theta_start = (y1 - uy).atan2(x1 - ux);
+        let theta_mid = (y2 - uy).atan2(x2 - ux);
+        let theta_end = (y3 - uy).atan2(x3 - ux);
+
+        let ccw_sweep = normalize_angle(theta_end - theta_start);
+        let ccw_to_mid = normalize_angle(theta_mid - theta_start);
+
+        let sweep = if ccw_to_mid <= ccw_sweep + ARC_ANGLE_TOL {
+            ccw_sweep
+        } else {
+            -normalize_angle(theta_start - theta_end)
+        };
+
+        Self::new(center, radius, theta_start, sweep, fluid)
+    }
+
+    /// True if polar angle `theta` lies on the finite arc.
+    pub fn contains_angle(&self, theta: f64) -> bool {
+        if self.sweep > 0.0 {
+            normalize_angle(theta - self.theta_start)
+                <= self.sweep + ARC_ANGLE_TOL
+        } else {
+            normalize_angle(self.theta_start - theta)
+                <= -self.sweep + ARC_ANGLE_TOL
+        }
+    }
+
+    pub fn start_point(&self) -> Point {
+        Point {
+            x: self.center.x + self.radius * self.theta_start.cos(),
+            y: self.center.y + self.radius * self.theta_start.sin(),
+        }
+    }
+
+    pub fn end_point(&self) -> Point {
+        let theta_end = self.theta_start + self.sweep;
+        Point {
+            x: self.center.x + self.radius * theta_end.cos(),
+            y: self.center.y + self.radius * theta_end.sin(),
+        }
+    }
+
+    /// Exact closest point on the finite arc.
+    pub fn closest_point(&self, p: Point) -> Point {
+        let rx = p.x - self.center.x;
+        let ry = p.y - self.center.y;
+        let rnorm = rx.hypot(ry);
+
+        if rnorm > ARC_ANGLE_TOL {
+            let theta = ry.atan2(rx);
+            if self.contains_angle(theta) {
+                let s = self.radius / rnorm;
+                return Point {
+                    x: self.center.x + s * rx,
+                    y: self.center.y + s * ry,
+                };
+            }
+        }
+
+        // Radial projection falls outside the finite arc (or p is at the
+        // center): fall back to the nearest endpoint.
+        let start = self.start_point();
+        let end = self.end_point();
+
+        let d2s = (p.x - start.x).powi(2) + (p.y - start.y).powi(2);
+        let d2e = (p.x - end.x).powi(2) + (p.y - end.y).powi(2);
+
+        if d2s <= d2e {
+            start
+        } else {
+            end
+        }
+    }
+
+    /// FLUID-DOMAIN outward normal at a point on the arc.
+    ///
+    /// FluidSide::Inside  -> normal = radial
+    /// FluidSide::Outside -> normal = -radial
+    pub fn outward_normal(&self, p0: Point) -> Vec2 {
+        let dx = p0.x - self.center.x;
+        let dy = p0.y - self.center.y;
+        let nrm = dx.hypot(dy);
+
+        assert!(
+            nrm > 1e-14,
+            "CircularArc::outward_normal: point coincides with arc center"
+        );
+
+        let radial = Vec2 {
+            x: dx / nrm,
+            y: dy / nrm,
+        };
+
+        match self.fluid {
+            FluidSide::Inside => radial,
+            FluidSide::Outside => Vec2 {
+                x: -radial.x,
+                y: -radial.y,
+            },
+        }
+    }
+
+    /// Exact projection: P0 = closest point, n = fluid outward normal,
+    /// D = (p - P0) . n, matching the existing Projection convention.
+    pub fn project(&self, p: Point) -> Projection {
+        let p0 = self.closest_point(p);
+        let n = self.outward_normal(p0);
+
+        let dx = p.x - p0.x;
+        let dy = p.y - p0.y;
+
+        let distance = dx * n.x + dy * n.y;
+
+        Projection {
+            point: p0,
+            normal: n,
+            distance,
+        }
+    }
+}
+
+/// Marks an inclusive range of Polygon sides as an analytic circular arc.
+///
+/// The Polygon sides keep their role for the domain/mask and BC ownership;
+/// the arc only overrides the boundary geometry (P0, n, D).
+#[derive(Clone, Debug)]
+pub struct ArcOverride {
+    pub side_start: usize,
+    pub side_end: usize,
+    pub arc: CircularArc,
+}
+
+impl ArcOverride {
+    /// Inclusive side-range check; ranges do not wrap.
+    #[inline(always)]
+    pub fn contains_side(&self, side: usize) -> bool {
+        side >= self.side_start && side <= self.side_end
+    }
+}
+
+#[cfg(test)]
+mod arc_tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    fn cylinder_arc() -> CircularArc {
+        CircularArc::from_three_points(
+            Point { x: 0.0, y: -1.0 },
+            Point { x: -1.0, y: 0.0 },
+            Point { x: 0.0, y: 1.0 },
+            FluidSide::Outside,
+        )
+    }
+
+    #[test]
+    fn three_point_construction_left_semicircle() {
+        let arc = cylinder_arc();
+
+        assert!((arc.center.x - 0.0).abs() < 1e-12);
+        assert!((arc.center.y - 0.0).abs() < 1e-12);
+        assert!((arc.radius - 1.0).abs() < 1e-12);
+
+        // (-1,0) lies on the selected finite arc.
+        assert!(arc.contains_angle(PI));
+
+        // (+1,0) does NOT lie on the selected finite arc.
+        assert!(!arc.contains_angle(0.0));
+        assert!(!arc.contains_angle(2.0 * PI));
+    }
+
+    #[test]
+    fn stagnation_projection() {
+        let arc = cylinder_arc();
+
+        let p = Point { x: -1.2, y: 0.0 };
+        let proj = arc.project(p);
+
+        assert!((proj.point.x + 1.0).abs() < 1e-12);
+        assert!(proj.point.y.abs() < 1e-12);
+
+        // Fluid is OUTSIDE the cylinder => outward fluid normal = +x.
+        assert!((proj.normal.x - 1.0).abs() < 1e-12);
+        assert!(proj.normal.y.abs() < 1e-12);
+
+        // Ghost/query point is on the fluid side: D = (p-P0).n = -0.2.
+        assert!((proj.distance + 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn upper_lower_mirror_symmetry() {
+        let arc = cylinder_arc();
+
+        let p_upper = Point { x: -1.1, y: 0.2 };
+        let p_lower = Point { x: -1.1, y: -0.2 };
+
+        let a = arc.project(p_upper);
+        let b = arc.project(p_lower);
+
+        assert!((a.point.x - b.point.x).abs() < 1e-12);
+        assert!((a.point.y + b.point.y).abs() < 1e-12);
+
+        assert!((a.normal.x - b.normal.x).abs() < 1e-12);
+        assert!((a.normal.y + b.normal.y).abs() < 1e-12);
+
+        assert!((a.distance - b.distance).abs() < 1e-12);
+    }
+
+    #[test]
+    fn finite_arc_endpoint_selection() {
+        let arc = cylinder_arc();
+
+        // Radial projection of p points at theta=0, which is NOT on the
+        // LEFT semicircle; nearest endpoint must be (0,1) = end.
+        let p = Point { x: 0.3, y: 0.7 };
+        let p0 = arc.closest_point(p);
+
+        assert!((p0.x - 0.0).abs() < 1e-12);
+        assert!((p0.y - 1.0).abs() < 1e-12);
+
+        // Mirror case selects the start endpoint (0,-1).
+        let p = Point { x: 0.3, y: -0.7 };
+        let p0 = arc.closest_point(p);
+        assert!((p0.x - 0.0).abs() < 1e-12);
+        assert!((p0.y + 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    #[should_panic(expected = "collinear")]
+    fn collinear_points_rejected() {
+        let _ = CircularArc::from_three_points(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 1.0, y: 1.0 },
+            Point { x: 2.0, y: 2.0 },
+            FluidSide::Outside,
+        );
+    }
+
+    #[test]
+    fn arc_override_inclusive_side_range() {
+        let arc = CircularArc::from_three_points(
+            Point { x: 0.0, y: -1.0 },
+            Point { x: -1.0, y: 0.0 },
+            Point { x: 0.0, y: 1.0 },
+            FluidSide::Outside,
+        );
+
+        let ov = ArcOverride {
+            side_start: 5,
+            side_end: 9,
+            arc,
+        };
+
+        assert!(ov.contains_side(5));
+        assert!(ov.contains_side(9));
+        assert!(ov.contains_side(7));
+        assert!(!ov.contains_side(4));
+        assert!(!ov.contains_side(10));
+    }
+}

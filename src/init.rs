@@ -265,7 +265,7 @@ pub fn init_cylinder() -> Field {
 
     outer_points.push(Point {
         x: 0.0,
-        y: -1.0,
+        y: -1.0+ 0.0125,
     });
 
     bc_outer.push(
@@ -290,6 +290,10 @@ pub fn init_cylinder() -> Field {
 
     let n_arc = 360_usize;
 
+    // First polygon side of the circular Wall range (side i spans
+    // points[i] -> points[i+1], so this equals bc_outer.len() here).
+    let arc_side_start = bc_outer.len();
+
     for k in 1..=n_arc {
         let s =
             k as f64 / n_arc as f64;
@@ -311,7 +315,7 @@ pub fn init_cylinder() -> Field {
         outer_points.push(
             Point {
                 x: theta.cos(),
-                y: theta.sin(),
+                y: theta.sin()+0.0125,
             }
         );
 
@@ -319,6 +323,28 @@ pub fn init_cylinder() -> Field {
             BCType::ReflectiveWall
         );
     }
+
+    // Last polygon side of the circular Wall range (inclusive).
+    let arc_side_end = bc_outer.len() - 1;
+
+    // Analytic circular arc overriding the polygon Wall segments.
+    // The three points select the LEFT semicircle of the unit circle.
+    let cylinder_arc =
+        crate::geometry::CircularArc::from_three_points(
+            Point {
+                x: 0.0,
+                y: -1.0+0.0125,
+            },
+            Point {
+                x: -1.0,
+                y: 0.0+0.0125,
+            },
+            Point {
+                x: 0.0,
+                y: 1.0+0.0125,
+            },
+            FluidSide::Outside,
+        );
 
     // At this point the last arc point should be approximately:
     //
@@ -427,6 +453,18 @@ pub fn init_cylinder() -> Field {
             inner_bound,
             0.0,
         );
+
+    // Register the analytic circular-arc geometry override for the
+    // polygon Wall side range. The Polygon keeps defining the fluid
+    // mask and BC ownership; the arc replaces the boundary geometry
+    // (P0, normal, distance) for ghosts attached to those sides.
+    u.outer_arcs.push(
+        crate::geometry::ArcOverride {
+            side_start: arc_side_start,
+            side_end: arc_side_end,
+            arc: cylinder_arc,
+        }
+    );
 
     // ============================================================
     // Initial condition

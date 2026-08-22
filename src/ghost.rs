@@ -414,26 +414,45 @@ fn build_ghost_info(
         bc_list,
     );
 
-    let normal =
-    polygon.outward_normal_of_side(
-        side_id
-    );
-
-    let dx =
-    p.x - project.point.x;
-
-    let dy =
-    p.y - project.point.y;
-
-    let distance =
-    dx * normal.x
-    + dy * normal.y;
+    // ------------------------------------------------------------
+    // FINAL projection for this ghost:
+    //
+    //   * if the selected polygon side belongs to an analytic
+    //     CircularArc override -> exact arc geometry
+    //   * otherwise -> selected-polygon-side geometry
+    //
+    // This final projection is what feeds GhostBC precomputation
+    // below and every RK-stage ghost reconstruction.
+    // ------------------------------------------------------------
 
     let project =
-    Projection {
-        point: project.point,
-        normal,
-        distance,
+    if let Some(arc) =
+        field.arc_for_side(boundary, side_id)
+    {
+        arc.project(p)
+    }
+    else
+    {
+        let normal =
+        polygon.outward_normal_of_side(
+            side_id
+        );
+
+        let dx =
+        p.x - project.point.x;
+
+        let dy =
+        p.y - project.point.y;
+
+        let distance =
+        dx * normal.x
+        + dy * normal.y;
+
+        Projection {
+            point: project.point,
+            normal,
+            distance,
+        }
     };
 
     // Precompute the heavy per-stage extrapolation data for BC types that

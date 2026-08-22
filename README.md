@@ -229,4 +229,4 @@ Recommended verification workflow:
 
 The boundary treatment follows:
 
-> S. Tan, C. Wang, C.-W. Shu, "Accurate numerical boundary conditions for compressible flow problems," *Journal of Computational Physics* 231 (2012), 2510–2527.
+> S. Tan, C. Wang, C.-W. Shu, and J. Ning, "Efficient implementation of high order inverse Lax–Wendroff boundary treatment for conservation laws," *Journal of Computational Physics* 231 (2012), 2510–2527.

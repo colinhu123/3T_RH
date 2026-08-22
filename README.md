@@ -1,19 +1,19 @@
 # 2D Three-Temperature Radiation Hydrodynamics WENO Solver
 
-A Rust implementation of a two-dimensional, high-order finite-difference solver for the three-temperature radiation hydrodynamics (3-T RH) system.
+A Rust implementation of a two-dimensional, high-order finite-difference solver for the three-temperature radiation hydrodynamics (3-T RH) system on Cartesian grids with arbitrary polygon-embedded geometries.
 
-The implementation follows the 2D algorithm described by Cheng and Shu in *High order conservative finite difference WENO scheme for three-temperature radiation hydrodynamics* (Journal of Computational Physics, 2024). In particular, the solver follows the paper's direction-by-direction construction: the 2D spatial operator is assembled from 1D WENO flux evaluations in the x- and y-directions, together with the non-conservative terms, diffusion, and energy-exchange source terms.
+The implementation follows the 2D algorithm described by Cheng and Shu in *High order conservative finite difference WENO scheme for three-temperature radiation hydrodynamics* (Journal of Computational Physics, 2024). The boundary treatment follows the high-order inverse Lax–Wendroff (ILW) / WENO extrapolation approach of Tan, Wang and Shu (*Accurate numerical boundary conditions for computational fluid dynamics*, 2012).
 
 ## What this code solves
 
 The model contains six evolved quantities in two spatial dimensions:
 
-- density
-- x-momentum
-- y-momentum
-- electron energy variable
-- ion energy variable
-- radiation energy variable
+- density `rho`
+- x-momentum `mom_x`
+- y-momentum `mom_y`
+- electron energy variable `ee`
+- ion energy variable `ei`
+- radiation energy variable `er`
 
 The paper writes the 2D system in the form
 
@@ -25,23 +25,21 @@ U_t + dF1/dx + dF2/dy
 
 where `F1` and `F2` are the conservative convection fluxes, `N` contains the non-conservative pressure combinations, `G1` and `G2` are the electron/ion/radiation diffusion fluxes, and `S` contains the electron-ion and electron-radiation energy exchange terms.
 
-This is the same operator structure assembled in `main.rs`: conservative x/y flux divergences, non-conservative x/y contributions, source terms, and diffusion in both directions are combined to form the semi-discrete right-hand side.
+This is the same operator structure assembled in `l()` in `main.rs`: conservative x/y flux divergences, non-conservative x/y contributions, source terms, and diffusion in both directions are combined to form the semi-discrete right-hand side.
 
 ## Numerical method
 
-The spatial discretization is based on a fifth-order WENO finite-difference formulation, following the 2D construction in Section 4 of the reference paper.
+The spatial discretization is a fifth-order finite-difference WENO scheme with local characteristic decomposition (Roe-averaged 6x6 eigen-decomposition per interface, `weno.rs`), following the 2D construction in Section 4 of the reference paper.
 
 The main algorithm is:
 
-1. Build x-direction WENO interface fluxes.
-2. Build x-direction diffusion fluxes.
+1. Recompute all ghost-cell values for the current RK stage (`GhostGrid`).
+2. Build x-direction WENO interface fluxes (characteristic space).
 3. Build y-direction WENO interface fluxes.
-4. Build y-direction diffusion fluxes.
-5. Compute the cell-centered conservative flux divergence.
-6. Add the non-conservative x/y terms.
-7. Add the source term.
-8. Add the diffusion contribution in x/y.
-9. Advance the solution with third-order SSP Runge-Kutta time integration.
+4. Add the non-conservative x/y terms (6th-order central derivative + upwind jump terms, `noncon.rs`).
+5. Add the source term (`source.rs`).
+6. Add the diffusion contribution in x/y (`diffusion.rs`).
+7. Advance the solution with third-order SSP Runge-Kutta time integration.
 
 The paper explicitly notes that the 2D finite-difference method can reuse the 1D algorithm independently in each coordinate direction. This project follows that structure: the WENO reconstruction is called once for x-directed stencils and once for y-directed stencils.
 
@@ -59,259 +57,176 @@ u^(n+1) = 1/3 u^n + 2/3 u2 + 2 dt/3 L(u2)
 
 In the code this is implemented in `rk3_ssp()`.
 
-## Spatial operator in `main.rs`
+The global time step is `dt = 0.05 * dt_cfl`, where `dt_cfl` is the minimum over all fluid cells of `dt::get_local_dt()` (which includes advection, diffusion and exchange-term eigenvalue estimates, scaled by `LAMBDA = 0.5`). The step is clipped so the simulation lands exactly on output times and `t_final`.
 
-The main file contains the top-level numerical workflow.
+## Geometry and boundary conditions
 
-### Stencil construction
+The fluid domain is defined by polygons (`geometry.rs`):
 
-Three stencil extractors are provided:
+- `outer_bound`: polygon with fluid inside (`FluidSide::Inside`). The cylinder surface is part of this polygon.
+- `inner_bound`: polygon with fluid outside (`FluidSide::Outside`). Currently a dummy placed far outside the domain.
 
-- `weno_stencil_extractor()` builds the six-point stencil passed to `weno::Stencil6`.
-- `noncon_stencil_extractor()` builds the nine-point stencil used by the non-conservative discretization.
-- `diffusion_stencil_extractor()` builds the six-point stencil used for diffusion.
+Every side of each polygon carries a `BCType`. On a Cartesian point that lies outside the fluid domain, `Field::is_in_domain` returns false and the point is treated as a ghost cell.
 
-The x/y indexing uses modulo arithmetic, so the currently implemented stencil handling is periodic in both coordinate directions.
+### Ghost grid
 
-### Semi-discrete operator
+`ghost.rs` discovers, once at startup, every ghost index referenced by the solver stencils (a radius-4 cross, `default_stencil_offsets()`, covering WENO, non-conservative and diffusion stencils), and caches for each ghost:
 
-The function `l(u, dx, dy)` assembles the complete spatial operator. Its structure mirrors the paper's 2D semi-discrete equation:
+- the closest boundary point `P0` and outward fluid normal,
+- the boundary side (at polygon vertices the side is selected by BC priority: `Wall > ReflectiveWall > Constant/TimeDependent > FarField > Outflow > ZerothOrder > Periodic`),
+- the signed normal distance from `P0` to the ghost point.
 
-```text
-L(u) = conservative flux divergence
-     + non-conservative x/y terms
-     + source
-     + diffusion x/y terms
-```
+Ghost values are recomputed in parallel (Rayon) once per RK stage in `GhostGrid::update_values_parallel()`. All ghosts are first-stage-independent, so the update is data-parallel.
 
-The conservative contribution is formed from differences of neighboring interface fluxes. The diffusion contribution is likewise obtained from neighboring diffusion fluxes.
+### Boundary conditions (`bc1.rs`)
 
-### Parallel execution
+| BCType | Description |
+|---|---|
+| `Wall` | High-order ILW: no-penetration constraint on the momentum row, characteristic WENO extrapolation for the other rows, 4th-order Taylor expansion to the ghost point. |
+| `ReflectiveWall` | Geometric reflection of the nearest interior state with normal momentum flipped. |
+| `FarField(state)` | Characteristic BC: outgoing characteristics from WENO extrapolation, incoming characteristics from the freestream state. Becomes supersonic inflow/outflow automatically. |
+| `Outflow { p_inf, sigma, l_domain }` | LODI pressure relaxation for the incoming acoustic wave. |
+| `Constant(state)` / `TimeDependent(f)` | Prescribed boundary state. |
+| `ZerothOrder` | Ghost value copied from the mirrored interior cell. |
+| `Periodic` | y-periodic wrap (used by the translating-shock test). |
 
-The code uses Rayon (`rayon::prelude::*`) to parallelize grid loops. The x/y interface flux calculations and cell-wise RHS construction use parallel iterators, which is useful for the large uniform grids typically used by high-order finite-difference solvers.
+The high-order machinery (`weno_extrapolation()`) follows Tan et al. (2012), Sec. 2.4: for each order r = 0..4 a 2D polynomial of degree r is least-squares fitted to the (r+1)^2-point stencil `E_r` of characteristic variables in boundary-normal coordinates; smoothness indicators and nonlinear weights select the WENO combination of the k-th normal derivatives, which are Taylor-expanded to the ghost point.
 
 ## Current test problem in `main.rs`
 
-The current executable is configured as a 2D double-wave / radiation shock-tube style initial condition based on the constant states used in the reference problem family.
-
-The grid and physical domain are currently hard-coded as:
+The current executable is the **Mach-3 flow past the front half of a circular cylinder** (`init::init_cylinder()`):
 
 ```text
-Nx = 400
-Ny = 100
-Lx = 40
-Ly = 10
-Tfinal = 1
+domain      : x in [-3, 0], y in [-6, 6]
+obstacle    : half-disk x^2 + y^2 < 1, x <= 0  (part of the outer polygon)
+grid        : nx = 121, ny = 481, dx = dy = 1/40
+freestream  : rho = 1, p = 1, M = 3  (splits: ee = ei = er)
+t_final     : 0.4
+output      : every dt_store = 0.001
 ```
 
-so that
+The cylinder arc is approximated by 360 polygon segments with `ReflectiveWall`; all outer rectangular sides use `FarField` (the left side `x = -3` is supersonic inflow).
 
-```text
-dx = Lx / Nx
-dy = Ly / Ny
-```
-
-The initial state is piecewise constant in x:
-
-```text
-left quarter:    State 1
-middle region:   State 2
-right quarter:   State 1
-```
-
-with the states currently defined in `init()` as
-
-```text
-State 1:
-    rho   = 0.445
-    mom_x = 0.31061
-    mom_y = 0.0
-    ee    = 1.8
-    ei    = 1.8
-    er    = 3.564
-
-State 2:
-    rho   = 0.5
-    mom_x = 0.0
-    mom_y = 0.0
-    ee    = 0.285
-    ei    = 0.285
-    er    = 0.571
-```
-
-The main loop advances the solution until `t = 1.0` and writes the initial state plus every subsequent time step to the data directory through the I/O module.
+`init::init_double_mach()` is also available (the paper's double-Mach-reflection benchmark with a polygonal domain and a moving shock).
 
 ## Project layout
 
-The uploaded `main.rs` expects the following Rust modules:
-
 ```text
 .
-├── main.rs
-├── state.rs
-├── weno.rs
-├── dt.rs
-├── noncon.rs
-├── source.rs
-├── diffusion.rs
-├── constant.rs
-└── io.rs
+├── main.rs          grid/driver setup, spatial operator l(), SSP-RK3, time loop, output
+├── state.rs         State representation, pressure splits, physical fluxes, arithmetic
+├── weno.rs          WENO stencil, Roe-average eigen-decomposition, characteristic WENO5 reconstruction
+├── noncon.rs        non-conservative pressure term (6th-order derivative + upwind jumps)
+├── diffusion.rs     diffusion flux (6-point derivative of temperature)
+├── source.rs        electron-ion / electron-radiation energy exchange
+├── dt.rs            local time-step estimate
+├── constant.rs      physical and numerical constants
+├── geometry.rs      points, vectors, projections, polygons, normals
+├── field1.rs        GridInfo + Field with polygon-defined fluid region
+├── ghost.rs         GhostGrid: static ghost layout, parallel per-stage updates
+├── bc1.rs           boundary conditions (ILW wall, WENO extrapolation, far-field, LODI, ...)
+├── init.rs          initial conditions (cylinder, double Mach reflection)
+└── io.rs            binary output/restart writer and reader
 ```
 
-The responsibilities are approximately:
-
-| Module | Role |
-|---|---|
-| `main.rs` | Grid setup, spatial operator, SSP-RK3 stepping, global time loop, output |
-| `state.rs` | State representation and state arithmetic |
-| `weno.rs` | WENO stencil representation and interface reconstruction |
-| `noncon.rs` | Non-conservative term discretization |
-| `diffusion.rs` | Diffusion stencil and diffusion flux construction |
-| `dt.rs` | Local time-step estimate |
-| `source.rs` | Energy-exchange / additional source contribution |
-| `constant.rs` | Physical/numerical constants |
-| `io.rs` | Output-file management and solution writing |
-
-The exact formulas and implementation details of these components are contained in their respective modules; `main.rs` acts as the orchestration layer.
+`bc.rs` and `field.rs` are legacy rectangular-grid variants that are no longer wired into the build (`main.rs` declares `bc1`/`field1` instead).
 
 ## Build and run
-
-This project is intended to be built as a normal Rust/Cargo application.
 
 ```bash
 cargo build --release
 ```
 
-Run the solver with:
+Fresh run (clears `data_new/`):
 
 ```bash
 cargo run --release
 ```
 
-The program clears the previous output directory, initializes the solution, writes `solution_0000.dat`, advances the solution, and then writes files named like:
+Restart from an existing snapshot, e.g. `data_new/solution_0012.bin`:
 
-```text
-solution_0001.dat
-solution_0002.dat
-...
+```bash
+cargo run --release -- 12
 ```
 
-The run also prints the current step, simulation time, and time step to the terminal.
+The run prints the grid summary, per-step time/time-step info, and output-file writes.
+
+## Tests
+
+```bash
+cargo test
+```
+
+Test coverage includes:
+
+- WENO: eigen-decomposition (`L * R = I` for x/y), characteristic round-trip, constant-state flux preservation, WENO5 convergence order on a smooth profile.
+- noncon: constant-state and zero-velocity vanishing, direction sensitivity, wrapper consistency.
+- bc1: polynomial least-squares reproduction, derivative extraction, paper stencil `E_r` cardinality/structure on vertical and horizontal walls, constant-state characteristic extrapolation and final ghost reconstruction.
+- ghost: stencil-offset bookkeeping.
+- state: primitive-to-conservative conversion.
 
 ## Output
 
-The output is generated through `io::save_data()`. The exact file format is therefore controlled by `io.rs` rather than `main.rs`.
-
-A typical output sequence is:
+Binary files `data_new/solution_NNNN.bin` (little endian):
 
 ```text
-solution_0000.dat
-solution_0001.dat
-solution_0002.dat
-...
+header:
+  [8]u8  magic = "RH3TBIN1"
+  u32    version = 1
+  u32    nvar = 8
+  u64    nx
+  u64    ny
+  f64    time
+
+payload, j-major (x fastest):
+  repeated nx*ny times: f64 x, y, rho, mom_x, mom_y, ee, ei, er
 ```
 
-These files contain the numerical solution at successive time levels and can be post-processed or visualized with an external analysis/plotting script.
+Points outside the fluid polygon are stored as NaN so post-processing can mask them. Files are written to a `.tmp` name and atomically renamed, so a live visualizer never sees a partial file.
 
-## Relation to the reference 2D algorithm
+### Visualization
 
-The reference paper's 2D method is built from a one-dimensional high-order finite-difference WENO algorithm applied independently along each coordinate direction. The paper's Algorithm 4.1 computes the x-direction interface fluxes by applying the 1D procedure along each row, and the y-direction fluxes by applying the same procedure along each column.
+Interactive density viewer (arrow keys step through frames, `q` quits; safe to run while the solver is still writing):
 
-The project follows the same high-level decomposition:
+```bash
+python visualize_sol.py
+```
+
+Additional scripts in `py_utils/`:
+
+- `contour_gen.py` — contour plots of a single snapshot (edit the gamma values to match `constant.rs`).
+- `energy_split.py` — history of the maximum electron/ion/radiation energy splits across snapshots; writes `energy_split_history.csv`.
+- `conservation_check.py` — legacy text-format (`*.dat`) conservation check.
+
+## Current physical parameters (`constant.rs`)
 
 ```text
-                    2D problem
-                       |
-          +------------+------------+
-          |                         |
-       x direction              y direction
-          |                         |
-   WENO interface flux      WENO interface flux
-          |                         |
-   diffusion contribution    diffusion contribution
-          +------------+------------+
-                       |
-              cell-centered RHS
-                       |
-                  SSP-RK3 step
-                       |
-                 updated state
+KAPPA_E = KAPPA_I = KAPPA_R = 0   (no diffusion)
+OMEGA_EI = OMEGA_ER = 0           (no energy exchange)
+CVE = CVI = 1, A = 1
+GAMMA_E = GAMMA_I = GAMMA_R = 1.4
+LAMBDA = 0.5, WENO_Q = 2.0
 ```
 
-The implementation also keeps the separate non-conservative, diffusion, and source contributions rather than folding them into a single conservative flux.
-
-## Important implementation details
-
-### Periodic indexing in the current driver
-
-The stencil extractors use modulo indexing in both x and y. This is an explicit implementation choice in `main.rs` and means the current driver is set up around periodic stencil access.
-
-Changing to reflective, Dirichlet, outflow, or mixed boundaries will require boundary treatment outside the current modulo-based extraction logic.
-
-### Adaptive global time step
-
-`calc_global_dt()` scans all cells and takes the minimum local time step returned by `dt::get_local_dt()`.
-
-The main loop then clips the final time step so that the simulation does not advance beyond `t_final`.
-
-### Parallelism
-
-Rayon is used for grid-level parallelism. The current implementation therefore targets a CPU-parallel workflow rather than GPU execution.
+With these settings the code reduces to the 3-T Euler equations; diffusion and exchange terms are in place but inactive.
 
 ## Accuracy and verification
 
-The reference paper reports fifth-order spatial accuracy and third-order SSP Runge-Kutta time discretization for its finite-difference WENO construction. In the paper's 2D manufactured-solution test, the reported scheme reaches approximately fifth-order convergence in both `L1` and `Linf` norms for the directly evolved variables when the grid is refined.
+The reference paper reports fifth-order spatial accuracy and third-order SSP Runge-Kutta time discretization for its finite-difference WENO construction.
 
-For this project, a good next verification step is to reproduce the paper's 2D manufactured-solution test before relying on shock/interface problems as validation. This separates implementation errors in order-of-accuracy-sensitive pieces from physical-model behavior near discontinuities.
+Recommended verification workflow:
 
-## Recommended verification workflow
-
-1. Verify constant-state preservation.
-2. Verify the 2D manufactured solution and measure `L1`/`Linf` convergence.
-3. Check conservation of mass, momentum, and total energy for periodic or otherwise compatible boundary conditions.
+1. Verify constant-state preservation (`cargo test` covers this at the component level).
+2. Reproduce the paper's 2D manufactured-solution test to measure `L1`/`Linf` convergence.
+3. Check conservation of mass, momentum, and total energy for compatible boundary conditions.
 4. Test the discontinuous shock-tube configuration.
-5. Add diffusion and energy exchange only after the non-diffusive case is verified.
+5. Enable diffusion and energy exchange only after the non-diffusive case is verified.
 6. Compare density and the three temperatures against a reference solution.
-
-## Limitations of the current driver
-
-The README describes the implementation visible in the uploaded `main.rs`; it does not assume capabilities that are not shown there.
-
-In particular, the current driver has:
-
-- a fixed `400 x 100` grid;
-- a fixed domain `40 x 10`;
-- a fixed final time `1.0`;
-- a hard-coded initial condition;
-- modulo-based periodic stencil access;
-- no command-line configuration layer visible in `main.rs`;
-- no AMR or embedded-boundary machinery in the uploaded driver.
-
-These can be refactored later into configuration files, command-line parameters, or dedicated problem-definition modules.
 
 ## Reference
 
-The main numerical reference for this implementation is:
+> J. Cheng and C.-W. Shu, "High order conservative finite difference WENO scheme for three-temperature radiation hydrodynamics," *Journal of Computational Physics* 517 (2024), 113304.
 
-> J. Cheng and C.-W. Shu, “High order conservative finite difference WENO scheme for three-temperature radiation hydrodynamics,” *Journal of Computational Physics* 517 (2024), 113304.
+The boundary treatment follows:
 
-The paper describes the 3-T radiation-hydrodynamics equations, the conservative reformulation using three new energy variables, the fifth-order finite-difference WENO discretization, the direction-by-direction 2D extension, and the third-order SSP Runge-Kutta time discretization.
-
-## Source mapping
-
-For readers comparing the code directly with the paper:
-
-- `l()` corresponds to the semi-discrete spatial operator.
-- `weno_stencil_extractor()` supplies the directional stencil used by the WENO reconstruction.
-- `noncon_stencil_extractor()` supplies the stencil for the non-conservative contribution.
-- `diffusion_stencil_extractor()` supplies the diffusion stencil.
-- `rk3_ssp()` implements the three-stage SSP-RK3 update.
-- `calc_global_dt()` computes the global step from the per-cell time-step estimate.
-- `init()` defines the current numerical experiment.
-- `main()` controls initialization, output, time stepping, and data writing.
-
-The uploaded main file shows these components explicitly, including the x/y flux evaluation, the assembled RHS, the SSP-RK3 stages, the `400 x 100` initialization, and the output sequence. 
-
-## Citation
-
-If this solver is used in academic work, cite the Cheng and Shu paper above and describe any modifications made to the original algorithm.
+> S. Tan, C. Wang, C.-W. Shu, "Accurate numerical boundary conditions for compressible flow problems," *Journal of Computational Physics* 231 (2012), 2510–2527.

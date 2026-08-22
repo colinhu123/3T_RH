@@ -1,5 +1,5 @@
 use crate::{constant, state};
-use ndarray::{Array1,Array2,array};
+use ndarray::{Array1,Array2};
 use ndarray_linalg::Inverse;
 
 #[derive(Clone,Copy,Debug)]
@@ -13,23 +13,36 @@ pub struct Stencil6 {
 impl Stencil6 {
 
     pub fn build_l(&self) -> Array2<f64> {
+        let d3 = state::Derived::from_state(self.points[3]);
+        let d2 = state::Derived::from_state(self.points[2]);
+        let m = Self::build_l_plain(
+            &self.points[3],
+            &self.points[2],
+            &d3,
+            &d2,
+            self.dir,
+        );
+        Array2::from_shape_fn((6, 6), |(i, j)| m[i][j])
+    }
 
+    pub fn build_l_plain(
+        state1: &state::State,
+        state2: &state::State,
+        d3: &state::Derived,
+        d2: &state::Derived,
+        dir: state::Direction,
+    ) -> [[f64; 6]; 6] {
+    let u1 = d3.u;
+    let u2 = d2.u;
+    let v1 = d3.v;
+    let v2 = d2.v;
 
-    let state1 = self.points[3];
-    let state2 = self.points[2];
-    let u1 = state1.mom_x / state1.rho;
-    let u2 = state2.mom_x / state2.rho;
-    let v1 = state1.mom_y / state1.rho;
-    let v2 = state2.mom_y / state2.rho;
-    let w1_sq = u1.powi(2) + v1.powi(2);
-    let w2_sq = u2.powi(2) + v2.powi(2);
-
-    let ee1 =state1.ee / state1.rho- w1_sq / 6.0;
-    let ei1 =state1.ei / state1.rho- w1_sq / 6.0;
-    let er1 =state1.er / state1.rho- w1_sq / 6.0;
-    let ee2 =state2.ee / state2.rho- w2_sq / 6.0;
-    let ei2 =state2.ei / state2.rho- w2_sq / 6.0;
-    let er2 =state2.er / state2.rho- w2_sq / 6.0;
+    let ee1 = d3.e_e;
+    let ei1 = d3.e_i;
+    let er1 = d3.e_r;
+    let ee2 = d2.e_e;
+    let ei2 = d2.e_i;
+    let er2 = d2.e_r;
 
     let rho1 = state1.rho.sqrt();
     let rho2 = state2.rho.sqrt();
@@ -63,12 +76,12 @@ impl Stencil6 {
 
     let acoustic_den = 12.0 * cs2;
 
-    match self.dir {
+    match dir {
         // ========================================================
         // X direction
         // ========================================================
         state::Direction::X => {
-            array![
+            [
                 // ------------------------------------------------
                 // L_A^(1)
                 // acoustic: u - cs
@@ -259,7 +272,7 @@ impl Stencil6 {
         // Y direction
         // ========================================================
         state::Direction::Y => {
-            array![
+            [
                 // ------------------------------------------------
                 // L_B^(1)
                 // acoustic: v - cs
@@ -453,20 +466,38 @@ impl Stencil6 {
     }
 
     pub fn build_r_roe_ave(&self)-> (Array1<f64>,Array2<f64>) {
-        let state1 = self.points[3];
-        let state2 = self.points[2];
-        let u1 = state1.mom_x/state1.rho;
-        let u2 = state2.mom_x/state2.rho;
-        let v1 = state1.mom_y/state1.rho;
-        let v2 = state2.mom_y/state2.rho;
-        let w1_sq = u1.powi(2)+v1.powi(2);
-        let w2_sq = u2.powi(2) + v2.powi(2);
-        let ee1 = state1.ee/state1.rho - w1_sq/6.0;
-        let ei1 = state1.ei/state1.rho - w1_sq/6.0;
-        let er1 = state1.er/state1.rho - w1_sq/6.0;
-        let ee2 = state2.ee/state2.rho - w2_sq/6.0;
-        let ei2 = state2.ei/state2.rho - w2_sq/6.0;
-        let er2 = state2.er/state2.rho - w2_sq/6.0;
+        let d3 = state::Derived::from_state(self.points[3]);
+        let d2 = state::Derived::from_state(self.points[2]);
+        let (lambda, r) = Self::build_r_plain(
+            &self.points[3],
+            &self.points[2],
+            &d3,
+            &d2,
+            self.dir,
+        );
+        (
+            Array1::from_vec(lambda.to_vec()),
+            Array2::from_shape_fn((6, 6), |(i, j)| r[i][j]),
+        )
+    }
+
+    pub fn build_r_plain(
+        state1: &state::State,
+        state2: &state::State,
+        d3: &state::Derived,
+        d2: &state::Derived,
+        dir: state::Direction,
+    ) -> ([f64; 6], [[f64; 6]; 6]) {
+        let u1 = d3.u;
+        let u2 = d2.u;
+        let v1 = d3.v;
+        let v2 = d2.v;
+        let ee1 = d3.e_e;
+        let ei1 = d3.e_i;
+        let er1 = d3.e_r;
+        let ee2 = d2.e_e;
+        let ei2 = d2.e_i;
+        let er2 = d2.e_r;
         let rho1 = state1.rho.sqrt();
         let rho2 = state2.rho.sqrt();
 
@@ -484,10 +515,10 @@ impl Stencil6 {
         let cs = (constant::GAMMA_E*ge*ee + constant::GAMMA_I*gi*ei + constant::GAMMA_R*gr*er).sqrt();
         let gt = gi + ge + gr;
 
-        match self.dir {
+        match dir {
             state::Direction::X =>{
                 
-                let r = array![
+                let r = [
                 [1.0, 1.0, 1.0, 1.0, 0.0, 1.0],
                 [u-cs, u, u, u, 0.0, u+cs ],
                 [v, v, v, v, 1.0, v],
@@ -495,12 +526,12 @@ impl Stencil6 {
                 [constant::GAMMA_I*ei+w2/6.0-u*cs/3.0,gr,gt*w2/(6.0*gi),-ge,v/3.0, constant::GAMMA_I*ei+w2/6.0+u*cs/3.0],
                 [constant::GAMMA_R*er+w2/6.0-u*cs/3.0,-gi,ge,gt*w2/(6.0*gr),v/3.0, constant::GAMMA_R*er+w2/6.0+u*cs/3.0],
                 ];
-                let lambda = array![u-cs,u,u,u,u,u+cs];
+                let lambda = [u-cs,u,u,u,u,u+cs];
 
                 return (lambda,r)
             }
             state::Direction::Y => {
-                let r = array![
+                let r = [
                     [1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
                     [u, 1.0, u, u, u, u],
                     [v - cs, 0.0, v, v, v, v + cs],
@@ -508,7 +539,7 @@ impl Stencil6 {
                     [constant::GAMMA_I*ei+w2/6.0-v*cs/3.0, u/3.0, gr, gt*w2/(6.0*gi), -ge, constant::GAMMA_I*ei+w2/6.0+v*cs/3.0],
                     [constant::GAMMA_R*er+w2/6.0-v*cs/3.0, u/3.0, -gi, ge, gt*w2/(6.0*gr), constant::GAMMA_R*er+w2/6.0+v*cs/3.0],
                 ];
-                let lambda = array![v-cs,v,v,v,v,v+cs];
+                let lambda = [v-cs,v,v,v,v,v+cs];
                 return (lambda, r)
             }
         }
@@ -647,7 +678,168 @@ impl Stencil6 {
 
     }
 
+    /// Allocation-free reconstruction for the hot path.
+    ///
+    /// Takes the 6-point stencil of states plus per-point precomputed
+    /// `Derived` quantities. Numerically identical to `reconstruction()`.
+    pub fn reconstruction_fast(
+        points: &[state::State; 6],
+        d: &[state::Derived; 6],
+        dir: state::Direction,
+        recon_type: bool,
+    ) -> state::State {
+        let l = Self::build_l_plain(&points[3], &points[2], &d[3], &d[2], dir);
+        let (lambda, r) = Self::build_r_plain(&points[3], &points[2], &d[3], &d[2], dir);
 
+        let mut char_flux = [state::State::new(); 6];
+        let mut char_state = [state::State::new(); 6];
+
+        for i in 0..6 {
+            let fl = points[i].flux_from_derived(&d[i], dir);
+            if recon_type {
+                let c = l_dot(
+                    &l,
+                    &[fl.rho, fl.mom_x, fl.mom_y, fl.ee, fl.ei, fl.er],
+                );
+                char_flux[i] = state::State {
+                    rho: c[0],
+                    mom_x: c[1],
+                    mom_y: c[2],
+                    ee: c[3],
+                    ei: c[4],
+                    er: c[5],
+                };
+                let p = &points[i];
+                let c = l_dot(
+                    &l,
+                    &[p.rho, p.mom_x, p.mom_y, p.ee, p.ei, p.er],
+                );
+                char_state[i] = state::State {
+                    rho: c[0],
+                    mom_x: c[1],
+                    mom_y: c[2],
+                    ee: c[3],
+                    ei: c[4],
+                    er: c[5],
+                };
+            } else {
+                char_flux[i] = fl;
+                char_state[i] = points[i];
+            }
+        }
+
+        let a0 = lambda[0].abs();
+        let a1 = lambda[1].abs();
+        let a2 = lambda[2].abs();
+        let a3 = lambda[3].abs();
+        let a4 = lambda[4].abs();
+        let a5 = lambda[5].abs();
+
+        let mut f_plus_stencil = [state::State::new(); 6];
+        let mut f_minus_stencil = [state::State::new(); 6];
+
+        for i in 0..6 {
+            f_plus_stencil[i] = state::State {
+                rho: 0.5*(char_flux[i].rho + a0*char_state[i].rho),
+                mom_x: 0.5*(char_flux[i].mom_x + a1*char_state[i].mom_x),
+                mom_y: 0.5*(char_flux[i].mom_y + a2*char_state[i].mom_y),
+                ee:  0.5*(char_flux[i].ee  + a3*char_state[i].ee),
+                ei:  0.5*(char_flux[i].ei  + a4*char_state[i].ei),
+                er:  0.5*(char_flux[i].er  + a5*char_state[i].er),
+            };
+            f_minus_stencil[i] = state::State {
+                rho: 0.5*(char_flux[i].rho - a0*char_state[i].rho),
+                mom_x: 0.5*(char_flux[i].mom_x - a1*char_state[i].mom_x),
+                mom_y: 0.5*(char_flux[i].mom_y - a2*char_state[i].mom_y),
+                ee:  0.5*(char_flux[i].ee  - a3*char_state[i].ee),
+                ei:  0.5*(char_flux[i].ei  - a4*char_state[i].ei),
+                er:  0.5*(char_flux[i].er  - a5*char_state[i].er),
+            };
+        }
+
+        let tmp = stencil_arr(&f_plus_stencil);
+        let tmp1 = stencil_arr(&f_minus_stencil);
+
+        let mut flux_plus = [0.0; 6];
+        let mut flux_minus = [0.0; 6];
+        for i in 0..6 {
+            let stencil = [
+                tmp[i][0],
+                tmp[i][1],
+                tmp[i][2],
+                tmp[i][3],
+                tmp[i][4],
+            ];
+            flux_plus[i] = weno5(&stencil);
+            let stencil = [
+                tmp1[i][5],
+                tmp1[i][4],
+                tmp1[i][3],
+                tmp1[i][2],
+                tmp1[i][1],
+            ];
+            flux_minus[i] = weno5(&stencil);
+        }
+
+        let flux = state::State {
+            rho: flux_plus[0]+flux_minus[0],
+            mom_x: flux_plus[1]+flux_minus[1],
+            mom_y: flux_plus[2]+flux_minus[2],
+            ee: flux_plus[3]+flux_minus[3],
+            ei: flux_plus[4]+flux_minus[4],
+            er: flux_plus[5]+flux_minus[5],
+        };
+
+        let c = r_dot(&r, &[flux.rho, flux.mom_x, flux.mom_y, flux.ee, flux.ei, flux.er]);
+        state::State {
+            rho: c[0],
+            mom_x: c[1],
+            mom_y: c[2],
+            ee: c[3],
+            ei: c[4],
+            er: c[5],
+        }
+    }
+
+
+}
+
+/// component-major: arr[component][point] for a 6-point stencil
+#[inline]
+fn stencil_arr(st: &[state::State; 6]) -> [[f64; 6]; 6] {
+    let mut out = [[0.0; 6]; 6];
+    for i in 0..6 {
+        let s = &st[i];
+        out[0][i] = s.rho;
+        out[1][i] = s.mom_x;
+        out[2][i] = s.mom_y;
+        out[3][i] = s.ee;
+        out[4][i] = s.ei;
+        out[5][i] = s.er;
+    }
+    out
+}
+
+#[inline]
+fn l_dot(l: &[[f64; 6]; 6], u: &[f64; 6]) -> [f64; 6] {
+    let mut out = [0.0; 6];
+    for i in 0..6 {
+        let row = &l[i];
+        out[i] = row[0]*u[0] + row[1]*u[1] + row[2]*u[2]
+               + row[3]*u[3] + row[4]*u[4] + row[5]*u[5];
+    }
+    out
+}
+
+#[inline]
+fn r_dot(r: &[[f64; 6]; 6], u: &[f64; 6]) -> [f64; 6] {
+    let mut out = [0.0; 6];
+    for i in 0..6 {
+        let row = &r[i];
+        out[i] = row[0]*u[0] + row[1]*u[1] + row[2]*u[2]
+               + row[3]*u[3] + row[4]*u[4] + row[5]*u[5];
+    }
+    out
 }
 
 
@@ -1123,4 +1315,5 @@ mod tests {
             (flux_y.rho - state.mom_y).abs() < TOL
         );
     }
+
 }

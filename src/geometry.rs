@@ -32,24 +32,26 @@ pub fn point_on_segment(p: Point, a: Point, b: Point, eps: f64) -> bool {
         && p.y <= a.y.max(b.y) + eps
 }
 
-pub fn find_boundary_side(
+pub fn find_boundary_sides(
     p: Point,
     polygon: &Polygon,
     eps: f64,
-) -> Option<usize> {
-
+) -> Vec<usize> {
     let n = polygon.points.len();
     let pts = &polygon.points;
+
+    let mut sides = Vec::new();
+
     for i in 0..n {
         let a = pts[i];
         let b = pts[(i + 1) % n];
 
         if point_on_segment(p, a, b, eps) {
-            return Some(i);
+            sides.push(i);
         }
     }
 
-    None
+    sides
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -134,7 +136,7 @@ pub fn project<G: Geometry + ?Sized>(
         distance,
     }
 }
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FluidSide {
     Inside,
     Outside,
@@ -205,6 +207,46 @@ impl Polygon {
         let dy = a.y - b.y;
 
         dx * dx + dy * dy
+    }
+
+    pub fn outward_normal_of_side(
+        &self,
+        side: usize,
+    ) -> Vec2 {
+        let n = self.points.len();
+
+        let a = self.points[side];
+        let b = self.points[(side + 1) % n];
+
+        let tx = b.x - a.x;
+        let ty = b.y - a.y;
+
+        let len = tx.hypot(ty);
+
+        assert!(len > 1.0e-14);
+
+        let left = Vec2 {
+            x: -ty / len,
+            y:  tx / len,
+        };
+
+        let right = Vec2 {
+            x:  ty / len,
+            y: -tx / len,
+        };
+
+        let ccw =
+            self.signed_area2() > 0.0;
+
+        match self.fluid {
+            FluidSide::Inside => {
+                if ccw { right } else { left }
+            }
+
+            FluidSide::Outside => {
+                if ccw { left } else { right }
+            }
+        }
     }
 }
 

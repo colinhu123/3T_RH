@@ -8,6 +8,11 @@ use crate::state;
 pub fn n_vector(u: &state::State) -> state::State {
     let (pe, pi, pr) = u.pressure_spilit();
 
+    n_vector_from_pressures(pe, pi, pr)
+}
+
+#[inline]
+fn n_vector_from_pressures(pe: f64, pi: f64, pr: f64) -> state::State {
     state::State {
         rho: 0.0,
         mom_x: 0.0,
@@ -208,6 +213,122 @@ pub fn nonconservative_y(
     dy: f64,
 ) -> state::State {
     nonconservative_direction(stencil, dy, state::Direction::Y)
+}
+
+/// Hot-path variant: identical numerics, but reads pressures/velocities
+/// from per-stage precomputed `Derived` quantities instead of recomputing
+/// `pressure_spilit` / momentum divisions pointwise.
+pub fn nonconservative_x_pre(
+    d: &[state::Derived; 9],
+    dx: f64,
+) -> state::State {
+    nonconservative_direction_pre(d, dx, state::Direction::X)
+}
+
+pub fn nonconservative_y_pre(
+    d: &[state::Derived; 9],
+    dy: f64,
+) -> state::State {
+    nonconservative_direction_pre(d, dy, state::Direction::Y)
+}
+
+fn dN_pre(stencil: &[state::Derived; 7], dx: f64) -> state::State {
+    let mut pe = [0.0; 7];
+    let mut pi = [0.0; 7];
+    let mut pr = [0.0; 7];
+    for i in 0..7 {
+        pe[i] = stencil[i].pe;
+        pi[i] = stencil[i].pi;
+        pr[i] = stencil[i].pr;
+    }
+
+    let dpe = sixth_order_derivative(pe[0], pe[1], pe[2], pe[4], pe[5], pe[6], dx);
+    let dpi = sixth_order_derivative(pi[0], pi[1], pi[2], pi[4], pi[5], pi[6], dx);
+    let dpr = sixth_order_derivative(pr[0], pr[1], pr[2], pr[4], pr[5], pr[6], dx);
+
+    state::State {
+        rho: 0.0,
+        mom_x: 0.0,
+        mom_y: 0.0,
+        ee: 2.0*dpe - dpi - dpr,
+        ei: 2.0*dpi - dpe - dpr,
+        er: 2.0*dpr - dpe - dpi,
+    }
+}
+
+fn n_jump_pre(stencil8: &[state::Derived; 8]) -> state::State {
+    let mut n_ee = [0.0; 8];
+    let mut n_ei = [0.0; 8];
+    let mut n_er = [0.0; 8];
+    for k in 0..8 {
+        let n = n_vector_from_pressures(stencil8[k].pe, stencil8[k].pi, stencil8[k].pr);
+        n_ee[k] = n.ee;
+        n_ei[k] = n.ei;
+        n_er[k] = n.er;
+    }
+
+    let jump_component = |arr: &[f64; 8]| -> f64 {
+        let b2: [f64; 7] = [arr[0], arr[1], arr[2], arr[3], arr[4], arr[5], arr[6]];
+        let mut b1: [f64; 7] = [arr[1], arr[2], arr[3], arr[4], arr[5], arr[6], arr[7]];
+        b1.reverse();
+        q_pulse(&b1) - q_pulse(&b2)
+    };
+
+    state::State {
+        rho: 0.0,
+        mom_x: 0.0,
+        mom_y: 0.0,
+        ee: jump_component(&n_ee),
+        ei: jump_component(&n_ei),
+        er: jump_component(&n_er),
+    }
+}
+
+/// Hot-path variant of `nonconservative_direction`, numerically identical.
+pub fn nonconservative_direction_pre(
+    d: &[state::Derived; 9],
+    ds: f64,
+    dir: state::Direction,
+) -> state::State {
+    let v = if matches!(dir, state::Direction::X) { d[4].u } else { d[4].v };
+
+    let deriv_stencil: [state::Derived; 7] = [
+        d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+    ];
+
+    let derivative = dN_pre(&deriv_stencil, ds);
+
+    let stencil_m: [state::Derived; 8] = [
+        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
+    ];
+
+    let stencil_p: [state::Derived; 8] = [
+        d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8],
+    ];
+
+    let jump_m = n_jump_pre(&stencil_m);
+    let jump_p = n_jump_pre(&stencil_p);
+
+    let vm = if matches!(dir, state::Direction::X) { d[3].u } else { d[3].v };
+    let vp = if matches!(dir, state::Direction::X) { d[5].u } else { d[5].v };
+
+    let coef_left = v.max(vm).max(0.0) / 3.0;
+    let coef_right = v.min(vp).min(0.0) / 3.0;
+
+    state::State {
+        rho: 0.0,
+        mom_x: 0.0,
+        mom_y: 0.0,
+
+        ee: v/3.0 * derivative.ee
+            + (coef_left*jump_m.ee + coef_right*jump_p.ee) / ds,
+
+        ei: v/3.0 * derivative.ei
+            + (coef_left*jump_m.ei + coef_right*jump_p.ei) / ds,
+
+        er: v/3.0 * derivative.er
+            + (coef_left*jump_m.er + coef_right*jump_p.er) / ds,
+    }
 }
 
 #[cfg(test)]

@@ -1,11 +1,10 @@
-use ndarray::{Array1, Array2,array};
+use ndarray::{Array1, Array2, array};
 use nalgebra::{DMatrix, DVector};
 use crate::field1::{self, GridInfo};
 use crate::geometry::Geometry;
 use ndarray_linalg::Solve;
 use crate::state::{self, State};
 use crate::{geometry, weno};
-use crate::weno::Stencil6;
 use crate::constant;
 use std::sync::Arc;
 
@@ -26,6 +25,233 @@ pub enum BCType {
     Outflow { p_inf: f64, sigma: f64, l_domain: f64 },
     ZerothOrder,
     FarField(State),
+}
+
+// ============================================================================
+// Precomputed per-ghost WENO-extrapolation data (Tan et al. 2012, Sec. 2.4).
+//
+// The E_r stencils and the local-coordinate regression matrices depend ONLY
+// on the geometry (projection + grid), never on field values. All the heavy
+// least-squares work is therefore done once at GhostGrid build time:
+//
+//   * `stencil[r]`: (r+1)^2 fluid-cell targets (linear indices), r-major
+//   * `s[r]`:       symmetric matrix with beta_r = data^T S_r data
+//   * `w[r][k]`:    weight vector with V^(k) = w . data (k <= r)
+//
+// At each RK stage a ghost update is then just gathers + small dot products,
+// instead of ~30 SVD least-squares fits.
+// ============================================================================
+
+pub const BC_STENCIL_OFF: [usize; 6] = [0, 1, 5, 14, 30, 55];
+pub const BC_S_OFF: [usize; 6] = [0, 1, 17, 98, 354, 979];
+pub const BC_W_OFF: [usize; 6] = [0, 1, 9, 36, 100, 225];
+
+#[derive(Clone, Debug)]
+pub struct GhostBC {
+    pub nearest: (isize, isize),
+    pub normal: geometry::Vec2,
+    pub d: [f64; 5],
+    pub stencil: [u32; 55],
+    pub s: [f64; 979],
+    pub w: [f64; 225],
+}
+
+/// Coefficient-space quadratic form of the smoothness indicator,
+/// beta_r(c) = c^T M_r c. Depends only on r and h, not on the stencil
+/// geometry (the monomial integrals are taken over the fixed cell K).
+pub fn beta_quadratic_form(r: usize, h: f64) -> DMatrix<f64> {
+    let n = (r + 1) * (r + 2) / 2;
+    let mut m = DMatrix::<f64>::zeros(n, n);
+    for a in 0..n {
+        for b in a..n {
+            let mut ea = DVector::<f64>::zeros(n);
+            let mut eb = DVector::<f64>::zeros(n);
+            ea[a] = 1.0;
+            eb[b] = 1.0;
+            let eab = &ea + &eb;
+            let v = 0.5
+                * (smooth_indicator(&eab, r, h)
+                    - smooth_indicator(&ea, r, h)
+                    - smooth_indicator(&eb, r, h));
+            m[(a, b)] = v;
+            m[(b, a)] = v;
+        }
+    }
+    m
+}
+
+pub fn beta_quadratic_forms(h: f64) -> [DMatrix<f64>; 5] {
+    std::array::from_fn(|r| beta_quadratic_form(r, h))
+}
+
+/// Column index of the x^k monomial in the `fit_polynomial_surface`
+/// coefficient ordering.
+fn xk_coefficient_column(k: usize) -> usize {
+    let mut col = 0;
+    for t in 0..=k {
+        for i2 in 0..=t {
+            let j2 = t - i2;
+            if i2 == k && j2 == 0 {
+                return col;
+            }
+            col += 1;
+        }
+    }
+    unreachable!()
+}
+
+/// Build all per-ghost extrapolation data once.
+///
+/// The pseudoinverse is computed with the same truncated SVD (tol 1e-12)
+/// used by the per-stage `fit_polynomial_surface` path, so the two paths
+/// agree to roundoff.
+pub fn precompute_ghost_bc(
+    project: &geometry::Projection,
+    field: &field1::Field,
+    beta_forms: &[DMatrix<f64>; 5],
+) -> GhostBC {
+    let nearest = find_nearest_grid_point(*project, field);
+    let h = (field.grid.dx * field.grid.dy).sqrt();
+
+    let d0 = 2.0 * h.powi(4);
+    let d1 = 2.0 * h.powi(3);
+    let d2 = 2.0 * h.powi(2);
+    let d3 = 2.0 * h;
+    let d = [d0, d1, d2, d3, 1.0 - d0 - d1 - d2 - d3];
+
+    let mut bc = GhostBC {
+        nearest,
+        normal: project.normal,
+        d,
+        stencil: [0; 55],
+        s: [0.0; 979],
+        w: [0.0; 225],
+    };
+
+    for r in 0..=4usize {
+        let m = (r + 1) * (r + 1);
+        let n_terms = (r + 1) * (r + 2) / 2;
+
+        let idxs = weno_stencil_extractor_indices(*project, field, r);
+
+        let mut xy = [[0.0; 2]; 25];
+        for a in 0..m {
+            let (gi, gj) = idxs[a];
+            bc.stencil[BC_STENCIL_OFF[r] + a] = field.linear_index((gi, gj)) as u32;
+            let p = geometry::Point {
+                x: field.grid.x(gi),
+                y: field.grid.y(gj),
+            };
+            let (nor, tan) = project.gloabl2local_coord(p);
+            xy[a] = [nor, tan];
+        }
+
+        let mut a_mat = DMatrix::<f64>::zeros(m, n_terms);
+        for row in 0..m {
+            let mut col = 0;
+            for t in 0..=r {
+                for i2 in 0..=t {
+                    let j2 = t - i2;
+                    a_mat[(row, col)] =
+                        xy[row][0].powi(i2 as i32) * xy[row][1].powi(j2 as i32);
+                    col += 1;
+                }
+            }
+        }
+
+        let pinv = a_mat
+            .svd(true, true)
+            .pseudo_inverse(1.0e-12)
+            .expect("pinv failed");
+
+        if r == 0 {
+            bc.s[0] = 2.0 * h * h;
+        } else {
+            let s_r = pinv.transpose() * &beta_forms[r] * &pinv;
+            for a in 0..m {
+                for b in 0..m {
+                    bc.s[BC_S_OFF[r] + a * m + b] = s_r[(a, b)];
+                }
+            }
+        }
+
+        for k in 0..=r {
+            let col = xk_coefficient_column(k);
+            let kf = factorial(k);
+            for a in 0..m {
+                bc.w[BC_W_OFF[r] + k * m + a] = kf * pinv[(col, a)];
+            }
+        }
+    }
+
+    bc
+}
+
+/// Fast per-stage characteristic WENO extrapolation using precomputed data.
+///
+/// Numerically identical to `weno_extrapolation` for the same stencil.
+pub fn weno_extrapolation_pre(
+    left: &[[f64; 6]; 6],
+    bc: &GhostBC,
+    field: &field1::Field,
+    k: usize,
+) -> [f64; 6] {
+    let n = bc.normal;
+    let mut alpha = [[0.0; 5]; 6];
+    let mut vks = [[0.0; 5]; 6];
+    let mut alpha_sum = [0.0; 6];
+
+    for r in 0..=4usize {
+        let m = (r + 1) * (r + 1);
+
+        let mut data = [[0.0f64; 25]; 6];
+
+        for a in 0..m {
+            let s = field.value[bc.stencil[BC_STENCIL_OFF[r] + a] as usize];
+            let mn = s.mom_x * n.x + s.mom_y * n.y;
+            let mt = -s.mom_x * n.y + s.mom_y * n.x;
+            let u6 = [s.rho, mn, mt, s.ee, s.ei, s.er];
+            for c in 0..6 {
+                let row = &left[c];
+                data[c][a] = row[0]*u6[0] + row[1]*u6[1] + row[2]*u6[2]
+                    + row[3]*u6[3] + row[4]*u6[4] + row[5]*u6[5];
+            }
+        }
+
+        for c in 0..6 {
+            let soff = BC_S_OFF[r];
+            let mut beta = 0.0;
+            for a in 0..m {
+                let base = soff + a * m;
+                let mut acc = 0.0;
+                for b in 0..m {
+                    acc += bc.s[base + b] * data[c][b];
+                }
+                beta += data[c][a] * acc;
+            }
+
+            let mut vk = 0.0;
+            if k <= r {
+                let woff = BC_W_OFF[r] + k * m;
+                for a in 0..m {
+                    vk += bc.w[woff + a] * data[c][a];
+                }
+            }
+
+            alpha[c][r] = bc.d[r] / (constant::DEFAULT_EPS + beta).powf(constant::WENO_Q);
+            vks[c][r] = vk;
+            alpha_sum[c] += alpha[c][r];
+        }
+    }
+
+    let mut result = [0.0; 6];
+    for c in 0..6 {
+        for r in 0..=4usize {
+            result[c] += (alpha[c][r] / alpha_sum[c]) * vks[c][r];
+        }
+    }
+
+    result
 }
 
 pub fn find_nearest_grid_point(project: geometry::Projection, field: &field1::Field) -> (isize, isize) {
@@ -53,11 +279,21 @@ pub fn find_nearest_grid_point(project: geometry::Projection, field: &field1::Fi
     }
     target_idx
 }
-/// build_local_a returns (L, R, lambda) in sequence
+/// build_local returns (L, R, lambda) in sequence
 /// 
 pub fn build_local(project: geometry::Projection,idx: (isize, isize), field: &field1::Field)->(Array2<f64>,Array2<f64>,Array1<f64>) {
+    let (l, r, lambda) = build_local_plain(project.normal, idx, field);
+    (
+        Array2::from_shape_fn((6, 6), |(i, j)| l[i][j]),
+        Array2::from_shape_fn((6, 6), |(i, j)| r[i][j]),
+        Array1::from_vec(lambda.to_vec()),
+    )
+}
+
+/// Allocation-free variant of `build_local`.
+pub fn build_local_plain(normal: geometry::Vec2, idx: (isize, isize), field: &field1::Field)
+    -> ([[f64; 6]; 6], [[f64; 6]; 6], [f64; 6]) {
     let val = field.value[field.linear_index(idx)];
-    let normal = project.normal;
     let mom_n = val.mom_x*normal.x + val.mom_y*normal.y;
     let mom_t = -val.mom_x*normal.y + val.mom_y*normal.x;
     let s1 = state::State {
@@ -68,14 +304,11 @@ pub fn build_local(project: geometry::Projection,idx: (isize, isize), field: &fi
         ei: val.ei,
         er: val.er,
     };
-    let sten = Stencil6 {
-        points: [s1; 6],
-        dir: state::Direction::X,
-    };
+    let d1 = state::Derived::from_state(s1);
 
-    let l = sten.build_l();
-    let (lambda,r) = sten.build_r_roe_ave();
-    (l,r,lambda)
+    let l = weno::Stencil6::build_l_plain(&s1, &s1, &d1, &d1, state::Direction::X);
+    let (lambda, r) = weno::Stencil6::build_r_plain(&s1, &s1, &d1, &d1, state::Direction::X);
+    (l, r, lambda)
 }
 
 fn stencil2arr(stencil: Vec<(f64, f64, state::State)>) 
@@ -373,20 +606,27 @@ fn periodic_value(
     field.get(wrapped_idx)
 }
 
-pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,field: &field1::Field)
+pub fn set_ghost_point_value(
+    idx:(isize,isize),
+    project: geometry::Projection,
+    boundary: crate::ghost::BoundaryKind,
+    side_id: usize,
+    field: &field1::Field,
+    bc_pre: Option<&GhostBC>,
+)
 -> state::State {
-    let t= field.time;
-    let p = geometry::Point { x: field.grid.x(idx.0), y: field.grid.y(idx.1) };
-    let con1 = field.outer_bound.is_fluid(p);
-    let polygon = if con1 == false {&field.outer_bound} else {&field.inner_bound};
-    let i = match geometry::find_boundary_side(project.point, polygon, constant::DEFAULT_EPS) {
-        Some(i) => i,
-        None => {
-            panic!("Boundary point {:?} does not lie on polygon boundary", project.point);
-        }
+
+    let bc = match boundary {
+    crate::ghost::BoundaryKind::Outer => {
+        &field.bc_outer[side_id]
+    }
+
+    crate::ghost::BoundaryKind::Inner => {
+        &field.bc_inner[side_id]
+    }
     };
-    let bc_list = if con1 == false {&field.bc_outer} else {&field.bc_inner};
-    let bc = &bc_list[i];
+
+    let t= field.time;
 
     if let BCType::Constant(value) = bc {
         return *value;
@@ -423,11 +663,29 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
     // The characteristic matrix is evaluated at U_0, the interior grid
     // point nearest to the boundary foot P_0 (Tan et al., Sec. 2.3),
     // never at the ghost-cell index itself.
-    let idx_near = find_nearest_grid_point(project, field);
-    let (left, right, _lambda) = build_local(project, idx_near, field);
-    for k in 0..5 {
-        v[k] = weno_extrapolation(project, field, k);
-    }
+    //
+    // Fast path: per-ghost stencil/regression data were precomputed at
+    // GhostGrid build time. Slow path (tests / standalone use): rebuild
+    // everything per call.
+    let (left, right, lambda) = if let Some(pre) = bc_pre {
+        let (l_plain, r_plain, lam) =
+            build_local_plain(project.normal, pre.nearest, field);
+        for k in 0..5 {
+            v[k] = weno_extrapolation_pre(&l_plain, pre, field, k);
+        }
+        (
+            Array2::from_shape_fn((6, 6), |(i, j)| l_plain[i][j]),
+            Array2::from_shape_fn((6, 6), |(i, j)| r_plain[i][j]),
+            Array1::from_vec(lam.to_vec()),
+        )
+    } else {
+        let idx_near = find_nearest_grid_point(project, field);
+        let (l, r, lam) = build_local(project, idx_near, field);
+        for k in 0..5 {
+            v[k] = weno_extrapolation(project, field, k);
+        }
+        (l, r, lam)
+    };
 
     match bc {
         BCType::Wall => {
@@ -570,9 +828,8 @@ pub fn set_ghost_point_value(idx:(isize,isize),project: geometry::Projection,fie
         },
         BCType::FarField(u_inf) => {
     // Characteristic matrices are evaluated from the nearest
-    // interior state, exactly as in the existing BC machinery.
-    let idx_near = find_nearest_grid_point(project, field);
-    let (left, right, lambda) = build_local(project, idx_near, field);
+    // interior state, exactly as in the existing BC machinery
+    // (already computed above with the correct idx_near).
 
     // ------------------------------------------------------------
     // Convert freestream state to the LOCAL (normal,tangential)
@@ -1106,6 +1363,19 @@ pub fn weno_stencil_extractor(
     field: &field1::Field,
     r: usize,
 ) -> Vec<(isize, isize, state::State)> {
+    weno_stencil_extractor_indices(project, field, r)
+        .into_iter()
+        .map(|(gi, gj)| (gi, gj, field.get((gi, gj))))
+        .collect()
+}
+
+/// Index-only variant of `weno_stencil_extractor` (geometry-only, used by
+/// the precompute path; all returned points are fluid cells).
+pub fn weno_stencil_extractor_indices(
+    project: geometry::Projection,
+    field: &field1::Field,
+    r: usize,
+) -> Vec<(isize, isize)> {
     assert!(r <= 4, "paper WENO extrapolation only uses r=0..4");
 
     let n = project.normal;
@@ -1154,7 +1424,7 @@ pub fn weno_stencil_extractor(
                 let m = ((y_star - y0) / dy).floor() as isize;
                 let base_start = m - (r as isize / 2);
 
-                let s_l = shifted_vertical_substencil(
+                let s_l = shifted_vertical_substencil_indices(
                     field, i_line, base_start, width,
                 ).unwrap_or_else(|| {
                     panic!(
@@ -1191,7 +1461,7 @@ pub fn weno_stencil_extractor(
                 let m = ((x_star - x0) / dx).floor() as isize;
                 let base_start = m - (r as isize / 2);
 
-                let s_l = shifted_horizontal_substencil(
+                let s_l = shifted_horizontal_substencil_indices(
                     field, j_line, base_start, width,
                 ).unwrap_or_else(|| {
                     panic!(
@@ -1216,12 +1486,12 @@ pub fn weno_stencil_extractor(
 
 /// Shift a vertical S_l as a whole along y until all `width` consecutive
 /// points are in Omega.  Search nearest shifts first; never discard points.
-fn shifted_vertical_substencil(
+fn shifted_vertical_substencil_indices(
     field: &field1::Field,
     i: isize,
     base_start_j: isize,
     width: isize,
-) -> Option<Vec<(isize, isize, state::State)>> {
+) -> Option<Vec<(isize, isize)>> {
     let max_shift = field.grid.ny as isize + width;
     for mag in 0..=max_shift {
         let shifts: [isize; 2] = [-mag, mag];
@@ -1239,9 +1509,7 @@ fn shifted_vertical_substencil(
                 indices.push(idx);
             }
             if ok {
-                return Some(indices.into_iter()
-                    .map(|idx| (idx.0, idx.1, field.get(idx)))
-                    .collect());
+                return Some(indices);
             }
         }
     }
@@ -1250,12 +1518,12 @@ fn shifted_vertical_substencil(
 
 /// Shift a horizontal S_l as a whole along x until all `width` consecutive
 /// points are in Omega.  Search nearest shifts first; never discard points.
-fn shifted_horizontal_substencil(
+fn shifted_horizontal_substencil_indices(
     field: &field1::Field,
     j: isize,
     base_start_i: isize,
     width: isize,
-) -> Option<Vec<(isize, isize, state::State)>> {
+) -> Option<Vec<(isize, isize)>> {
     let max_shift = field.grid.nx as isize + width;
     for mag in 0..=max_shift {
         let shifts: [isize; 2] = [-mag, mag];
@@ -1273,9 +1541,7 @@ fn shifted_horizontal_substencil(
                 indices.push(idx);
             }
             if ok {
-                return Some(indices.into_iter()
-                    .map(|idx| (idx.0, idx.1, field.get(idx)))
-                    .collect());
+                return Some(indices);
             }
         }
     }

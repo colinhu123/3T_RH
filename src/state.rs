@@ -53,6 +53,37 @@ impl State {
         (pe, pi, pr)
     }
 
+    pub fn flux_from_derived(&self, d: &Derived, dir: Direction) -> Self {
+        let u = d.u;
+        let v = d.v;
+        let p = d.pe + d.pi + d.pr;
+        let (pe, pi, pr) = (d.pe, d.pi, d.pr);
+        let rho = self.rho;
+
+        match dir {
+            Direction::X => {
+                return Self {
+                rho: rho*u,
+                mom_x: rho*u*u + p,
+                mom_y: rho*u*v,
+                ee: (self.ee + pe) * u,
+                ei: (self.ei + pi) * u,
+                er: (self.er + pr) * u,
+            }
+            }
+            Direction::Y => {
+                return Self {
+                    rho: rho * v,
+                    mom_x: rho* u * v,
+                    mom_y: rho * v * v + p,
+                    ee: (self.ee + pe) * v,
+                    ei: (self.ei + pi) * v,
+                    er: (self.er + pr) * v,
+                }
+            }
+        }
+    }
+
     pub fn flux(&self, dir: Direction) -> Self {
         let u = self.mom_x/self.rho;
         let v = self.mom_y/self.rho;
@@ -173,6 +204,77 @@ impl State {
 }
 
 
+
+/// Per-stage derived quantities cached once per cell / ghost cell.
+///
+/// Bit-identical to the pointwise expressions used by `State::flux`,
+/// `State::pressure_spilit`, `State::te/ti/tr` and the Roe averages in
+/// `weno.rs` (u and v use the same division form as `State`).
+#[derive(Clone, Copy, Debug)]
+pub struct Derived {
+    pub u: f64,
+    pub v: f64,
+    pub e_e: f64,
+    pub e_i: f64,
+    pub e_r: f64,
+    pub pe: f64,
+    pub pi: f64,
+    pub pr: f64,
+    pub te: f64,
+    pub ti: f64,
+    pub tr: f64,
+}
+
+impl Derived {
+    pub fn new() -> Self {
+        Self {
+            u: 0.0,
+            v: 0.0,
+            e_e: 0.0,
+            e_i: 0.0,
+            e_r: 0.0,
+            pe: 0.0,
+            pi: 0.0,
+            pr: 0.0,
+            te: 0.0,
+            ti: 0.0,
+            tr: 0.0,
+        }
+    }
+
+    pub fn from_state(s: State) -> Self {
+        let u = s.mom_x / s.rho;
+        let v = s.mom_y / s.rho;
+        let w2 = u.powi(2) + v.powi(2);
+
+        let e_e = s.ee / s.rho - w2 / 6.0;
+        let e_i = s.ei / s.rho - w2 / 6.0;
+        let e_r = s.er / s.rho - w2 / 6.0;
+
+        let pe = (constant::GAMMA_E - 1.0) * (s.ee - s.rho * w2 / 6.0);
+        let pi = (constant::GAMMA_I - 1.0) * (s.ei - s.rho * w2 / 6.0);
+        let pr = (constant::GAMMA_R - 1.0) * (s.er - s.rho * w2 / 6.0);
+
+        let te = s.ee / (s.rho * constant::CVE) - w2 / (6.0 * constant::CVE);
+        let ti = s.ei / (s.rho * constant::CVI) - w2 / (6.0 * constant::CVI);
+        let er_term = s.er / s.rho - w2 / 6.0;
+        let tr = (er_term * s.rho / constant::A).powf(0.25);
+
+        Self {
+            u,
+            v,
+            e_e,
+            e_i,
+            e_r,
+            pe,
+            pi,
+            pr,
+            te,
+            ti,
+            tr,
+        }
+    }
+}
 
 ///flux1: value at i - 1/2
 /// flux2: value at i + 1/2

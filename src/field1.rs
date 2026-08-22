@@ -80,6 +80,9 @@ pub struct Field {
     pub bc_inner: Vec<BCType>,
     pub bc_outer: Vec<BCType>,
     pub time: f64,
+    /// Fluid mask over the Cartesian grid (linear index = i*ny + j),
+    /// computed once at construction. `is_in_domain` reads this mask.
+    pub fluid: Vec<bool>,
 }
 
 impl Field {
@@ -96,6 +99,22 @@ impl Field {
         assert!(inner_bound.fluid == FluidSide::Outside, "Wrong inner boundary setting");
         assert!(bc_inner.len() == inner_bound.points.len());
         assert!(bc_outer.len() == outer_bound.points.len());
+
+        let nx = grid.nx;
+        let ny = grid.ny;
+
+        let fluid = (0..nx * ny)
+            .map(|linear| {
+                let i = linear / ny;
+                let j = linear % ny;
+                let p = Point {
+                    x: grid.x(i as isize),
+                    y: grid.y(j as isize),
+                };
+                outer_bound.is_fluid(p) && inner_bound.is_fluid(p)
+            })
+            .collect();
+
         Self {
             grid:grid,
             value: vec![value; grid.len()],
@@ -104,21 +123,45 @@ impl Field {
             bc_inner: bc_inner,
             bc_outer: bc_outer,
             time: time,
+            fluid: fluid,
+        }
+    }
+
+    /// Scratch field with the same geometry, BC lists and fluid mask,
+    /// but zeroed values. Does not re-run the polygon point-in-polygon
+    /// mask construction.
+    pub fn empty_like(&self) -> Self {
+        Self {
+            grid: self.grid,
+            value: vec![State::new(); self.grid.len()],
+            outer_bound: Polygon::new(
+                self.outer_bound.points.clone(),
+                self.outer_bound.fluid,
+            ),
+            inner_bound: Polygon::new(
+                self.inner_bound.points.clone(),
+                self.inner_bound.fluid,
+            ),
+            bc_inner: self.bc_inner.clone(),
+            bc_outer: self.bc_outer.clone(),
+            time: self.time,
+            fluid: self.fluid.clone(),
         }
     }
 
     pub fn is_in_domain(&self, idx: (isize, isize))-> bool {
-        let x= self.grid.x(idx.0);
-        let y = self.grid.y(idx.1);
-        let p = Point {x: x, y: y};
-        let con1 = self.outer_bound.is_fluid(p);
-        let con2 = self.inner_bound.is_fluid(p);
-        if con1 && con2 {
-            true
+        if !self.grid.is_in_domain(idx) {
+            let x= self.grid.x(idx.0);
+            let y = self.grid.y(idx.1);
+            let p = Point {x: x, y: y};
+            let con1 = self.outer_bound.is_fluid(p);
+            let con2 = self.inner_bound.is_fluid(p);
+            return con1 && con2;
         }
-        else {
-            false
-        }
+
+        let i = idx.0 as usize;
+        let j = idx.1 as usize;
+        self.fluid[i*self.grid.ny + j]
     }
 
     #[inline(always)]
@@ -168,27 +211,130 @@ impl Field {
     }
 
     pub fn get(
-        &self,
-        idx: (isize, isize),
-    )-> State {
-        if self.is_in_domain(idx) {
-            return self.get_inside(idx)
+    &self,
+    idx: (isize, isize),
+) -> State {
+    // ============================================================
+    // Interior fluid point
+    // ============================================================
 
-        } else {
-            let x= self.grid.x(idx.0);
-            let y = self.grid.y(idx.1);
-            let p = Point {x: x, y: y};
-            let con1 = self.outer_bound.is_fluid(p);
-            //let con2 = self.inner_bound.is_fluid(p);
-
-            let project = if con1 == false {geometry::project(&self.outer_bound, p)} else {
-                geometry::project(&self.inner_bound, p)
-            };
-
-            bc1::set_ghost_point_value(idx, project, self)
-            //Space prepared for WENO extrapolation and ILW
-            //State::new()
-        }
+    if self.is_in_domain(idx) {
+        return self.get_inside(idx);
     }
+
+    // ============================================================
+    // Ghost point
+    // ============================================================
+
+    let p = Point {
+        x: self.grid.x(idx.0),
+        y: self.grid.y(idx.1),
+    };
+
+    // ------------------------------------------------------------
+    // Determine outer / inner boundary.
+    // ------------------------------------------------------------
+
+    let outer_fluid =
+        self.outer_bound.is_fluid(p);
+
+    let (polygon, bc_list) =
+        if !outer_fluid {
+            (
+                &self.outer_bound,
+                &self.bc_outer,
+            )
+        } else {
+            (
+                &self.inner_bound,
+                &self.bc_inner,
+            )
+        };
+
+    // ------------------------------------------------------------
+    // First obtain the closest boundary point P0.
+    //
+    // Do not trust raw_project.normal at a polygon vertex yet.
+    // ------------------------------------------------------------
+
+    let raw_project =
+        geometry::project(
+            polygon,
+            p,
+        );
+
+    // ------------------------------------------------------------
+    // Find ALL sides containing P0 and select according to BC
+    // priority.
+    //
+    // In particular:
+    //
+    //       Wall > FarField
+    //
+    // so the two cylinder junctions behave identically.
+    // ------------------------------------------------------------
+
+    let side_id =
+        crate::ghost::select_boundary_side(
+            raw_project.point,
+            polygon,
+            bc_list,
+        );
+
+    // ------------------------------------------------------------
+    // IMPORTANT:
+    //
+    // Recompute the normal from the SELECTED side.
+    //
+    // Otherwise at a polygon vertex:
+    //
+    //       BC may come from Wall side
+    //       normal may come from FarField side
+    //
+    // which is inconsistent.
+    // ------------------------------------------------------------
+
+    let normal =
+        polygon.outward_normal_of_side(
+            side_id,
+        );
+
+    let dx =
+        p.x - raw_project.point.x;
+
+    let dy =
+        p.y - raw_project.point.y;
+
+    let distance =
+        dx * normal.x
+        + dy * normal.y;
+
+    let project =
+        geometry::Projection {
+            point: raw_project.point,
+            normal,
+            distance,
+        };
+
+    // ------------------------------------------------------------
+    // Reconstruct ghost using the BC side that WE selected.
+    // ------------------------------------------------------------
+
+    let boundary =
+    if !outer_fluid {
+        crate::ghost::BoundaryKind::Outer
+    } else {
+        crate::ghost::BoundaryKind::Inner
+    };
+
+    bc1::set_ghost_point_value(
+        idx,
+        project,
+        boundary,
+        side_id,
+        self,
+        None,
+    )
+}
 
 }

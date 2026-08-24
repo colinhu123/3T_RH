@@ -15,7 +15,7 @@ NVAR = 8
 # Only completed *.bin files are visible. Rust writes *.bin.tmp first
 # and atomically renames it after flush/close.
 def refresh_files():
-    return sorted(glob.glob("data_new/solution_*.bin"))
+    return sorted(glob.glob("data/solution_*.bin"))
 
 files = refresh_files()
 if len(files) == 0:

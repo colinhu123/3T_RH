@@ -423,7 +423,7 @@ fn main() {
     // Load restart file first
     // ---------------------------------------------------------
     if let Some(id) = restart_id {
-    let path = format!("data_new/solution_{:04}.bin", id);
+    let path = format!("data/solution_{:04}.bin", id);
     io::load_data(&mut u, &path);
     }
 
@@ -458,7 +458,7 @@ fn main() {
 
     while t < t_final-1e-14 {
         let dt_cfl=calc_global_dt(&u);
-        let mut dt=0.05*dt_cfl;
+        let mut dt=0.1*dt_cfl;
         if next_store_time<=t_final && t+dt>next_store_time { dt=next_store_time-t; }
         if t+dt>t_final { dt=t_final-t; }
         assert!(dt>0.0,"non-positive dt at t={}",t);
@@ -564,39 +564,23 @@ mod parity {
                 x: field.grid.x(idx.0),
                 y: field.grid.y(idx.1),
             };
-            let poly = &field.outer_bound;
-            let raw_project = geometry::project(poly, p);
-            let side = ghost::select_boundary_side(
-                raw_project.point,
-                poly,
-                &field.bc_outer,
-            );
 
-            // Same FINAL projection as the real solver:
-            // ArcOverride if the selected side belongs to an arc,
-            // selected-polygon-side geometry otherwise.
-            let project = if let Some(arc) =
-                field.arc_for_side(ghost::BoundaryKind::Outer, side)
-            {
-                arc.project(p)
-            } else {
-                let normal = poly.outward_normal_of_side(side);
-                let dx = p.x - raw_project.point.x;
-                let dy = p.y - raw_project.point.y;
-                geometry::Projection {
-                    point: raw_project.point,
-                    normal,
-                    distance: dx * normal.x + dy * normal.y,
-                }
+            // Same analytic BoundaryElement lookup as the real solver:
+            // nearest element wins, BC priority breaks junction ties.
+            let (boundary_id, project) =
+                bc1::find_boundary_element(p, &field.outer_boundary);
+
+            let q = match &field.outer_boundary[boundary_id].bc {
+                bc1::BCType::PrimitiveWall => bc1::PRIMITIVE_WALL_WENO_Q,
+                _ => constant::WENO_Q,
             };
-
-            let pre = bc1::precompute_ghost_bc(&project, &field, &beta);
+            let pre = bc1::precompute_ghost_bc(&project, &field, &beta, q);
 
             let a = bc1::set_ghost_point_value(
                 idx,
                 project,
                 ghost::BoundaryKind::Outer,
-                side,
+                boundary_id,
                 &field,
                 None,
             );
@@ -604,7 +588,7 @@ mod parity {
                 idx,
                 project,
                 ghost::BoundaryKind::Outer,
-                side,
+                boundary_id,
                 &field,
                 Some(&pre),
             );
@@ -613,75 +597,221 @@ mod parity {
     }
 
     #[test]
-    fn cylinder_arc_override_registration() {
+    fn cylinder_has_one_physical_arc() {
         let u = init::init_cylinder();
 
+        // Six physical elements: 5 FarField lines + 1 cylinder arc.
+        assert_eq!(u.outer_boundary.len(), 6, "cylinder must have 6 physical elements");
+
+        let arcs: Vec<_> = u
+            .outer_boundary
+            .iter()
+            .filter(|e| matches!(e.geometry, geometry::BoundaryGeometry::Arc(_)))
+            .collect();
+        assert_eq!(arcs.len(), 1, "cylinder must have exactly ONE physical arc");
+
         assert!(
-            u.outer_arcs.len() >= 1,
-            "cylinder must register at least one analytic arc"
+            matches!(&arcs[0].bc, bc1::BCType::PrimitiveWall),
+            "cylinder arc must use the PrimitiveWall BC"
         );
 
-        let ov = &u.outer_arcs[0];
-
-        assert!((ov.arc.center.x - 0.0).abs() < 1e-12);
-        assert!((ov.arc.center.y - 0.0).abs() < 1e-12);
-        assert!((ov.arc.radius - 1.0).abs() < 1e-12);
-
-        for side in ov.side_start..=ov.side_end {
-            assert!(
-                matches!(&u.bc_outer[side], bc1::BCType::ReflectiveWall),
-                "arc side {} must keep its Wall BC",
-                side
-            );
-        }
+        // The 360 Polygon arc segments remain only as domain-classifier
+        // detail: the physical boundary must NOT scale with them.
+        assert_eq!(u.bc_outer.len(), 365);
     }
 
     #[test]
-    fn ghostgrid_stagnation_normal_exact() {
+    fn cylinder_physical_geometry_ignores_polygon_segments() {
+        let field = init::init_cylinder();
+
+        // Stagnation-line ghost coordinate, projected through the analytic
+        // boundary lookup. The result must be the exact analytic arc
+        // projection, independent of any of the 360 Polygon segments.
+        let p = geometry::Point { x: -1.2, y: 0.0 };
+        let (id, project) = bc1::find_boundary_element(p, &field.outer_boundary);
+
+        let arc = match &field.outer_boundary[id].geometry {
+            geometry::BoundaryGeometry::Arc(a) => a,
+            _ => panic!("stagnation point must resolve to the analytic arc"),
+        };
+
+        let direct = arc.project(p);
+
+        assert!((project.point.x - direct.point.x).abs() < 1e-14);
+        assert!((project.point.y - direct.point.y).abs() < 1e-14);
+        assert!((project.normal.x - direct.normal.x).abs() < 1e-14);
+        assert!((project.normal.y - direct.normal.y).abs() < 1e-14);
+        assert!((project.distance - direct.distance).abs() < 1e-14);
+    }
+
+    #[test]
+    fn ghostgrid_uses_analytic_arc_projection() {
         let field = init::init_cylinder();
         let offsets = ghost::default_stencil_offsets();
         let ghosts = ghost::GhostGrid::build(&field, &offsets);
 
-        // Ghost whose FINAL analytic P0 is closest to the stagnation
-        // point (-1, 0).
-        let mut best: Option<(&ghost::GhostInfo, f64)> = None;
+        // The ONE analytic arc element.
+        let arc = field
+            .outer_boundary
+            .iter()
+            .find_map(|e| match &e.geometry {
+                geometry::BoundaryGeometry::Arc(a) => Some(a),
+                _ => None,
+            })
+            .expect("cylinder must have one analytic arc");
+
+        let cx = arc.center.x;
+        let cy = arc.center.y;
+
+        // 1. EVERY cylinder-arc ghost must have its cached Projection
+        //    equal (to roundoff) the direct analytic arc projection of
+        //    its Cartesian coordinate. This proves GhostGrid::build
+        //    resolved physical geometry through the analytic arc, with
+        //    zero Polygon-segment contamination.
+        let mut arc_ghosts = 0usize;
         for g in &ghosts.info {
-            let d = (g.project.point.x + 1.0).hypot(g.project.point.y);
-            if best.map_or(true, |(_, bd)| d < bd) {
-                best = Some((g, d));
+            let is_arc = matches!(
+                field.outer_boundary[g.boundary_id].geometry,
+                geometry::BoundaryGeometry::Arc(_)
+            );
+            if !is_arc {
+                continue;
             }
+            arc_ghosts += 1;
+
+            let p = geometry::Point {
+                x: field.grid.x(g.idx.0),
+                y: field.grid.y(g.idx.1),
+            };
+            let direct = arc.project(p);
+
+            assert!((g.project.point.x - direct.point.x).abs() < 1e-12);
+            assert!((g.project.point.y - direct.point.y).abs() < 1e-12);
+            assert!((g.project.normal.x - direct.normal.x).abs() < 1e-12);
+            assert!((g.project.normal.y - direct.normal.y).abs() < 1e-12);
+            assert!((g.project.distance - direct.distance).abs() < 1e-12);
+        }
+        assert!(arc_ghosts > 0, "no cylinder-arc ghosts found");
+
+        // 2. Stagnation-line query: exact analytic P0 and normal.
+        let p = geometry::Point {
+            x: cx - arc.radius - 0.2,
+            y: cy,
+        };
+        let (id, proj) = bc1::find_boundary_element(p, &field.outer_boundary);
+        assert!(matches!(
+            field.outer_boundary[id].geometry,
+            geometry::BoundaryGeometry::Arc(_)
+        ));
+        assert!((proj.point.x - (cx - arc.radius)).abs() < 1e-12);
+        assert!((proj.point.y - cy).abs() < 1e-12);
+        assert!((proj.normal.x - 1.0).abs() < 1e-12);
+        assert!(proj.normal.y.abs() < 1e-12);
+
+        // 3. Upper/lower mirror symmetry about the arc center line.
+        let (_, up) = bc1::find_boundary_element(
+            geometry::Point {
+                x: cx - arc.radius - 0.1,
+                y: cy + 0.2,
+            },
+            &field.outer_boundary,
+        );
+        let (_, dn) = bc1::find_boundary_element(
+            geometry::Point {
+                x: cx - arc.radius - 0.1,
+                y: cy - 0.2,
+            },
+            &field.outer_boundary,
+        );
+
+        assert!((up.point.x - dn.point.x).abs() < 1e-12);
+        assert!((up.point.y + dn.point.y - 2.0 * cy).abs() < 1e-12);
+        assert!((up.normal.x - dn.normal.x).abs() < 1e-12);
+        assert!((up.normal.y + dn.normal.y).abs() < 1e-12);
+        assert!((up.distance - dn.distance).abs() < 1e-12);
+    }
+
+    // ============================================================
+    // PrimitiveWall (order zero): Phase-D validation.
+    //
+    // The conservative Wall produces non-physical states for the
+    // Mach-3 cylinder at t=0; the primitive order-zero wall must not.
+    // ============================================================
+
+    #[test]
+    fn primitive_wall_initial_ghosts_admissible() {
+        let field = init::init_cylinder();
+        let offsets = ghost::default_stencil_offsets();
+        let mut ghosts = ghost::GhostGrid::build(&field, &offsets);
+
+        ghosts.update_values_parallel(&field);
+
+        let mut count = 0usize;
+        let mut min_rho = f64::INFINITY;
+        let mut max_rho = f64::NEG_INFINITY;
+        let mut min_p = f64::INFINITY;
+        let mut max_p = f64::NEG_INFINITY;
+
+        for (i, g) in ghosts.info.iter().enumerate() {
+            if !matches!(
+                &field.outer_boundary[g.boundary_id].bc,
+                bc1::BCType::PrimitiveWall
+            ) {
+                continue;
+            }
+            count += 1;
+
+            let s = ghosts.values[i];
+            assert!(
+                s.rho.is_finite()
+                    && s.mom_x.is_finite()
+                    && s.mom_y.is_finite()
+                    && s.ee.is_finite()
+                    && s.ei.is_finite()
+                    && s.er.is_finite(),
+                "non-finite PrimitiveWall ghost at {:?}",
+                g.idx
+            );
+            assert!(s.rho > 0.0, "rho <= 0 at {:?}", g.idx);
+
+            let d = Derived::from_state(s);
+            let p = d.pe + d.pi + d.pr;
+            assert!(p > 0.0, "p <= 0 at {:?}", g.idx);
+            assert!(d.e_e > 0.0, "e_e <= 0 at {:?}", g.idx);
+            assert!(d.e_i > 0.0, "e_i <= 0 at {:?}", g.idx);
+            assert!(d.e_r > 0.0, "e_r <= 0 at {:?}", g.idx);
+
+            min_rho = min_rho.min(s.rho);
+            max_rho = max_rho.max(s.rho);
+            min_p = min_p.min(p);
+            max_p = max_p.max(p);
         }
 
-        let (g, d) = best.expect("no ghost found");
-        assert!(
-            d < 1e-6,
-            "stagnation ghost P0 = ({}, {}), dist to (-1,0) = {}",
-            g.project.point.x,
-            g.project.point.y,
-            d
+        assert!(count > 0, "no PrimitiveWall ghosts found");
+        println!(
+            "PrimitiveWall ghosts: count={}, rho=[{:.6e},{:.6e}], p=[{:.6e},{:.6e}]",
+            count, min_rho, max_rho, min_p, max_p
         );
-        assert!((g.project.normal.x - 1.0).abs() < 1e-9);
-        assert!(g.project.normal.y.abs() < 1e-9);
+    }
 
-        // Mirror symmetry for two solid-side ghosts at y = +/-0.2.
-        let j_up = ((0.2 - field.grid.y0) / field.grid.dy).round() as isize;
-        let j_dn = ((-0.2 - field.grid.y0) / field.grid.dy).round() as isize;
-        let i_ghost = ((-0.975 - field.grid.x0) / field.grid.dx).round() as isize;
+    #[test]
+    fn primitive_wall_first_rk1_stays_admissible() {
+        let field = init::init_cylinder();
+        let offsets = ghost::default_stencil_offsets();
+        let mut ghosts = ghost::GhostGrid::build(&field, &offsets);
 
-        let id_up = ghosts
-            .id((i_ghost, j_up))
-            .expect("upper mirror ghost missing");
-        let id_dn = ghosts
-            .id((i_ghost, j_dn))
-            .expect("lower mirror ghost missing");
+        let mut scratch = Scratch::new(&field);
+        let mut u1 = field.empty_like();
 
-        let up = &ghosts.info[id_up];
-        let dn = &ghosts.info[id_dn];
+        let dt_cfl = calc_global_dt(&field);
+        let dt = 0.05 * dt_cfl;
+        assert!(dt > 0.0);
 
-        assert!((up.project.point.x - dn.project.point.x).abs() < 1e-9);
-        assert!((up.project.point.y + dn.project.point.y).abs() < 1e-9);
-        assert!((up.project.normal.x - dn.project.normal.x).abs() < 1e-9);
-        assert!((up.project.normal.y + dn.project.normal.y).abs() < 1e-9);
-        assert!((up.project.distance - dn.project.distance).abs() < 1e-9);
+        // Initial ghost update + first spatial RHS + first RK1 update.
+        // assert_admissible() inside stage_update_rhs panics on any
+        // non-physical state, so reaching the end of this test means the
+        // first RK1 step produced a fully admissible state.
+        l(&field, &mut ghosts, &mut scratch);
+        stage_update_rhs(&field, &mut u1, &scratch.rhs, dt, "test RK1 state");
     }
 }

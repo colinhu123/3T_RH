@@ -8,7 +8,48 @@ use crate::{geometry, weno};
 use crate::constant;
 use std::sync::Arc;
 
-const WALL_TAYLOR_ORDER: usize = 4;
+const WALL_TAYLOR_ORDER: usize = 0;
+
+// ============================================================================
+// PRIMITIVE-VARIABLE WALL (Euler-equivalent benchmark specialization).
+//
+// Intended for the Mach-3 cylinder Example 5 of Tan, Wang, Shu, Ning,
+// JCP 231 (2012) 2510-2527, where the primitive-variable wall treatment
+// avoids the non-physical states produced by the conservative one.
+//
+// The current three-energy model is configured to be equivalent to ideal
+// Euler (all gammas equal, equal energy partition), so the wall algorithm
+// uses the ordinary 4-variable Euler primitive state
+//
+//     W = [rho, un, ut, p]
+//
+// where un/ut are the local normal/tangential velocities and p is the
+// TOTAL Euler pressure. Only the final conversion back to the solver's
+// 6-component State splits pressure/kinetic energy equally among the
+// three energy modes.
+// ============================================================================
+
+/// Taylor order of the primitive wall expansion.
+///
+/// 0: W_ghost = W^(0) with un^(0) = 0 (validated first milestone).
+/// Higher orders add derivative terms; see primitive_wall_value().
+const PRIMITIVE_WALL_TAYLOR_ORDER: usize = 0;
+
+/// EXPERIMENTAL: when true, the first normal derivative of pressure at
+/// the wall uses the paper's curved-wall relation
+///
+///     dp/dn = rho * ut^2 / R        (Eq. (2.23))
+///
+/// (n = fluid-domain outward normal, R = wall radius of curvature)
+/// instead of pure WENO extrapolation. This is NOT a validated
+/// paper-faithful primitive ILW method; it is disabled by default and
+/// must not be presented as such.
+const PRIMITIVE_WALL_ILW_K1: bool = false;
+
+/// Boundary WENO nonlinear exponent for the PrimitiveWall cylinder
+/// benchmark (the cited paper uses q = 10 for this problem). Interior
+/// WENO and other boundary types keep constant::WENO_Q.
+pub const PRIMITIVE_WALL_WENO_Q: f64 = 10.0;
 
 
 pub type TimeBCFn = Arc<dyn Fn(geometry::Point, geometry::Vec2, f64) -> state::State + Send + Sync>;
@@ -18,6 +59,9 @@ pub enum BCType {
     /// Mirror the state without changing momentum.
     ReflectiveWall,
     Wall,
+    /// High-order wall using LOCAL EULER PRIMITIVE variables
+    /// [rho, un, ut, p] (Euler-equivalent benchmark specialization).
+    PrimitiveWall,
     Periodic,
     Constant(State),
     /// Prescribed boundary state U(P0,n,t).
@@ -25,6 +69,87 @@ pub enum BCType {
     Outflow { p_inf: f64, sigma: f64, l_domain: f64 },
     ZerothOrder,
     FarField(State),
+}
+
+// ============================================================================
+// Analytic physical boundary elements.
+//
+// ONE BoundaryElement = ONE analytic geometry + ONE BC. This is the
+// authoritative physical boundary layer; the Polygon is only the domain
+// classifier / fluid-mask source.
+// ============================================================================
+
+/// Priority used to resolve geometric ties between boundary elements
+/// (higher wins). Wall beats FarField at shared junctions.
+pub fn bc_priority(bc: &BCType) -> usize {
+    match bc {
+        BCType::Wall => 100,
+        BCType::PrimitiveWall => 100,
+        BCType::ReflectiveWall => 90,
+        BCType::Constant(_) => 70,
+        BCType::TimeDependent(_) => 70,
+        BCType::FarField(_) => 20,
+        BCType::Outflow { .. } => 10,
+        BCType::ZerothOrder => 5,
+        BCType::Periodic => 0,
+    }
+}
+
+#[derive(Clone)]
+pub struct BoundaryElement {
+    pub geometry: geometry::BoundaryGeometry,
+    pub bc: BCType,
+}
+
+/// Squared-distance tie tolerance for `find_boundary_element`.
+const BOUNDARY_TIE_TOL: f64 = 1e-12;
+
+/// Find the analytic BoundaryElement physically closest to `p`.
+///
+/// Returns (element index, analytic Projection). Euclidean squared
+/// distance |p - P0|^2 decides the winner; near-ties are resolved by
+/// BC priority (Wall > ReflectiveWall > ... > FarField), then by
+/// deterministic element order.
+///
+/// Build-time / cold-path work only; a linear scan is intentional.
+pub fn find_boundary_element(
+    p: geometry::Point,
+    elements: &[BoundaryElement],
+) -> (usize, geometry::Projection) {
+    assert!(
+        !elements.is_empty(),
+        "no analytic boundary elements registered"
+    );
+
+    let mut best: Option<(usize, geometry::Projection, f64, usize)> = None;
+
+    for (i, e) in elements.iter().enumerate() {
+        let proj = e.geometry.project(p);
+        let dx = p.x - proj.point.x;
+        let dy = p.y - proj.point.y;
+        let dist2 = dx * dx + dy * dy;
+        let priority = bc_priority(&e.bc);
+
+        let replace = match best {
+            None => true,
+            Some((bi, _, best_dist2, best_priority)) => {
+                if dist2 < best_dist2 - BOUNDARY_TIE_TOL {
+                    true
+                } else if (dist2 - best_dist2).abs() <= BOUNDARY_TIE_TOL {
+                    priority > best_priority || (priority == best_priority && i < bi)
+                } else {
+                    false
+                }
+            }
+        };
+
+        if replace {
+            best = Some((i, proj, dist2, priority));
+        }
+    }
+
+    let (i, proj, _, _) = best.expect("no boundary element found");
+    (i, proj)
 }
 
 // ============================================================================
@@ -51,6 +176,8 @@ pub struct GhostBC {
     pub nearest: (isize, isize),
     pub normal: geometry::Vec2,
     pub d: [f64; 5],
+    /// Boundary WENO nonlinear exponent for this ghost.
+    pub q: f64,
     pub stencil: [u32; 55],
     pub s: [f64; 979],
     pub w: [f64; 225],
@@ -109,6 +236,7 @@ pub fn precompute_ghost_bc(
     project: &geometry::Projection,
     field: &field1::Field,
     beta_forms: &[DMatrix<f64>; 5],
+    q: f64,
 ) -> GhostBC {
     let nearest = find_nearest_grid_point(*project, field);
     let h = (field.grid.dx * field.grid.dy).sqrt();
@@ -123,6 +251,7 @@ pub fn precompute_ghost_bc(
         nearest,
         normal: project.normal,
         d,
+        q,
         stencil: [0; 55],
         s: [0.0; 979],
         w: [0.0; 225],
@@ -184,6 +313,10 @@ pub fn precompute_ghost_bc(
         }
     }
 
+    debug_assert!(bc.s.iter().all(|x| x.is_finite()), "GhostBC.s contains non-finite at nearest={:?}", nearest);
+debug_assert!(bc.w.iter().all(|x| x.is_finite()), "GhostBC.w contains non-finite at nearest={:?}", nearest);
+debug_assert!(bc.normal.x.is_finite() && bc.normal.y.is_finite(), "GhostBC.normal non-finite");
+
     bc
 }
 
@@ -238,7 +371,7 @@ pub fn weno_extrapolation_pre(
                 }
             }
 
-            alpha[c][r] = bc.d[r] / (constant::DEFAULT_EPS + beta).powf(constant::WENO_Q);
+            alpha[c][r] = bc.d[r] / (constant::DEFAULT_EPS + beta).powf(bc.q);
             vks[c][r] = vk;
             alpha_sum[c] += alpha[c][r];
         }
@@ -251,7 +384,321 @@ pub fn weno_extrapolation_pre(
         }
     }
 
+    debug_assert!(
+    alpha_sum.iter().all(|&s| s.is_finite() && s > 0.0),
+    "alpha_sum non-finite/non-positive: {:?}", alpha_sum
+);
+debug_assert!(
+    result.iter().all(|x| x.is_finite()),
+    "weno_extrapolation_pre produced non-finite result: {:?}", result
+);
+
     result
+}
+
+// ============================================================================
+// Local Euler primitive-variable machinery for PrimitiveWall.
+//
+// W = [rho, un, ut, p]
+//
+//   n  = project.normal  (FLUID-DOMAIN outward normal)
+//   t  = (-n.y, n.x)
+//   un = ux*n.x + uy*n.y
+//   ut = -ux*n.y + uy*n.x
+//   inverse: ux = un*n.x - ut*n.y
+//            uy = un*n.y + ut*n.x
+//
+// The current model is Euler-equivalent (equal gammas, equal energy
+// partition), so p = pe + pi + pr is the ordinary Euler pressure and the
+// conversion back splits pressure and kinetic energy equally among the
+// three energy modes.
+// ============================================================================
+
+#[derive(Clone, Copy, Debug)]
+struct EulerPrimitiveLocal {
+    rho: f64,
+    un: f64,
+    ut: f64,
+    p: f64,
+}
+
+/// Solver State -> local Euler primitive [rho, un, ut, p].
+///
+/// Total pressure is obtained from the existing Derived EOS helpers:
+/// p = pe + pi + pr.
+fn state_to_local_euler_primitive(
+    state: State,
+    normal: geometry::Vec2,
+) -> EulerPrimitiveLocal {
+    let ux = state.mom_x / state.rho;
+    let uy = state.mom_y / state.rho;
+
+    let d = state::Derived::from_state(state);
+
+    EulerPrimitiveLocal {
+        rho: state.rho,
+        un: ux * normal.x + uy * normal.y,
+        ut: -ux * normal.y + uy * normal.x,
+        p: d.pe + d.pi + d.pr,
+    }
+}
+
+/// Local Euler primitive -> solver State, using the benchmark's equal
+/// energy partition:
+///
+///     pe = pi = pr = p / 3
+///
+///     kinetic_mode = 0.5 * rho * (ux^2 + uy^2) / 3
+///
+///     ee = pe/(GAMMA_E-1) + kinetic_mode   (and likewise ei, er)
+///
+/// The full kinetic energy must NOT be placed into every mode (that
+/// would triple-count it).
+fn local_euler_primitive_to_state(
+    w: EulerPrimitiveLocal,
+    normal: geometry::Vec2,
+) -> State {
+    let ux = w.un * normal.x - w.ut * normal.y;
+    let uy = w.un * normal.y + w.ut * normal.x;
+
+    let kinetic_mode =
+        0.5 * w.rho * (ux * ux + uy * uy) / 3.0;
+
+    let pe = w.p / 3.0;
+    let pi = w.p / 3.0;
+    let pr = w.p / 3.0;
+
+    State {
+        rho: w.rho,
+        mom_x: w.rho * ux,
+        mom_y: w.rho * uy,
+        ee: pe / (constant::GAMMA_E - 1.0) + kinetic_mode,
+        ei: pi / (constant::GAMMA_I - 1.0) + kinetic_mode,
+        er: pr / (constant::GAMMA_R - 1.0) + kinetic_mode,
+    }
+}
+
+/// Order-zero primitive wall state: enforce no-penetration un = 0 and
+/// keep the extrapolated rho / ut / p.
+#[inline]
+fn primitive_wall_order0(w: [f64; 4]) -> [f64; 4] {
+    let mut out = w;
+    out[1] = 0.0;
+    out
+}
+
+/// Paper Eq. (2.23): dp/dn = rho * ut^2 / R, with n the FLUID-DOMAIN
+/// outward normal. For the convex cylinder obstacle n points toward the
+/// curvature center, hence the + sign. R = f64::INFINITY for flat walls
+/// makes the contribution vanish.
+#[inline]
+fn primitive_curved_pressure_gradient(rho: f64, ut: f64, radius: f64) -> f64 {
+    rho * ut * ut / radius
+}
+
+/// Scalar 2D WENO extrapolation of the FOUR local Euler primitive
+/// components [rho, un, ut, p] using the precomputed ghost geometry
+/// (stencil indices, smoothness quadratic forms, derivative weights).
+///
+/// Identical machinery to `weno_extrapolation_pre`, but the extrapolated
+/// DATA are primitive variables rather than L-projected characteristics.
+/// Returns the k-th normal derivative of each primitive component.
+fn weno_extrapolation_pre_primitive(
+    bc: &GhostBC,
+    field: &field1::Field,
+    k: usize,
+) -> [f64; 4] {
+    let n = bc.normal;
+    let mut alpha = [[0.0; 5]; 4];
+    let mut vks = [[0.0; 5]; 4];
+    let mut alpha_sum = [0.0; 4];
+
+    for r in 0..=4usize {
+        let m = (r + 1) * (r + 1);
+
+        let mut data = [[0.0f64; 25]; 4];
+
+        for a in 0..m {
+            let s = field.value[bc.stencil[BC_STENCIL_OFF[r] + a] as usize];
+
+            let ux = s.mom_x / s.rho;
+            let uy = s.mom_y / s.rho;
+            let d = state::Derived::from_state(s);
+
+            data[0][a] = s.rho;
+            data[1][a] = ux * n.x + uy * n.y;
+            data[2][a] = -ux * n.y + uy * n.x;
+            data[3][a] = d.pe + d.pi + d.pr;
+        }
+
+        for c in 0..4 {
+            let soff = BC_S_OFF[r];
+            let mut beta = 0.0;
+            for a in 0..m {
+                let base = soff + a * m;
+                let mut acc = 0.0;
+                for b in 0..m {
+                    acc += bc.s[base + b] * data[c][b];
+                }
+                beta += data[c][a] * acc;
+            }
+
+            let mut vk = 0.0;
+            if k <= r {
+                let woff = BC_W_OFF[r] + k * m;
+                for a in 0..m {
+                    vk += bc.w[woff + a] * data[c][a];
+                }
+            }
+
+            alpha[c][r] = bc.d[r] / (constant::DEFAULT_EPS + beta).powf(bc.q);
+            vks[c][r] = vk;
+            alpha_sum[c] += alpha[c][r];
+        }
+    }
+
+    let mut result = [0.0; 4];
+    for c in 0..4 {
+        for r in 0..=4usize {
+            result[c] += (alpha[c][r] / alpha_sum[c]) * vks[c][r];
+        }
+    }
+
+    result
+}
+
+/// High-order solid wall in LOCAL EULER PRIMITIVE variables.
+///
+/// Order 0 (PRIMITIVE_WALL_TAYLOR_ORDER = 0, the validated first
+/// milestone):
+///
+///     W_ghost = W^(0),  with un^(0) = 0
+///
+/// and rho / ut / p taken from the primitive 2D WENO extrapolation.
+/// NO characteristic matrices, NO conservative U0 solve, NO ILW, NO
+/// Taylor derivative terms are used in that mode.
+///
+/// For higher orders the Taylor expansion is performed entirely in
+/// primitive variables:
+///
+///     W_g = W^(0) + D W^(1) + D^2/2 W^(2) + D^3/6 W^(3) + D^4/24 W^(4)
+///
+/// with W^(k) from the same scalar primitive WENO machinery. k = 1 may
+/// optionally use the curved-wall pressure-gradient relation
+/// (EXPERIMENTAL, see PRIMITIVE_WALL_ILW_K1). The final primitive ghost
+/// state is converted ONCE to the solver State.
+fn primitive_wall_value(
+    idx: (isize, isize),
+    project: geometry::Projection,
+    bc: &GhostBC,
+    field: &field1::Field,
+    radius_of_curvature: f64,
+) -> state::State {
+    let mut w0 = [0.0; 4];
+    let mut w_ghost = [0.0; 4];
+    let mut coef = 1.0;
+
+    for k in 0..=PRIMITIVE_WALL_TAYLOR_ORDER {
+        let mut wk = weno_extrapolation_pre_primitive(bc, field, k);
+
+        if k == 0 {
+            wk = primitive_wall_order0(wk);
+            w0 = wk;
+
+            // ----------------------------------------------------
+            // Admissibility of the extrapolated primitive W^(0):
+            // finite, rho > 0, p > 0. NO clamping: panic with a full
+            // diagnostic so the method can be diagnosed.
+            // ----------------------------------------------------
+            if !wk.iter().all(|x| x.is_finite()) || wk[0] <= 0.0 || wk[3] <= 0.0 {
+                panic!(
+                    "\nPRIMITIVE WALL: non-admissible W^(0)\n\
+                     ghost idx   = {:?}\n\
+                     P0          = ({:.16e}, {:.16e})\n\
+                     normal      = ({:.16e}, {:.16e})\n\
+                     distance D  = {:.16e}\n\
+                     rho^(0)     = {:.16e}\n\
+                     un^(0)      = {:.16e}\n\
+                     ut^(0)      = {:.16e}\n\
+                     p^(0)       = {:.16e}\n",
+                    idx,
+                    project.point.x,
+                    project.point.y,
+                    project.normal.x,
+                    project.normal.y,
+                    project.distance,
+                    wk[0],
+                    wk[1],
+                    wk[2],
+                    wk[3],
+                );
+            }
+        } else if k == 1 && PRIMITIVE_WALL_ILW_K1 {
+            // EXPERIMENTAL curved-wall first normal derivative:
+            // dp/dn = rho * ut^2 / R (paper Eq. (2.23)).
+            wk[3] = primitive_curved_pressure_gradient(
+                w0[0],
+                w0[2],
+                radius_of_curvature,
+            );
+        }
+
+        for c in 0..4 {
+            w_ghost[c] += coef * wk[c];
+        }
+        if k < PRIMITIVE_WALL_TAYLOR_ORDER {
+            coef *= project.distance / ((k + 1) as f64);
+        }
+    }
+
+    let state = local_euler_primitive_to_state(
+        EulerPrimitiveLocal {
+            rho: w_ghost[0],
+            un: w_ghost[1],
+            ut: w_ghost[2],
+            p: w_ghost[3],
+        },
+        project.normal,
+    );
+
+    // ------------------------------------------------------------
+    // Final ghost admissibility: finite, rho > 0, total pressure > 0,
+    // all three modal internal energies > 0.
+    // ------------------------------------------------------------
+    let d = state::Derived::from_state(state);
+    let finite = state.rho.is_finite()
+        && state.mom_x.is_finite()
+        && state.mom_y.is_finite()
+        && state.ee.is_finite()
+        && state.ei.is_finite()
+        && state.er.is_finite();
+
+    if !finite
+        || state.rho <= 0.0
+        || d.pe + d.pi + d.pr <= 0.0
+        || d.e_e <= 0.0
+        || d.e_i <= 0.0
+        || d.e_r <= 0.0
+    {
+        panic!(
+            "\nPRIMITIVE WALL: non-admissible final ghost state\n\
+             ghost idx = {:?}\n\
+             rho = {:.16e}, p = {:.16e}, e_int = ({:.16e},{:.16e},{:.16e})\n\
+             W_ghost = [rho={:.16e}, un={:.16e}, ut={:.16e}, p={:.16e}]\n",
+            idx,
+            state.rho,
+            d.pe + d.pi + d.pr,
+            d.e_e,
+            d.e_i,
+            d.e_r,
+            w_ghost[0],
+            w_ghost[1],
+            w_ghost[2],
+            w_ghost[3],
+        );
+    }
+
+    state
 }
 
 pub fn find_nearest_grid_point(project: geometry::Projection, field: &field1::Field) -> (isize, isize) {
@@ -610,7 +1057,7 @@ pub fn set_ghost_point_value(
     idx:(isize,isize),
     project: geometry::Projection,
     boundary: crate::ghost::BoundaryKind,
-    side_id: usize,
+    boundary_id: usize,
     field: &field1::Field,
     bc_pre: Option<&GhostBC>,
 )
@@ -618,11 +1065,11 @@ pub fn set_ghost_point_value(
 
     let bc = match boundary {
     crate::ghost::BoundaryKind::Outer => {
-        &field.bc_outer[side_id]
+        &field.outer_boundary[boundary_id].bc
     }
 
     crate::ghost::BoundaryKind::Inner => {
-        &field.bc_inner[side_id]
+        &field.inner_boundary[boundary_id].bc
     }
     };
 
@@ -658,6 +1105,39 @@ pub fn set_ghost_point_value(
         field,
     );
     }   
+
+    // ------------------------------------------------------------
+    // PrimitiveWall: local Euler primitive [rho, un, ut, p] wall.
+    //
+    // Uses ONLY the precomputed geometric stencil data (GhostBC) and
+    // the cached analytic Projection. No characteristic matrices, no
+    // conservative ILW, no polygon-side lookup.
+    // ------------------------------------------------------------
+    if let BCType::PrimitiveWall = bc {
+        let radius = match boundary {
+            crate::ghost::BoundaryKind::Outer => {
+                field.outer_boundary[boundary_id]
+                    .geometry
+                    .radius_of_curvature(project.point)
+            }
+            crate::ghost::BoundaryKind::Inner => {
+                field.inner_boundary[boundary_id]
+                    .geometry
+                    .radius_of_curvature(project.point)
+            }
+        };
+
+        if let Some(pre) = bc_pre {
+            return primitive_wall_value(idx, project, pre, field, radius);
+        }
+
+        // Slow path (Field::get / standalone tests): build the geometric
+        // precompute on the fly with the benchmark boundary WENO exponent.
+        let h = (field.grid.dx * field.grid.dy).sqrt();
+        let beta = beta_quadratic_forms(h);
+        let own = precompute_ghost_bc(&project, field, &beta, PRIMITIVE_WALL_WENO_Q);
+        return primitive_wall_value(idx, project, &own, field, radius);
+    }
 
     let mut v = [[0.0; 6]; 5];
     // The characteristic matrix is evaluated at U_0, the interior grid
@@ -700,7 +1180,7 @@ pub fn set_ghost_point_value(
             let mut rhs0 = Array1::from_vec(v[0].to_vec());
             rhs0[0] = 0.0;
             let u0 = solve6(&left0, &rhs0);
-
+            debug_assert!(u0.iter().all(|x| x.is_finite()), "u0 non-finite, idx={:?}", idx);
             // ---------------------------------------------------------
             // k = 1: ILW momentum row + extrapolation rows — Eq. (2.20)/(2.22)
             //        analogue. R -> infinity for flat polygon walls,
@@ -1690,7 +2170,7 @@ mod tests {
             BCType::Wall,
         ];
 
-        field1::Field::new(
+        let mut field = field1::Field::new(
             grid,
             inner_bc,
             outer_bc,
@@ -1698,7 +2178,54 @@ mod tests {
             outer,
             inner,
             0.0,
-        )
+        );
+
+        // Analytic physical boundary: four Wall line segments.
+        // CCW polygon with fluid inside => outward normal = (dy, -dx)/len.
+        field.outer_boundary = vec![
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Line(
+                    geometry::LineSegment::new(
+                        Point { x: 0.0, y: 0.0 },
+                        Point { x: lx, y: 0.0 },
+                        geometry::Vec2 { x: 0.0, y: -1.0 },
+                    ),
+                ),
+                bc: BCType::Wall,
+            },
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Line(
+                    geometry::LineSegment::new(
+                        Point { x: lx, y: 0.0 },
+                        Point { x: lx, y: ly },
+                        geometry::Vec2 { x: 1.0, y: 0.0 },
+                    ),
+                ),
+                bc: BCType::Wall,
+            },
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Line(
+                    geometry::LineSegment::new(
+                        Point { x: lx, y: ly },
+                        Point { x: 0.0, y: ly },
+                        geometry::Vec2 { x: 0.0, y: 1.0 },
+                    ),
+                ),
+                bc: BCType::Wall,
+            },
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Line(
+                    geometry::LineSegment::new(
+                        Point { x: 0.0, y: ly },
+                        Point { x: 0.0, y: 0.0 },
+                        geometry::Vec2 { x: -1.0, y: 0.0 },
+                    ),
+                ),
+                bc: BCType::Wall,
+            },
+        ];
+
+        field
     }
 
     // ------------------------------------------------------------------------
@@ -2175,4 +2702,227 @@ fn constant_polynomial_fit_has_zero_high_order_coefficients() {
 
     assert!((c[0] - 1.0).abs() < 1e-12);
 }
+
+    // ------------------------------------------------------------------------
+    // Analytic boundary lookup
+    //
+    // Nearest BoundaryElement wins by Euclidean distance; at geometric
+    // ties BC priority breaks the tie: Wall must beat FarField at the
+    // arc/line junction.
+    // ------------------------------------------------------------------------
+    #[test]
+    fn analytic_junction_wall_beats_farfield() {
+        let arc = geometry::CircularArc::from_three_points(
+            Point { x: 0.0, y: -1.0 },
+            Point { x: -1.0, y: 0.0 },
+            Point { x: 0.0, y: 1.0 },
+            geometry::FluidSide::Outside,
+        );
+
+        let line = geometry::LineSegment::new(
+            Point { x: 0.0, y: 1.0 },
+            Point { x: 0.0, y: 6.0 },
+            geometry::Vec2 { x: 1.0, y: 0.0 },
+        );
+
+        let elements = vec![
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Line(line),
+                bc: BCType::FarField(State::new()),
+            },
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Arc(arc),
+                bc: BCType::Wall,
+            },
+        ];
+
+        // Middle of the line -> line element.
+        let (id, proj) =
+            find_boundary_element(Point { x: 0.2, y: 3.0 }, &elements);
+        assert_eq!(id, 0);
+        assert!((proj.point.y - 3.0).abs() < 1e-14);
+
+        // Middle of the arc -> arc element.
+        let (id, proj) =
+            find_boundary_element(Point { x: -1.5, y: 0.0 }, &elements);
+        assert_eq!(id, 1);
+        assert!((proj.normal.x - 1.0).abs() < 1e-12);
+        assert!(proj.normal.y.abs() < 1e-12);
+
+        // Shared endpoint (0,1): point equidistant from arc endpoint and
+        // line (radial projection falls OUTSIDE the finite arc) -> exact
+        // geometric tie -> Wall wins.
+        let (id, proj) =
+            find_boundary_element(Point { x: 0.1, y: 1.0 }, &elements);
+        assert_eq!(id, 1, "Wall must beat FarField at the junction");
+        assert!((proj.point.x - 0.0).abs() < 1e-12);
+        assert!((proj.point.y - 1.0).abs() < 1e-12);
+        // Arc normal at (0,1): fluid outside => -radial = (0,-1).
+        assert!(proj.normal.x.abs() < 1e-12);
+        assert!((proj.normal.y + 1.0).abs() < 1e-12);
+    }
+
+    // ------------------------------------------------------------------------
+    // PrimitiveWall tests
+    // ------------------------------------------------------------------------
+
+    /// Euler-equivalent state with equal energy partition (ee = ei = er)
+    /// for the given rho / ux / uy / total pressure p.
+    fn euler_equivalent_state(rho: f64, ux: f64, uy: f64, p: f64) -> State {
+        let kinetic_mode = 0.5 * rho * (ux * ux + uy * uy) / 3.0;
+        let e = p / 3.0 / (constant::GAMMA_E - 1.0) + kinetic_mode;
+        State {
+            rho,
+            mom_x: rho * ux,
+            mom_y: rho * uy,
+            ee: e,
+            ei: e,
+            er: e,
+        }
+    }
+
+    fn state_close(a: &State, b: &State, tol: f64) {
+        let d = [
+            (a.rho - b.rho).abs(),
+            (a.mom_x - b.mom_x).abs(),
+            (a.mom_y - b.mom_y).abs(),
+            (a.ee - b.ee).abs(),
+            (a.ei - b.ei).abs(),
+            (a.er - b.er).abs(),
+        ];
+        let maxd = d.into_iter().fold(0.0f64, f64::max);
+        assert!(maxd < tol, "state mismatch {} >= {}", maxd, tol);
+    }
+
+    #[test]
+    fn euler_primitive_round_trip() {
+        let normals = [
+            geometry::Vec2 { x: 1.0, y: 0.0 },
+            geometry::Vec2 { x: 0.0, y: 1.0 },
+            geometry::Vec2 { x: 1.0, y: 1.0 },
+            geometry::Vec2 { x: -1.0, y: 0.3 },
+        ];
+
+        let cases = [
+            euler_equivalent_state(1.0, 3.54964787, 0.0, 1.0),
+            euler_equivalent_state(0.6, 1.2, -0.9, 2.7),
+            euler_equivalent_state(1.8, -0.5, 2.2, 0.3),
+            euler_equivalent_state(0.2, 0.0, 0.0, 0.05),
+        ];
+
+        for state in cases {
+            for n in normals {
+                let n = n.normalize();
+                let w = state_to_local_euler_primitive(state, n);
+                let back = local_euler_primitive_to_state(w, n);
+                state_close(&state, &back, 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn freestream_pressure_is_rotationally_invariant() {
+        let state = euler_equivalent_state(1.0, 3.54964787, 0.0, 1.0);
+
+        for n in [
+            geometry::Vec2 { x: 1.0, y: 0.0 },
+            geometry::Vec2 { x: 0.0, y: 1.0 },
+            geometry::Vec2 { x: 0.6, y: 0.8 },
+            geometry::Vec2 { x: -0.8, y: 0.6 },
+        ] {
+            let w = state_to_local_euler_primitive(state, n);
+            assert!(
+                (w.p - 1.0).abs() < 1e-12,
+                "p = {} for normal {:?}",
+                w.p,
+                n
+            );
+        }
+
+        // The three modal pressures of the Euler-equivalent freestream
+        // must be equal and sum to p.
+        let d = state::Derived::from_state(state);
+        assert!((d.pe - d.pi).abs() < 1e-12);
+        assert!((d.pi - d.pr).abs() < 1e-12);
+        assert!((d.pe + d.pi + d.pr - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn energy_partition_of_converted_ghost() {
+        let w = EulerPrimitiveLocal {
+            rho: 1.3,
+            un: -0.4,
+            ut: 2.1,
+            p: 4.2,
+        };
+        let state = local_euler_primitive_to_state(w, geometry::Vec2 { x: 0.0, y: 1.0 });
+
+        let d = state::Derived::from_state(state);
+        assert!((d.pe - w.p / 3.0).abs() < 1e-12);
+        assert!((d.pi - w.p / 3.0).abs() < 1e-12);
+        assert!((d.pr - w.p / 3.0).abs() < 1e-12);
+        assert!((d.pe + d.pi + d.pr - w.p).abs() < 1e-12);
+        assert!((state.ee - state.ei).abs() < 1e-12);
+        assert!((state.ei - state.er).abs() < 1e-12);
+    }
+
+    #[test]
+    fn order_zero_wall_imposes_no_penetration() {
+        let w = [1.0, 3.5, -0.2, 1.3];
+        let ww = primitive_wall_order0(w);
+
+        assert!(ww[0] == w[0], "rho must be unchanged");
+        assert!(ww[1] == 0.0, "un must be zero");
+        assert!(ww[2] == w[2], "ut must be unchanged");
+        assert!(ww[3] == w[3], "p must be unchanged");
+
+        let state = local_euler_primitive_to_state(
+            EulerPrimitiveLocal {
+                rho: ww[0],
+                un: ww[1],
+                ut: ww[2],
+                p: ww[3],
+            },
+            geometry::Vec2 { x: 1.0, y: 0.0 },
+        );
+        let d = state::Derived::from_state(state);
+        assert!(state.rho > 0.0);
+        assert!(d.pe + d.pi + d.pr > 0.0);
+        assert!(d.e_e > 0.0 && d.e_i > 0.0 && d.e_r > 0.0);
+    }
+
+    #[test]
+    fn stagnation_local_conversion() {
+        // Freestream: ux > 0, uy = 0; stagnation normal n = (+1, 0).
+        let state = euler_equivalent_state(1.0, 3.54964787, 0.0, 1.0);
+
+        let w = state_to_local_euler_primitive(state, geometry::Vec2 { x: 1.0, y: 0.0 });
+        assert!((w.un - 3.54964787).abs() < 1e-12);
+        assert!(w.ut.abs() < 1e-12);
+
+        // Wall state at the stagnation point: un = 0, ut = 0.
+        let ww = primitive_wall_order0([w.rho, w.un, w.ut, w.p]);
+        assert!(ww[1] == 0.0);
+        assert!(ww[2].abs() < 1e-12);
+        assert!(ww[0] > 0.0 && ww[3] > 0.0);
+
+        let ghost = local_euler_primitive_to_state(
+            EulerPrimitiveLocal { rho: ww[0], un: ww[1], ut: ww[2], p: ww[3] },
+            geometry::Vec2 { x: 1.0, y: 0.0 },
+        );
+        let d = state::Derived::from_state(ghost);
+        assert!(ghost.rho > 0.0 && d.pe + d.pi + d.pr > 0.0);
+        assert!(d.e_e > 0.0 && d.e_i > 0.0 && d.e_r > 0.0);
+    }
+
+    #[test]
+    fn curved_pressure_gradient_relation() {
+        // dp/dn = rho * ut^2 / R, Eq. (2.23).
+        assert!(primitive_curved_pressure_gradient(1.0, 0.0, 1.0).abs() < 1e-14);
+        let pn = primitive_curved_pressure_gradient(1.5, 2.0, 1.0);
+        assert!((pn - 6.0).abs() < 1e-12);
+        assert!(pn > 0.0);
+        // Flat wall: R = infinity -> no curved-wall contribution.
+        assert!(primitive_curved_pressure_gradient(1.5, 2.0, f64::INFINITY).abs() < 1e-14);
+    }
 }

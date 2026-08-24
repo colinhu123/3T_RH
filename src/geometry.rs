@@ -653,22 +653,110 @@ impl CircularArc {
     }
 }
 
-/// Marks an inclusive range of Polygon sides as an analytic circular arc.
+/// Analytic finite line segment boundary geometry.
 ///
-/// The Polygon sides keep their role for the domain/mask and BC ownership;
-/// the arc only overrides the boundary geometry (P0, n, D).
-#[derive(Clone, Debug)]
-pub struct ArcOverride {
-    pub side_start: usize,
-    pub side_end: usize,
-    pub arc: CircularArc,
+/// The normal is the OUTWARD NORMAL OF THE FLUID DOMAIN and is supplied
+/// explicitly at construction (the segment itself has no notion of which
+/// side is fluid).
+#[derive(Clone, Copy, Debug)]
+pub struct LineSegment {
+    pub start: Point,
+    pub end: Point,
+
+    /// Outward normal of the FLUID domain (normalized at construction).
+    pub normal: Vec2,
 }
 
-impl ArcOverride {
-    /// Inclusive side-range check; ranges do not wrap.
-    #[inline(always)]
-    pub fn contains_side(&self, side: usize) -> bool {
-        side >= self.side_start && side <= self.side_end
+impl LineSegment {
+    pub fn new(
+        start: Point,
+        end: Point,
+        normal: Vec2,
+    ) -> Self {
+        let len = (end.x - start.x).hypot(end.y - start.y);
+        assert!(len > 1e-14, "LineSegment must have nonzero length");
+
+        let n_norm = normal.norm();
+        assert!(n_norm > 1e-14, "LineSegment normal must be nonzero");
+
+        Self {
+            start,
+            end,
+            normal: Vec2 {
+                x: normal.x / n_norm,
+                y: normal.y / n_norm,
+            },
+        }
+    }
+
+    /// Standard finite-segment projection: t = dot(p-start, end-start)/|end-start|^2
+    /// clamped to [0,1].
+    pub fn closest_point(&self, p: Point) -> Point {
+        let dx = self.end.x - self.start.x;
+        let dy = self.end.y - self.start.y;
+        let len2 = dx * dx + dy * dy;
+
+        let t = ((p.x - self.start.x) * dx + (p.y - self.start.y) * dy) / len2;
+        let t = t.clamp(0.0, 1.0);
+
+        Point {
+            x: self.start.x + t * dx,
+            y: self.start.y + t * dy,
+        }
+    }
+
+    /// P0 = closest_point(p), n = stored fluid-outward normal,
+    /// D = (p - P0) . n (existing Projection convention).
+    pub fn project(&self, p: Point) -> Projection {
+        let p0 = self.closest_point(p);
+
+        let dx = p.x - p0.x;
+        let dy = p.y - p0.y;
+
+        let distance = dx * self.normal.x + dy * self.normal.y;
+
+        Projection {
+            point: p0,
+            normal: self.normal,
+            distance,
+        }
+    }
+}
+
+/// Analytic physical boundary geometry.
+///
+/// The Polygon remains the domain classifier / fluid-mask source; these
+/// variants define the actual physical boundary geometry (closest point,
+/// outward fluid normal, signed distance) used by the ghost-BC machinery.
+#[derive(Clone, Copy, Debug)]
+pub enum BoundaryGeometry {
+    Line(LineSegment),
+    Arc(CircularArc),
+}
+
+impl BoundaryGeometry {
+    pub fn closest_point(&self, p: Point) -> Point {
+        match self {
+            BoundaryGeometry::Line(l) => l.closest_point(p),
+            BoundaryGeometry::Arc(a) => a.closest_point(p),
+        }
+    }
+
+    pub fn project(&self, p: Point) -> Projection {
+        match self {
+            BoundaryGeometry::Line(l) => l.project(p),
+            BoundaryGeometry::Arc(a) => a.project(p),
+        }
+    }
+
+    /// Local radius of curvature for the primitive curved-wall condition.
+    ///
+    /// Lines: +infinity (curvature 0). Arcs: |R| = arc radius.
+    pub fn radius_of_curvature(&self, _p0: Point) -> f64 {
+        match self {
+            BoundaryGeometry::Line(_) => f64::INFINITY,
+            BoundaryGeometry::Arc(a) => a.radius,
+        }
     }
 }
 
@@ -769,25 +857,122 @@ mod arc_tests {
         );
     }
 
+    // ============================================================
+    // LineSegment
+    // ============================================================
+
     #[test]
-    fn arc_override_inclusive_side_range() {
-        let arc = CircularArc::from_three_points(
-            Point { x: 0.0, y: -1.0 },
-            Point { x: -1.0, y: 0.0 },
-            Point { x: 0.0, y: 1.0 },
-            FluidSide::Outside,
+    fn line_segment_interior_projection() {
+        // Fluid above the line => outward normal -y.
+        let line = LineSegment::new(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 1.0, y: 0.0 },
+            Vec2 { x: 0.0, y: -1.0 },
         );
 
-        let ov = ArcOverride {
-            side_start: 5,
-            side_end: 9,
-            arc,
-        };
+        let p = Point { x: 0.25, y: 0.5 };
+        let proj = line.project(p);
 
-        assert!(ov.contains_side(5));
-        assert!(ov.contains_side(9));
-        assert!(ov.contains_side(7));
-        assert!(!ov.contains_side(4));
-        assert!(!ov.contains_side(10));
+        assert!((proj.point.x - 0.25).abs() < 1e-14);
+        assert!(proj.point.y.abs() < 1e-14);
+        assert!((proj.normal.x - 0.0).abs() < 1e-14);
+        assert!((proj.normal.y + 1.0).abs() < 1e-14);
+        // p is on the fluid side of the wall foot => D = (p-P0).n = -0.5
+        assert!((proj.distance + 0.5).abs() < 1e-14);
+    }
+
+    #[test]
+    fn line_segment_endpoint_clamping() {
+        let line = LineSegment::new(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 1.0, y: 0.0 },
+            Vec2 { x: 0.0, y: -1.0 },
+        );
+
+        // Radial projection would fall beyond the end => clamp to (1,0).
+        let p = Point { x: 2.0, y: 3.0 };
+        let p0 = line.closest_point(p);
+        assert!((p0.x - 1.0).abs() < 1e-14);
+        assert!(p0.y.abs() < 1e-14);
+
+        // ... and beyond the start => clamp to (0,0).
+        let p = Point { x: -1.5, y: -2.0 };
+        let p0 = line.closest_point(p);
+        assert!(p0.x.abs() < 1e-14);
+        assert!(p0.y.abs() < 1e-14);
+    }
+
+    #[test]
+    fn line_segment_normal_is_normalized() {
+        let line = LineSegment::new(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 1.0, y: 0.0 },
+            Vec2 { x: 0.0, y: -7.0 },
+        );
+
+        assert!((line.normal.norm() - 1.0).abs() < 1e-14);
+        assert!((line.normal.y + 1.0).abs() < 1e-14);
+    }
+
+    // ============================================================
+    // Straight-boundary regression: analytic LineSegment must reproduce
+    // the Polygon physical geometry on the same straight side.
+    // ============================================================
+
+    #[test]
+    fn line_segment_matches_polygon_side_projection() {
+        // Bottom side of a rectangle polygon, fluid inside (CCW).
+        let polygon = Polygon::new(
+            vec![
+                Point { x: -3.0, y: -6.0 },
+                Point { x: 0.0, y: -6.0 },
+                Point { x: 0.0, y: 6.0 },
+                Point { x: -3.0, y: 6.0 },
+            ],
+            FluidSide::Inside,
+        );
+
+        let line = LineSegment::new(
+            Point { x: -3.0, y: -6.0 },
+            Point { x: 0.0, y: -6.0 },
+            Vec2 { x: 0.0, y: -1.0 },
+        );
+
+        for p in [
+            Point { x: -2.0, y: -7.0 },
+            Point { x: -0.5, y: -6.25 },
+            Point { x: -1.2, y: -5.0 },
+        ] {
+            let poly_proj = project(&polygon, p);
+            let line_proj = line.project(p);
+
+            assert!((poly_proj.point.x - line_proj.point.x).abs() < 1e-14);
+            assert!((poly_proj.point.y - line_proj.point.y).abs() < 1e-14);
+            assert!((poly_proj.normal.x - line_proj.normal.x).abs() < 1e-14);
+            assert!((poly_proj.normal.y - line_proj.normal.y).abs() < 1e-14);
+            assert!((poly_proj.distance - line_proj.distance).abs() < 1e-14);
+        }
+    }
+
+    // ============================================================
+    // Curvature API
+    // ============================================================
+
+    #[test]
+    fn boundary_geometry_radius_of_curvature() {
+        let arc = cylinder_arc();
+        let r = BoundaryGeometry::Arc(arc).radius_of_curvature(Point { x: -1.0, y: 0.0 });
+        assert!((r - 1.0).abs() < 1e-12);
+
+        let line = LineSegment::new(
+            Point { x: 0.0, y: 0.0 },
+            Point { x: 1.0, y: 0.0 },
+            Vec2 { x: 0.0, y: -1.0 },
+        );
+        assert!(
+            BoundaryGeometry::Line(line)
+                .radius_of_curvature(Point { x: 0.5, y: 0.0 })
+                .is_infinite()
+        );
     }
 }

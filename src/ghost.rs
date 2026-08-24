@@ -20,7 +20,9 @@ pub struct GhostInfo {
     pub project: Projection,
     pub nearest_idx: (isize, isize),
     pub boundary: BoundaryKind,
-    pub side_id: usize,
+    /// Index into Field.outer_boundary / Field.inner_boundary: the
+    /// analytic physical BoundaryElement this ghost belongs to.
+    pub boundary_id: usize,
     /// Precomputed WENO-extrapolation data (only for Wall / Outflow /
     /// FarField ghosts).
     pub bc: Option<Box<bc1::GhostBC>>,
@@ -182,7 +184,7 @@ impl GhostGrid {
                     g.idx,
                     g.project,
                     g.boundary,
-                    g.side_id,
+                    g.boundary_id,
                     field,
                     g.bc.as_deref(),
                 );
@@ -217,7 +219,7 @@ impl GhostGrid {
                         g.idx,
                         g.project,
                         g.boundary,
-                        g.side_id,
+                        g.boundary_id,
                         field,
                         g.bc.as_deref(),
                     );
@@ -238,20 +240,20 @@ impl GhostGrid {
                          ========================================\n\
                          NON-FINITE GHOST STATE\n\
                          ========================================\n\
-                         ghost id   = {}\n\
-                         ghost idx  = {:?}\n\
-                         boundary   = {:?}\n\
-                         side id    = {}\n\
-                         P0         = ({:.16e}, {:.16e})\n\
-                         normal     = ({:.16e}, {:.16e})\n\
-                         distance   = {:.16e}\n\
-                         nearest    = {:?}\n\
-                         state      = {:?}\n\
+                         ghost id      = {}\n\
+                         ghost idx     = {:?}\n\
+                         boundary      = {:?}\n\
+                         boundary id   = {}\n\
+                         P0            = ({:.16e}, {:.16e})\n\
+                         normal        = ({:.16e}, {:.16e})\n\
+                         distance      = {:.16e}\n\
+                         nearest       = {:?}\n\
+                         state         = {:?}\n\
                          ========================================\n",
                         id,
                         g.idx,
                         g.boundary,
-                        g.side_id,
+                        g.boundary_id,
                         g.project.point.x,
                         g.project.point.y,
                         g.project.normal.x,
@@ -281,71 +283,7 @@ impl GhostGrid {
 }
 
 
-#[inline]
-fn bc_priority(bc: &bc1::BCType) -> usize {
-    match bc {
-        // Solid/symmetry constraints have highest priority.
-        bc1::BCType::Wall => 100,
-        bc1::BCType::ReflectiveWall => 90,
 
-        // Prescribed states.
-        bc1::BCType::Constant(_) => 70,
-        bc1::BCType::TimeDependent(_) => 70,
-
-        // Open boundaries.
-        bc1::BCType::FarField(_) => 20,
-        bc1::BCType::Outflow { .. } => 10,
-
-        // Adapt these if needed.
-        bc1::BCType::ZerothOrder => 5,
-        bc1::BCType::Periodic => 0,
-
-        _ => 0,
-    }
-}
-
-pub fn select_boundary_side(
-    p0: geometry::Point,
-    polygon: &geometry::Polygon,
-    bc_list: &[bc1::BCType],
-) -> usize {
-    let candidates =
-        geometry::find_boundary_sides(
-            p0,
-            polygon,
-            crate::constant::DEFAULT_EPS,
-        );
-
-    assert!(
-        !candidates.is_empty(),
-        "projection point ({:.16e},{:.16e}) \
-         does not lie on any polygon side",
-        p0.x,
-        p0.y,
-    );
-
-    assert_eq!(
-        polygon.points.len(),
-        bc_list.len(),
-        "polygon side count and BC count disagree"
-    );
-
-    let mut best_side = candidates[0];
-    let mut best_priority =
-        bc_priority(&bc_list[best_side]);
-
-    for &side in &candidates[1..] {
-        let priority =
-            bc_priority(&bc_list[side]);
-
-        if priority > best_priority {
-            best_side = side;
-            best_priority = priority;
-        }
-    }
-
-    best_side
-}
 
 /// A point is cached iff a real fluid cell's registered stencil references it
 /// and the referenced point is outside the fluid domain.
@@ -385,84 +323,39 @@ fn build_ghost_info(
         y: field.grid.y(idx.1),
     };
 
-    // Compatible with the current Field layout:
-    // outside outer polygon -> outer boundary;
-    // otherwise             -> inner boundary.
+    // The Polygon only classifies the domain: outside the outer polygon
+    // -> outer boundary; otherwise -> inner excluded region.
     let outer_fluid = field.outer_bound.is_fluid(p);
-    let (boundary, polygon) = if !outer_fluid {
-        (BoundaryKind::Outer, &field.outer_bound)
+    let (boundary, elements) = if !outer_fluid {
+        (BoundaryKind::Outer, &field.outer_boundary)
     } else {
-        (BoundaryKind::Inner, &field.inner_bound)
+        (BoundaryKind::Inner, &field.inner_boundary)
     };
 
-    let project = geometry::project(polygon, p);
+    // Analytic physical boundary lookup: exact P0 / n / D come from the
+    // selected BoundaryElement (Line or Arc), never from Polygon sides.
+    let (boundary_id, project) =
+        bc1::find_boundary_element(p, elements);
+
     let nearest_idx = bc1::find_nearest_grid_point(project, field);
-    let bc_list = match boundary {
-    BoundaryKind::Outer => {
-        &field.bc_outer
-    }
-
-    BoundaryKind::Inner => {
-        &field.bc_inner
-    }
-    };
-
-    let side_id =
-    select_boundary_side(
-        project.point,
-        polygon,
-        bc_list,
-    );
-
-    // ------------------------------------------------------------
-    // FINAL projection for this ghost:
-    //
-    //   * if the selected polygon side belongs to an analytic
-    //     CircularArc override -> exact arc geometry
-    //   * otherwise -> selected-polygon-side geometry
-    //
-    // This final projection is what feeds GhostBC precomputation
-    // below and every RK-stage ghost reconstruction.
-    // ------------------------------------------------------------
-
-    let project =
-    if let Some(arc) =
-        field.arc_for_side(boundary, side_id)
-    {
-        arc.project(p)
-    }
-    else
-    {
-        let normal =
-        polygon.outward_normal_of_side(
-            side_id
-        );
-
-        let dx =
-        p.x - project.point.x;
-
-        let dy =
-        p.y - project.point.y;
-
-        let distance =
-        dx * normal.x
-        + dy * normal.y;
-
-        Projection {
-            point: project.point,
-            normal,
-            distance,
-        }
-    };
 
     // Precompute the heavy per-stage extrapolation data for BC types that
     // use it. Cheap BCs (Constant/ReflectiveWall/ZerothOrder/Periodic/...)
-    // skip it entirely.
-    let bc_pre = match &bc_list[side_id] {
+    // skip it entirely. The ANALYTIC Projection above is what feeds the
+    // WENO stencil geometry / regression matrices.
+    let bc_pre = match &elements[boundary_id].bc {
         bc1::BCType::Wall
+        | bc1::BCType::PrimitiveWall
         | bc1::BCType::Outflow { .. }
         | bc1::BCType::FarField(_) => {
-            Some(Box::new(bc1::precompute_ghost_bc(&project, field, beta_forms)))
+            // PrimitiveWall uses the benchmark boundary WENO exponent
+            // (q = 10 for the Mach-3 cylinder, Tan et al. 2012);
+            // all other boundary types keep the global exponent.
+            let q = match &elements[boundary_id].bc {
+                bc1::BCType::PrimitiveWall => bc1::PRIMITIVE_WALL_WENO_Q,
+                _ => crate::constant::WENO_Q,
+            };
+            Some(Box::new(bc1::precompute_ghost_bc(&project, field, beta_forms, q)))
         }
         _ => None,
     };
@@ -472,7 +365,7 @@ fn build_ghost_info(
         project,
         nearest_idx,
         boundary,
-        side_id,
+        boundary_id,
         bc: bc_pre,
     }
 }

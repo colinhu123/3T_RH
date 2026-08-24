@@ -28,9 +28,9 @@ pub fn save_data(
     _lx: f64,
     _ly: f64,
 ) {
-    create_dir_all("data_new").expect("Cannot create data directory");
+    create_dir_all("data").expect("Cannot create data directory");
 
-    let final_path = format!("data_new/{}", filename);
+    let final_path = format!("data/{}", filename);
     let tmp_path = format!("{}.tmp", final_path);
 
     let file = File::create(&tmp_path).expect("Cannot create temporary output file");
@@ -87,7 +87,7 @@ pub fn save_data(
 }
 
 pub fn clear_data_folder() {
-    let path = "data_new";
+    let path = "data";
 
     if Path::new(path).exists() {
         remove_dir_all(path).expect("Failed to remove old data folder");

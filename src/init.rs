@@ -4,6 +4,35 @@ use crate::field1::*;
 use crate::bc1::*;
 use std::sync::Arc;
 
+/// Analytic straight boundary element.
+///
+/// The outward FLUID-domain normal is derived from the segment
+/// direction using the polygon convention of this project:
+///
+///     CCW polygon with fluid INSIDE  =>  outward normal = (dy, -dx)/len
+fn line_element(
+    start: Point,
+    end: Point,
+    bc: BCType,
+) -> BoundaryElement {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let len = dx.hypot(dy);
+    assert!(len > 1e-14, "degenerate boundary line");
+
+    BoundaryElement {
+        geometry: BoundaryGeometry::Line(LineSegment::new(
+            start,
+            end,
+            Vec2 {
+                x: dy / len,
+                y: -dx / len,
+            },
+        )),
+        bc,
+    }
+}
+
 fn euler_to_three_energy(
     rho: f64,
     ux: f64,
@@ -93,6 +122,17 @@ pub fn init_double_mach() -> Field {
         inner_bound,
         0.0,
     );
+
+    // Analytic physical outer boundary (CCW polygon, fluid inside):
+    //  A->B bottom (post-shock), B->C wedge Wall, C->D supersonic
+    //  outflow, D->E moving shock, E->A supersonic inflow.
+    u.outer_boundary = vec![
+        line_element(a, b, BCType::Constant(post)),
+        line_element(b, c, BCType::Wall),
+        line_element(c, d, BCType::Constant(pre)),
+        line_element(d, e, BCType::ZerothOrder),
+        line_element(e, a, BCType::Constant(post)),
+    ];
 
     // Initial vertical shock at x=0: post-shock on the left, pre-shock right.
     for i in 0..nx {
@@ -290,10 +330,6 @@ pub fn init_cylinder() -> Field {
 
     let n_arc = 360_usize;
 
-    // First polygon side of the circular Wall range (side i spans
-    // points[i] -> points[i+1], so this equals bc_outer.len() here).
-    let arc_side_start = bc_outer.len();
-
     for k in 1..=n_arc {
         let s =
             k as f64 / n_arc as f64;
@@ -320,15 +356,12 @@ pub fn init_cylinder() -> Field {
         );
 
         bc_outer.push(
-            BCType::ReflectiveWall
+            BCType::Wall
         );
     }
 
-    // Last polygon side of the circular Wall range (inclusive).
-    let arc_side_end = bc_outer.len() - 1;
-
-    // Analytic circular arc overriding the polygon Wall segments.
-    // The three points select the LEFT semicircle of the unit circle.
+    // Analytic circular arc defining the physical cylinder boundary.
+    // The three points select the LEFT arc passing through `mid`.
     let cylinder_arc =
         crate::geometry::CircularArc::from_three_points(
             Point {
@@ -440,7 +473,19 @@ pub fn init_cylinder() -> Field {
         vec![BCType::Wall; 4];
 
     // ============================================================
-    // Construct Field
+    // Analytic physical outer boundary: SIX BoundaryElements.
+    //
+    // The 360 Polygon arc segments above remain ONLY as the domain
+    // classifier / fluid-mask approximation. All physical ghost
+    // boundary geometry (P0, normal, D) and BC ownership now come
+    // from these analytic elements:
+    //
+    //   0. bottom line  (-3,-6) -> (0,-6)        FarField
+    //   1. lower right  (0,-6)  -> (0,-1)        FarField
+    //   2. LEFT semicircle (0,-1) -> (-1,0) -> (0,+1)  cylinder BC
+    //   3. upper right  (0,+1)  -> (0,+6)        FarField
+    //   4. top line     (0,+6)  -> (-3,+6)       FarField
+    //   5. left line    (-3,+6) -> (-3,-6)       FarField
     // ============================================================
 
     let mut u =
@@ -454,17 +499,37 @@ pub fn init_cylinder() -> Field {
             0.0,
         );
 
-    // Register the analytic circular-arc geometry override for the
-    // polygon Wall side range. The Polygon keeps defining the fluid
-    // mask and BC ownership; the arc replaces the boundary geometry
-    // (P0, normal, distance) for ghosts attached to those sides.
-    u.outer_arcs.push(
-        crate::geometry::ArcOverride {
-            side_start: arc_side_start,
-            side_end: arc_side_end,
-            arc: cylinder_arc,
-        }
-    );
+    u.outer_boundary = vec![
+        line_element(
+            Point { x: -3.0, y: -6.0 },
+            Point { x: 0.0, y: -6.0 },
+            BCType::FarField(u_inf),
+        ),
+        line_element(
+            Point { x: 0.0, y: -6.0 },
+            Point { x: 0.0, y: -1.0 },
+            BCType::FarField(u_inf),
+        ),
+        crate::bc1::BoundaryElement {
+            geometry: crate::geometry::BoundaryGeometry::Arc(cylinder_arc),
+            bc: BCType::PrimitiveWall,
+        },
+        line_element(
+            Point { x: 0.0, y: 1.0 },
+            Point { x: 0.0, y: 6.0 },
+            BCType::FarField(u_inf),
+        ),
+        line_element(
+            Point { x: 0.0, y: 6.0 },
+            Point { x: -3.0, y: 6.0 },
+            BCType::FarField(u_inf),
+        ),
+        line_element(
+            Point { x: -3.0, y: 6.0 },
+            Point { x: -3.0, y: -6.0 },
+            BCType::FarField(u_inf),
+        ),
+    ];
 
     // ============================================================
     // Initial condition

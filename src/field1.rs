@@ -77,18 +77,21 @@ pub struct Field {
     pub value: Vec<State>,
     pub outer_bound: Polygon,
     pub inner_bound: Polygon,
+    // LEGACY / domain-compat: BC lists keyed by Polygon side. After the
+    // analytic-boundary refactor these are no longer authoritative for
+    // ghost BCs (use outer_boundary / inner_boundary instead). Kept
+    // because Field::new() and existing initializers still build them.
     pub bc_inner: Vec<BCType>,
     pub bc_outer: Vec<BCType>,
     pub time: f64,
     /// Fluid mask over the Cartesian grid (linear index = i*ny + j),
     /// computed once at construction. `is_in_domain` reads this mask.
     pub fluid: Vec<bool>,
-    /// Analytic circular-arc overrides for selected outer/inner polygon
-    /// side ranges. The Polygon remains authoritative for the domain and
-    /// the fluid mask; the arcs only override boundary geometry
-    /// (P0, normal, distance) for ghosts attached to those sides.
-    pub outer_arcs: Vec<geometry::ArcOverride>,
-    pub inner_arcs: Vec<geometry::ArcOverride>,
+    /// Analytic physical boundary elements (ONE geometry + ONE BC each).
+    /// These are the authoritative physical boundary geometry for ghosts;
+    /// the Polygon above is only the domain classifier / fluid-mask source.
+    pub outer_boundary: Vec<bc1::BoundaryElement>,
+    pub inner_boundary: Vec<bc1::BoundaryElement>,
 }
 
 impl Field {
@@ -130,8 +133,8 @@ impl Field {
             bc_outer: bc_outer,
             time: time,
             fluid: fluid,
-            outer_arcs: Vec::new(),
-            inner_arcs: Vec::new(),
+            outer_boundary: Vec::new(),
+            inner_boundary: Vec::new(),
         }
     }
 
@@ -154,26 +157,9 @@ impl Field {
             bc_outer: self.bc_outer.clone(),
             time: self.time,
             fluid: self.fluid.clone(),
-            outer_arcs: self.outer_arcs.clone(),
-            inner_arcs: self.inner_arcs.clone(),
+            outer_boundary: self.outer_boundary.clone(),
+            inner_boundary: self.inner_boundary.clone(),
         }
-    }
-
-    /// Find the analytic CircularArc overriding the given polygon side,
-    /// if any. Linear search: this is a cold/build-time operation.
-    pub fn arc_for_side(
-        &self,
-        boundary: crate::ghost::BoundaryKind,
-        side_id: usize,
-    ) -> Option<&geometry::CircularArc> {
-        let arcs = match boundary {
-            crate::ghost::BoundaryKind::Outer => &self.outer_arcs,
-            crate::ghost::BoundaryKind::Inner => &self.inner_arcs,
-        };
-
-        arcs.iter()
-            .find(|ov| ov.contains_side(side_id))
-            .map(|ov| &ov.arc)
     }
 
     pub fn is_in_domain(&self, idx: (isize, isize))-> bool {
@@ -260,117 +246,42 @@ impl Field {
 
     // ------------------------------------------------------------
     // Determine outer / inner boundary.
+    //
+    // The Polygon only classifies the domain here; the physical
+    // boundary geometry comes from the analytic BoundaryElements.
     // ------------------------------------------------------------
 
     let outer_fluid =
         self.outer_bound.is_fluid(p);
 
-    let (polygon, bc_list) =
-        if !outer_fluid {
-            (
-                &self.outer_bound,
-                &self.bc_outer,
-            )
-        } else {
-            (
-                &self.inner_bound,
-                &self.bc_inner,
-            )
-        };
-
-    let boundary =
+    let (boundary, elements) =
     if !outer_fluid {
-        crate::ghost::BoundaryKind::Outer
+        (
+            crate::ghost::BoundaryKind::Outer,
+            &self.outer_boundary,
+        )
     } else {
-        crate::ghost::BoundaryKind::Inner
+        (
+            crate::ghost::BoundaryKind::Inner,
+            &self.inner_boundary,
+        )
     };
 
-    // ------------------------------------------------------------
-    // First obtain the closest boundary point P0.
-    //
-    // Do not trust raw_project.normal at a polygon vertex yet.
-    // ------------------------------------------------------------
-
-    let raw_project =
-        geometry::project(
-            polygon,
-            p,
-        );
+    // Analytic boundary lookup: nearest BoundaryElement wins; BC
+    // priority (Wall > ... > FarField) breaks geometric ties at
+    // junctions. Returns the exact analytic Projection {P0, n, D}.
+    let (boundary_id, project) =
+        bc1::find_boundary_element(p, elements);
 
     // ------------------------------------------------------------
-    // Find ALL sides containing P0 and select according to BC
-    // priority.
-    //
-    // In particular:
-    //
-    //       Wall > FarField
-    //
-    // so the two cylinder junctions behave identically.
-    // ------------------------------------------------------------
-
-    let side_id =
-        crate::ghost::select_boundary_side(
-            raw_project.point,
-            polygon,
-            bc_list,
-        );
-
-    // ------------------------------------------------------------
-    // IMPORTANT:
-    //
-    // Final projection: if the selected polygon side belongs to an
-    // analytic CircularArc override, use the exact arc geometry
-    // (closest point, continuous normal, signed distance).
-    //
-    // Otherwise recompute the normal from the SELECTED side.
-    //
-    // Otherwise at a polygon vertex:
-    //
-    //       BC may come from Wall side
-    //       normal may come from FarField side
-    //
-    // which is inconsistent.
-    // ------------------------------------------------------------
-
-    let project =
-    if let Some(arc) =
-        self.arc_for_side(boundary, side_id)
-    {
-        arc.project(p)
-    }
-    else
-    {
-        let normal =
-            polygon.outward_normal_of_side(
-                side_id,
-            );
-
-        let dx =
-            p.x - raw_project.point.x;
-
-        let dy =
-            p.y - raw_project.point.y;
-
-        let distance =
-            dx * normal.x
-            + dy * normal.y;
-
-        geometry::Projection {
-            point: raw_project.point,
-            normal,
-            distance,
-        }
-    };
-
-    // ------------------------------------------------------------
-    // Reconstruct ghost using the BC side that WE selected.
+    // Reconstruct ghost using the selected analytic element's BC.
     // ------------------------------------------------------------
 
     bc1::set_ghost_point_value(
         idx,
         project,
         boundary,
-        side_id,
+        boundary_id,
         self,
         None,
     )

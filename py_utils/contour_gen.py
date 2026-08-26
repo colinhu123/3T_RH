@@ -9,7 +9,10 @@ import matplotlib.pyplot as plt
 # User settings
 # ============================================================
 
-FILE = "data_new/solution_0006.bin"
+# contour_gen.py 位于 py_utils/，数据位于项目根目录的 data_new/
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data_new"
+FILE = DATA_DIR / "solution_0996.bin"
 
 # !!! 改成 constant.rs 中对应的数值 !!!
 GAMMA_E = 5.0 / 3.0

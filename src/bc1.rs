@@ -8,7 +8,8 @@ use crate::{geometry, weno};
 use crate::constant;
 use std::sync::Arc;
 
-const WALL_TAYLOR_ORDER: usize = 0;
+const WALL_TAYLOR_ORDER: usize = 4;
+const OUTFLOW_TAYLOR_ORDER: usize = 0;
 
 // ============================================================================
 // PRIMITIVE-VARIABLE WALL (Euler-equivalent benchmark specialization).
@@ -69,6 +70,7 @@ pub enum BCType {
     Outflow { p_inf: f64, sigma: f64, l_domain: f64 },
     ZerothOrder,
     FarField(State),
+    NonReflective,
 }
 
 // ============================================================================
@@ -89,6 +91,7 @@ pub fn bc_priority(bc: &BCType) -> usize {
         BCType::Constant(_) => 70,
         BCType::TimeDependent(_) => 70,
         BCType::FarField(_) => 20,
+        BCType::NonReflective => 15,
         BCType::Outflow { .. } => 10,
         BCType::ZerothOrder => 5,
         BCType::Periodic => 0,
@@ -1053,6 +1056,34 @@ fn periodic_value(
     field.get(wrapped_idx)
 }
 
+fn robust_outflow_copy(
+    project: geometry::Projection,
+    field: &field1::Field,
+) -> State {
+    let n = project.normal;
+    let h = field.grid.dx.min(field.grid.dy);
+
+    for k in 1..=8 {
+        let s = 0.5 * k as f64 * h;
+
+        let p = geometry::Point {
+            x: project.point.x - s * n.x,
+            y: project.point.y - s * n.y,
+        };
+
+        let idx = field.grid.coord2idx(p);
+
+        if field.is_in_domain(idx) {
+            return field.value[field.linear_index(idx)];
+        }
+    }
+
+    panic!(
+        "cannot find safe interior state for outflow at {:?}",
+        project.point
+    );
+}
+
 pub fn set_ghost_point_value(
     idx:(isize,isize),
     project: geometry::Projection,
@@ -1091,11 +1122,12 @@ pub fn set_ghost_point_value(
     }
 
     if let BCType::ZerothOrder = bc {
-    return zeroth_order_value(
-        idx,
-        project,
-        field,
-    );
+        return robust_outflow_copy(project, field);
+    //return zeroth_order_value(
+    //    idx,
+    //    project,
+    //    field,
+    //);
     }
 
     if let BCType::Periodic = bc {
@@ -1168,6 +1200,15 @@ pub fn set_ghost_point_value(
     };
 
     match bc {
+        BCType::NonReflective => {
+            for i in 0..6 {
+                if lambda[i] < 0.0 {
+                    v[0][i] = 0.0;
+                }
+            }
+
+            state::State::new()
+        }
         BCType::Wall => {
             // ---------------------------------------------------------
             // k = 0: enforce mom_n = 0 (no-penetration), and extrapolate
@@ -1265,6 +1306,7 @@ pub fn set_ghost_point_value(
                 let m_local = (un0 / a).abs(); // TODO: swap for a stored global M_max if you track one
                 let l1 = *sigma * (1.0 - m_local.powi(2)) * a / *l_domain * (p0 - *p_inf);
                 rhs1[0] = l1 / lambda1;
+                println!("Capture subsonic outlet case");
             }
             // else: this boundary point is locally supersonic-out; row 0 is
             // also outgoing there, so leave the WENO-extrapolated value alone.
@@ -1286,7 +1328,7 @@ pub fn set_ghost_point_value(
             let d = project.distance;
             let mut u_ghost = u[0].clone();
             let mut coef = 1.0;
-            for k in 1..=WALL_TAYLOR_ORDER {
+            for k in 1..= OUTFLOW_TAYLOR_ORDER {
                 coef *= d / (k as f64);
                 u_ghost = u_ghost + coef * &u[k];
             }

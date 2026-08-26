@@ -10,7 +10,7 @@ import struct
 # Configuration
 # ============================================================
 
-DATA_DIR = "data_new"
+DATA_DIR = "data"
 FILE_PATTERN = os.path.join(DATA_DIR, "solution_*.bin")
 
 OUTPUT_VIDEO = "density.mp4"

@@ -153,7 +153,7 @@ impl State {
         let ei1 = pi/((constant::GAMMA_I-1.0)*rho);
         let er1 = pr/((constant::GAMMA_R-1.0)*rho);
 
-        let kinetic_share = rho*(u*u + v*v)/66.0;
+        let kinetic_share = rho*(u*u + v*v)/6.0;
         
         Self {
             rho: rho,

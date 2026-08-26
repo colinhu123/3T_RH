@@ -4,7 +4,7 @@ import glob, os, struct
 
 MAGIC=b"RH3TBIN1"
 HEADER=struct.Struct("<8sIIQQd")
-files=sorted(glob.glob("data_new/solution_*.bin"))
+files=sorted(glob.glob("data/solution_*.bin"))
 if not files: raise RuntimeError("No data/solution_*.bin files found")
 
 rows=[]

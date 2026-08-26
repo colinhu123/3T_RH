@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
 use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 
 use crate::bc1;
 use crate::field1::Field;
@@ -155,7 +155,12 @@ impl GhostGrid {
     #[inline(always)]
     pub fn k_for(&self, di: isize, dj: isize) -> usize {
         let k = self.off_map[(di + 4) as usize][(dj + 4) as usize];
-        assert!(k != u8::MAX, "stencil offset ({}, {}) is not registered", di, dj);
+        assert!(
+            k != u8::MAX,
+            "stencil offset ({}, {}) is not registered",
+            di,
+            dj
+        );
         k as usize
     }
 
@@ -179,15 +184,14 @@ impl GhostGrid {
     pub fn update_values(&mut self, field: &Field, _t: f64) {
         for id in 0..self.info.len() {
             let g = &self.info[id];
-            let result =
-                bc1::set_ghost_point_value(
-                    g.idx,
-                    g.project,
-                    g.boundary,
-                    g.boundary_id,
-                    field,
-                    g.bc.as_deref(),
-                );
+            let result = bc1::set_ghost_point_value(
+                g.idx,
+                g.project,
+                g.boundary,
+                g.boundary_id,
+                field,
+                g.bc.as_deref(),
+            );
             self.values[id] = result;
             self.derived[id] = Derived::from_state(result);
         }
@@ -198,10 +202,7 @@ impl GhostGrid {
     /// Each ghost is reconstructed once for the current RK stage, using
     /// its precomputed BC data. Derived quantities are filled in the same
     /// pass. Fail immediately if bc1 produces a non-finite ghost state.
-    pub fn update_values_parallel(
-        &mut self,
-        field: &Field,
-    ) {
+    pub fn update_values_parallel(&mut self, field: &Field) {
         let info = &self.info;
 
         let values = &mut self.values;
@@ -214,15 +215,14 @@ impl GhostGrid {
             .for_each(|(id, (value, dvalue))| {
                 let g = &info[id];
 
-                let result =
-                    bc1::set_ghost_point_value(
-                        g.idx,
-                        g.project,
-                        g.boundary,
-                        g.boundary_id,
-                        field,
-                        g.bc.as_deref(),
-                    );
+                let result = bc1::set_ghost_point_value(
+                    g.idx,
+                    g.project,
+                    g.boundary,
+                    g.boundary_id,
+                    field,
+                    g.bc.as_deref(),
+                );
 
                 // ----------------------------------------------------
                 // bc1 must NEVER return NaN / Inf.
@@ -270,7 +270,9 @@ impl GhostGrid {
     }
 
     pub fn print_summary(&self) {
-        let outer = self.info.iter()
+        let outer = self
+            .info
+            .iter()
             .filter(|g| g.boundary == BoundaryKind::Outer)
             .count();
         println!(
@@ -282,14 +284,9 @@ impl GhostGrid {
     }
 }
 
-
-
-
 /// A point is cached iff a real fluid cell's registered stencil references it
 /// and the referenced point is outside the fluid domain.
-pub fn discover_ghost_indices(field: &Field, offsets: &[Offset])
-    -> Vec<(isize, isize)>
-{
+pub fn discover_ghost_indices(field: &Field, offsets: &[Offset]) -> Vec<(isize, isize)> {
     let mut set = HashSet::<(isize, isize)>::new();
 
     for i in 0..field.grid.nx as isize {
@@ -323,19 +320,27 @@ fn build_ghost_info(
         y: field.grid.y(idx.1),
     };
 
-    // The Polygon only classifies the domain: outside the outer polygon
-    // -> outer boundary; otherwise -> inner excluded region.
+    // The Polygon only classifies the domain. Both checks are explicit:
+    // outside the outer polygon -> outer boundary; inside the interior
+    // obstacle polygon -> inner boundary. A ghost must satisfy exactly
+    // one, so the remaining case is a bug.
     let outer_fluid = field.outer_bound.is_fluid(p);
+    let inner_fluid = field.inner_bound.is_fluid(p);
     let (boundary, elements) = if !outer_fluid {
         (BoundaryKind::Outer, &field.outer_boundary)
-    } else {
+    } else if !inner_fluid {
         (BoundaryKind::Inner, &field.inner_boundary)
+    } else {
+        panic!(
+            "build_ghost_info: ghost idx {:?} p=({:.6e},{:.6e}) is classified \
+             fluid by BOTH polygons (outer and inner)",
+            idx, p.x, p.y,
+        );
     };
 
     // Analytic physical boundary lookup: exact P0 / n / D come from the
     // selected BoundaryElement (Line or Arc), never from Polygon sides.
-    let (boundary_id, project) =
-        bc1::find_boundary_element(p, elements);
+    let (boundary_id, project) = bc1::find_boundary_element(p, elements);
 
     let nearest_idx = bc1::find_nearest_grid_point(project, field);
 
@@ -355,7 +360,9 @@ fn build_ghost_info(
                 bc1::BCType::PrimitiveWall => bc1::PRIMITIVE_WALL_WENO_Q,
                 _ => crate::constant::WENO_Q,
             };
-            Some(Box::new(bc1::precompute_ghost_bc(&project, field, beta_forms, q)))
+            Some(Box::new(bc1::precompute_ghost_bc(
+                &project, field, beta_forms, q,
+            )))
         }
         _ => None,
     };

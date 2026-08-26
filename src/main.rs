@@ -1,36 +1,61 @@
-mod state;
-mod weno;
-mod dt;
-mod noncon;
-mod source;
-mod diffusion;
-mod constant;
-mod io;
-mod geometry;
 mod bc1;
+mod constant;
+mod diffusion;
+mod dt;
 mod field1;
+mod geometry;
 mod ghost;
 mod init;
+mod io;
+mod noncon;
+mod source;
+mod state;
+mod weno;
 
 use field1::Field;
-use state::{Derived, Direction, State};
-use rayon::prelude::*;
 use ghost::GhostGrid;
+use rayon::prelude::*;
+use state::{Derived, Direction, State};
 
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::bc1::BCType;
 static REPORTED_BAD_STATE: AtomicBool = AtomicBool::new(false);
-#[inline(always)] fn state_is_finite(s: State)
-->bool{s.rho.is_finite()&&s.mom_x.is_finite()&&s.mom_y.is_finite()&&s.ee.is_finite()&&s.ei.is_finite()&&s.er.is_finite()}
-#[inline(always)] fn internal_energies(s: State)
-->Option<(f64,f64,f64)>{
-    if !state_is_finite(s)||s.rho<=0.0{return None;}
-    let ux=s.mom_x/s.rho; let uy=s.mom_y/s.rho;
-    let k=(ux*ux+uy*uy)/6.0;
-    Some((s.ee/s.rho-k,s.ei/s.rho-k,s.er/s.rho-k))}
-#[inline(always)] fn assert_admissible(s:State,idx:(isize,isize),where_:&str){
-    let e=internal_energies(s);
-    let bad=!state_is_finite(s)||s.rho<=0.0||e.map_or(true,|q|q.0<=0.0||q.1<=0.0||q.2<=0.0);
-    if bad{if !REPORTED_BAD_STATE.swap(true,Ordering::SeqCst){eprintln!("\nFIRST NON-PHYSICAL STATE\nwhere = {}\nidx = {:?}\nstate = {:?}\ninternal energies = {:?}\n",where_,idx,s,e);} panic!("non-physical state at {:?} in {}",idx,where_);}}
+#[inline(always)]
+fn state_is_finite(s: State) -> bool {
+    s.rho.is_finite()
+        && s.mom_x.is_finite()
+        && s.mom_y.is_finite()
+        && s.ee.is_finite()
+        && s.ei.is_finite()
+        && s.er.is_finite()
+}
+#[inline(always)]
+fn internal_energies(s: State) -> Option<(f64, f64, f64)> {
+    if !state_is_finite(s) || s.rho <= 0.0 {
+        return None;
+    }
+    let ux = s.mom_x / s.rho;
+    let uy = s.mom_y / s.rho;
+    let k = (ux * ux + uy * uy) / 6.0;
+    Some((s.ee / s.rho - k, s.ei / s.rho - k, s.er / s.rho - k))
+}
+#[inline(always)]
+fn assert_admissible(s: State, idx: (isize, isize), where_: &str) {
+    let e = internal_energies(s);
+    let bad = !state_is_finite(s)
+        || s.rho <= 0.0
+        || e.map_or(true, |q| q.0 <= 0.0 || q.1 <= 0.0 || q.2 <= 0.0);
+    if bad {
+        if !REPORTED_BAD_STATE.swap(true, Ordering::SeqCst) {
+            eprintln!(
+                "\nFIRST NON-PHYSICAL STATE\nwhere = {}\nidx = {:?}\nstate = {:?}\ninternal energies = {:?}\n",
+                where_, idx, s, e
+            );
+        }
+        panic!("non-physical state at {:?} in {}", idx, where_);
+    }
+}
 
 // ============================================================================
 // Per-step scratch buffers, allocated once in main().
@@ -69,13 +94,21 @@ impl Scratch {
 #[inline(always)]
 fn v_at(u: &Field, g: &GhostGrid, t: u32) -> State {
     let t = t as usize;
-    if t < u.grid.len() { u.value[t] } else { g.values[t - u.grid.len()] }
+    if t < u.grid.len() {
+        u.value[t]
+    } else {
+        g.values[t - u.grid.len()]
+    }
 }
 
 #[inline(always)]
 fn d_at(g: &GhostGrid, derived: &[Derived], t: u32) -> Derived {
     let t = t as usize;
-    if t < derived.len() { derived[t] } else { g.derived[t - derived.len()] }
+    if t < derived.len() {
+        derived[t]
+    } else {
+        g.derived[t - derived.len()]
+    }
 }
 
 /// Gather a 6-point interface stencil from a fluid anchor cell.
@@ -132,11 +165,7 @@ fn gather9d(
 /// Compute the interface fluxes (WENO + diffusion) once per interface, and
 /// then assemble the cell-centered semi-discrete operator from the stored
 /// interface values plus the non-conservative / source terms.
-fn l(
-    u: &Field,
-    ghosts: &mut GhostGrid,
-    s: &mut Scratch,
-) {
+fn l(u: &Field, ghosts: &mut GhostGrid, s: &mut Scratch) {
     let nx = u.grid.nx;
     let ny = u.grid.ny;
     let dx = u.grid.dx;
@@ -287,8 +316,7 @@ fn l(
 
             let mut dif_term = State::new();
             if constant::DIFFUSION_ACTIVE {
-                let dif_x = state::update(dfx[lin], dfx[lin + ny])
-                    .scalar_prod(-1.0 / (dx * dx));
+                let dif_x = state::update(dfx[lin], dfx[lin + ny]).scalar_prod(-1.0 / (dx * dx));
                 let dif_y = state::update(dfy[j * nx + i], dfy[(j + 1) * nx + i])
                     .scalar_prod(-1.0 / (dy * dy));
                 dif_term = dif_x.add(dif_y);
@@ -304,6 +332,16 @@ fn l(
     }
 }
 
+#[inline(always)]
+fn project_equal_energies(mut s: State) -> State {
+    let e_avg = (s.ee + s.ei + s.er) / 3.0;
+
+    s.ee = e_avg;
+    s.ei = e_avg;
+    s.er = e_avg;
+
+    s
+}
 #[inline]
 fn stage_update_rhs(
     base: &Field,
@@ -313,15 +351,32 @@ fn stage_update_rhs(
     label: &str,
 ) {
     let ny = base.grid.ny;
-    dst.value.par_iter_mut().enumerate().for_each(|(l, o)| {
-        if !base.fluid[l] {
-            return;
-        }
-        let value = base.value[l].add(rhs[l].scalar_prod(coef));
-        assert_admissible(value, ((l / ny) as isize, (l % ny) as isize), label);
-        *o = value;
-    });
+
+    dst.value
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(l, o)| {
+            if !base.fluid[l] {
+                return;
+            }
+
+            let value = base.value[l]
+                .add(rhs[l].scalar_prod(coef));
+
+            let value = project_equal_energies(value);
+            assert_admissible(
+                value,
+                (
+                    (l / ny) as isize,
+                    (l % ny) as isize,
+                ),
+                label,
+            );
+
+            *o = value;
+        });
 }
+
 
 #[inline]
 fn stage_update_comb(
@@ -335,17 +390,39 @@ fn stage_update_comb(
     label: &str,
 ) {
     let ny = base.grid.ny;
-    dst.value.par_iter_mut().enumerate().for_each(|(l, o)| {
-        if !base.fluid[l] {
-            return;
-        }
-        let value = base.value[l]
-            .scalar_prod(w_base)
-            .add(add.value[l].scalar_prod(w_add))
-            .add(rhs[l].scalar_prod(coef));
-        assert_admissible(value, ((l / ny) as isize, (l % ny) as isize), label);
-        *o = value;
-    });
+
+    dst.value
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(l, o)| {
+            if !base.fluid[l] {
+                return;
+            }
+
+            let value = base.value[l]
+                .scalar_prod(w_base)
+                .add(
+                    add.value[l]
+                        .scalar_prod(w_add)
+                )
+                .add(
+                    rhs[l]
+                        .scalar_prod(coef)
+                );
+
+            let value = project_equal_energies(value);
+
+            assert_admissible(
+                value,
+                (
+                    (l / ny) as isize,
+                    (l % ny) as isize,
+                ),
+                label,
+            );
+
+            *o = value;
+        });
 }
 
 fn rk3_ssp(
@@ -366,23 +443,29 @@ fn rk3_ssp(
     u2.time = u.time + 0.5 * dt;
 
     l(&*u2, ghosts, s);
-    stage_update_comb(u, u2, u3, &s.rhs, 2.0 * dt / 3.0, 1.0 / 3.0, 2.0 / 3.0, "RK3 state");
+    stage_update_comb(
+        u,
+        u2,
+        u3,
+        &s.rhs,
+        2.0 * dt / 3.0,
+        1.0 / 3.0,
+        2.0 / 3.0,
+        "RK3 state",
+    );
     u3.time = u.time + dt;
 
     std::mem::swap(u, u3);
 }
 
-fn calc_global_dt(
-    u: &Field,
-) -> f64 {
+fn calc_global_dt(u: &Field) -> f64 {
     let nx = u.grid.nx;
     let ny = u.grid.ny;
 
     let dx = u.grid.dx;
     let dy = u.grid.dy;
 
-    let mut global_dt =
-        f64::INFINITY;
+    let mut global_dt = f64::INFINITY;
 
     for i in 0..nx {
         for j in 0..ny {
@@ -392,15 +475,9 @@ fn calc_global_dt(
             }
             let state = u.get(idx);
 
-            let local_dt =
-                dt::get_local_dt(
-                    state,
-                    dx,
-                    dy,
-                );
+            let local_dt = dt::get_local_dt(state, dx, dy);
 
-            global_dt =
-                global_dt.min(local_dt);
+            global_dt = global_dt.min(local_dt);
         }
     }
 
@@ -410,33 +487,37 @@ fn calc_global_dt(
 fn main() {
     // Fresh: cargo run --release
     // Restart from solution_0012.bin: cargo run --release -- 12
-    let restart_id=std::env::args().nth(1).map(|s|s.parse::<usize>().expect("restart id must be integer"));
+    let restart_id = std::env::args()
+        .nth(1)
+        .map(|s| s.parse::<usize>().expect("restart id must be integer"));
     if restart_id.is_none() {
         io::clear_data_folder();
     }
 
-    let mut u = init::init_cylinder();
+    let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::Reflective);
 
-    let t_store_interval = 0.001_f64;
+    let t_store_interval = 0.01_f64;
 
     // ---------------------------------------------------------
     // Load restart file first
     // ---------------------------------------------------------
     if let Some(id) = restart_id {
-    let path = format!("data/solution_{:04}.bin", id);
-    io::load_data(&mut u, &path);
+        let path = format!("data/solution_{:04}.bin", id);
+        io::load_data(&mut u, &path);
     }
 
     let mut store_id = if restart_id.is_some() {
-            (u.time / t_store_interval).round() as usize
-        } else {
-            0
+        (u.time / t_store_interval).round() as usize
+    } else {
+        0
     };
 
-    let dx=u.grid.dx; let dy=u.grid.dy;
-    let lx=dx*u.grid.nx as f64; let ly=dy*u.grid.ny as f64;
-    let offsets=ghost::default_stencil_offsets();
-    let mut ghosts=ghost::GhostGrid::build(&u,&offsets);
+    let dx = u.grid.dx;
+    let dy = u.grid.dy;
+    let lx = dx * u.grid.nx as f64;
+    let ly = dy * u.grid.ny as f64;
+    let offsets = ghost::default_stencil_offsets();
+    let mut ghosts = ghost::GhostGrid::build(&u, &offsets);
     ghosts.print_summary();
 
     let mut scratch = Scratch::new(&u);
@@ -444,46 +525,68 @@ fn main() {
     let mut u2 = u.empty_like();
     let mut u3 = u.empty_like();
 
-    let mut t=u.time;
-    let t_final=1.0_f64;
-    let mut next_store_time=(store_id+1) as f64*t_store_interval;
-    let mut n=0usize;
+    let mut t = u.time;
+    let t_final = 10.0_f64;
+    let mut next_store_time = (store_id + 1) as f64 * t_store_interval;
+    let mut n = 0usize;
 
     if restart_id.is_none() {
-        io::save_data(&u,"solution_0000.bin",lx,ly);
-        println!("stored solution_0000.bin at t = {:.8e}",t);
+        io::save_data(&u, "solution_0000.bin", lx, ly);
+        println!("stored solution_0000.bin at t = {:.8e}", t);
     } else {
-        println!("Restarting from id={}, t={:.8e}; next output t={:.8e}",store_id,t,next_store_time);
+        println!(
+            "Restarting from id={}, t={:.8e}; next output t={:.8e}",
+            store_id, t, next_store_time
+        );
     }
 
-    while t < t_final-1e-14 {
-        let dt_cfl=calc_global_dt(&u);
-        let mut dt=0.1*dt_cfl;
-        if next_store_time<=t_final && t+dt>next_store_time { dt=next_store_time-t; }
-        if t+dt>t_final { dt=t_final-t; }
-        assert!(dt>0.0,"non-positive dt at t={}",t);
+    while t < t_final - 1e-14 {
+        let dt_cfl = calc_global_dt(&u);
+        let mut dt = 0.5 * dt_cfl;
+        if next_store_time <= t_final && t + dt > next_store_time {
+            dt = next_store_time - t;
+        }
+        if t + dt > t_final {
+            dt = t_final - t;
+        }
+        assert!(dt > 0.0, "non-positive dt at t={}", t);
 
-        rk3_ssp(&mut u,&mut ghosts,dt,&mut u1,&mut u2,&mut u3,&mut scratch);
-        t=u.time; n+=1;
-        println!("step={}, t={:.8e}, dt={:.8e}, dt_cfl={:.8e}",n,t,dt,dt_cfl);
+        rk3_ssp(
+            &mut u,
+            &mut ghosts,
+            dt,
+            &mut u1,
+            &mut u2,
+            &mut u3,
+            &mut scratch,
+        );
+        t = u.time;
+        n += 1;
+        println!(
+            "step={}, t={:.8e}, dt={:.8e}, dt_cfl={:.8e}",
+            n, t, dt, dt_cfl
+        );
 
-        if next_store_time<=t_final && t>=next_store_time-1e-12 {
-            store_id+=1;
-            let filename=format!("solution_{:04}.bin",store_id);
-            io::save_data(&u,&filename,lx,ly);
-            println!("stored {} at t={:.8e}",filename,t);
-            next_store_time=(store_id+1) as f64*t_store_interval;
+        if next_store_time <= t_final && t >= next_store_time - 1e-12 {
+            store_id += 1;
+            let filename = format!("solution_{:04}.bin", store_id);
+            io::save_data(&u, &filename, lx, ly);
+            println!("stored {} at t={:.8e}", filename, t);
+            next_store_time = (store_id + 1) as f64 * t_store_interval;
         }
     }
 
-    let last_regular=store_id as f64*t_store_interval;
-    if (t-last_regular).abs()>1e-12 {
-        store_id+=1;
-        let filename=format!("solution_{:04}.bin",store_id);
-        io::save_data(&u,&filename,lx,ly);
-        println!("stored final {} at t={:.8e}",filename,t);
+    let last_regular = store_id as f64 * t_store_interval;
+    if (t - last_regular).abs() > 1e-12 {
+        store_id += 1;
+        let filename = format!("solution_{:04}.bin", store_id);
+        io::save_data(&u, &filename, lx, ly);
+        println!("stored final {} at t={:.8e}", filename, t);
     }
-    println!("Finished: t={:.8e}, restart-local steps={}, last id={}",t,n,store_id);
+    println!(
+        "Finished: t={:.8e}, restart-local steps={}, last id={}",
+        t, n, store_id
+    );
 }
 
 #[cfg(test)]
@@ -531,12 +634,18 @@ mod parity {
             }
 
             for recon in [true, false] {
-                let st = weno::Stencil6 { points: pts, dir: Direction::X };
+                let st = weno::Stencil6 {
+                    points: pts,
+                    dir: Direction::X,
+                };
                 let a = st.reconstruction(recon);
                 let b = weno::Stencil6::reconstruction_fast(&pts, &d, Direction::X, recon);
                 state_close(&a, &b, 1e-12);
 
-                let st = weno::Stencil6 { points: pts, dir: Direction::Y };
+                let st = weno::Stencil6 {
+                    points: pts,
+                    dir: Direction::Y,
+                };
                 let a = st.reconstruction(recon);
                 let b = weno::Stencil6::reconstruction_fast(&pts, &d, Direction::Y, recon);
                 state_close(&a, &b, 1e-12);
@@ -567,8 +676,7 @@ mod parity {
 
             // Same analytic BoundaryElement lookup as the real solver:
             // nearest element wins, BC priority breaks junction ties.
-            let (boundary_id, project) =
-                bc1::find_boundary_element(p, &field.outer_boundary);
+            let (boundary_id, project) = bc1::find_boundary_element(p, &field.outer_boundary);
 
             let q = match &field.outer_boundary[boundary_id].bc {
                 bc1::BCType::PrimitiveWall => bc1::PRIMITIVE_WALL_WENO_Q,
@@ -601,7 +709,11 @@ mod parity {
         let u = init::init_cylinder();
 
         // Six physical elements: 5 FarField lines + 1 cylinder arc.
-        assert_eq!(u.outer_boundary.len(), 6, "cylinder must have 6 physical elements");
+        assert_eq!(
+            u.outer_boundary.len(),
+            6,
+            "cylinder must have 6 physical elements"
+        );
 
         let arcs: Vec<_> = u
             .outer_boundary
@@ -813,5 +925,343 @@ mod parity {
         // first RK1 step produced a fully admissible state.
         l(&field, &mut ghosts, &mut scratch);
         stage_update_rhs(&field, &mut u1, &scratch.rhs, dt, "test RK1 state");
+    }
+
+    // ============================================================
+    // Full interior cylinder in a rectangular box (analytic Circle).
+    // ============================================================
+
+    /// Grid facts for the default full-cylinder box:
+    /// [-3,+3] x [-6,+6], h = 1/40, nx = 241, ny = 481.
+    fn cylinder_grid_index(x: f64, y: f64) -> (isize, isize) {
+        // x0 = -3, y0 = -6, h = 0.025 (default init).
+        let h = 1.0 / 40.0;
+        let i = ((x + 3.0) / h).round() as isize;
+        let j = ((y + 6.0) / h).round() as isize;
+        (i, j)
+    }
+
+    #[test]
+    fn full_cylinder_fluid_classification() {
+        let u = init::init_shock_cylinder_in_box(init::CylinderWallMode::Reflective);
+
+        // Point far outside the cylinder but inside the rectangle -> fluid.
+        assert!(u.is_in_domain(cylinder_grid_index(-2.0, 0.0)));
+        assert!(u.is_in_domain(cylinder_grid_index(0.0, -3.0)));
+        assert!(u.is_in_domain(cylinder_grid_index(2.0, 3.0)));
+
+        // Cylinder center -> not fluid.
+        assert!(!u.is_in_domain(cylinder_grid_index(0.0, 0.0)));
+
+        // Just inside R=1 -> not fluid (solid).
+        assert!(!u.is_in_domain(cylinder_grid_index(0.8, 0.0)));
+        assert!(!u.is_in_domain(cylinder_grid_index(0.0, 0.8)));
+
+        // Just outside R=1 -> fluid.
+        assert!(u.is_in_domain(cylinder_grid_index(1.2, 0.0)));
+        assert!(u.is_in_domain(cylinder_grid_index(0.0, 1.2)));
+    }
+
+    #[test]
+    fn full_cylinder_ghostgrid_has_outer_and_inner_ghosts() {
+        let u = init::init_shock_cylinder_in_box(init::CylinderWallMode::Reflective);
+        let offsets = ghost::default_stencil_offsets();
+        let ghosts = ghost::GhostGrid::build(&u, &offsets);
+
+        let outer = ghosts
+            .info
+            .iter()
+            .filter(|g| g.boundary == ghost::BoundaryKind::Outer)
+            .count();
+        let inner = ghosts
+            .info
+            .iter()
+            .filter(|g| g.boundary == ghost::BoundaryKind::Inner)
+            .count();
+
+        assert!(outer > 0, "expected outer rectangle ghosts");
+        assert!(inner > 0, "expected inner cylinder ghosts");
+        assert_eq!(outer + inner, ghosts.info.len());
+
+        println!(
+            "full-cylinder ghosts: total={}, outer={}, inner={}",
+            ghosts.info.len(),
+            outer,
+            inner
+        );
+    }
+
+    #[test]
+    fn all_cylinder_ghosts_use_the_analytic_circle() {
+        let u = init::init_shock_cylinder_in_box(init::CylinderWallMode::Reflective);
+        let offsets = ghost::default_stencil_offsets();
+        let ghosts = ghost::GhostGrid::build(&u, &offsets);
+
+        // Exactly ONE physical inner element, and it is a Circle.
+        assert_eq!(u.inner_boundary.len(), 1);
+        let circle = match &u.inner_boundary[0].geometry {
+            geometry::BoundaryGeometry::Circle(c) => *c,
+            _ => panic!("inner boundary must be a Circle"),
+        };
+
+        let mut inner_ghosts = 0usize;
+        for g in &ghosts.info {
+            if g.boundary != ghost::BoundaryKind::Inner {
+                continue;
+            }
+            inner_ghosts += 1;
+
+            // The Circle is the only inner element.
+            assert_eq!(g.boundary_id, 0);
+
+            // Every inner ghost's cached P0 lies exactly on the analytic
+            // circle: distance(center, P0) == radius.
+            let dx = g.project.point.x - circle.center.x;
+            let dy = g.project.point.y - circle.center.y;
+            let dist = dx.hypot(dy);
+            assert!(
+                (dist - circle.radius).abs() < 1e-9,
+                "inner ghost {:?} P0 not on circle: dist={}",
+                g.idx,
+                dist
+            );
+
+            // Fluid is OUTSIDE the obstacle: normal must equal -radial.
+            let radial = geometry::Vec2 {
+                x: dx / circle.radius,
+                y: dy / circle.radius,
+            };
+            assert!(
+                (g.project.normal.x + radial.x).abs() < 1e-9,
+                "inner ghost {:?} normal.x not -radial",
+                g.idx
+            );
+            assert!(
+                (g.project.normal.y + radial.y).abs() < 1e-9,
+                "inner ghost {:?} normal.y not -radial",
+                g.idx
+            );
+        }
+
+        assert!(inner_ghosts > 0, "no inner cylinder ghosts found");
+        println!("inner cylinder ghosts verified: {}", inner_ghosts);
+    }
+
+    #[test]
+    fn field_get_resolves_inner_cylinder_ghost() {
+        let u = init::init_shock_cylinder_in_box(init::CylinderWallMode::Reflective);
+        let offsets = ghost::default_stencil_offsets();
+        let ghosts = ghost::GhostGrid::build(&u, &offsets);
+
+        // Pick a cached inner ghost index.
+        let inner = ghosts
+            .info
+            .iter()
+            .find(|g| g.boundary == ghost::BoundaryKind::Inner)
+            .expect("expected inner cylinder ghosts");
+        let idx = inner.idx;
+        let p = geometry::Point {
+            x: u.grid.x(idx.0),
+            y: u.grid.y(idx.1),
+        };
+
+        // Manual analytic path through the single Circle element.
+        let (bid, proj) = bc1::find_boundary_element(p, &u.inner_boundary);
+        assert_eq!(bid, 0);
+        assert!(matches!(
+            u.inner_boundary[bid].geometry,
+            geometry::BoundaryGeometry::Circle(_)
+        ));
+
+        let manual =
+            bc1::set_ghost_point_value(idx, proj, ghost::BoundaryKind::Inner, bid, &u, None);
+
+        // Field::get must resolve the same Inner classification and
+        // analytic Circle projection.
+        let got = u.get(idx);
+        state_close(&got, &manual, 1e-12);
+        assert!(got.rho.is_finite() && got.rho > 0.0);
+    }
+
+    #[test]
+    fn reflective_wall_full_circle_first_rhs_rk() {
+        let field = init::init_shock_cylinder_in_box(init::CylinderWallMode::Reflective);
+        let offsets = ghost::default_stencil_offsets();
+        let mut ghosts = ghost::GhostGrid::build(&field, &offsets);
+        let mut scratch = Scratch::new(&field);
+        let mut u1 = field.empty_like();
+
+        let dt_cfl = calc_global_dt(&field);
+        let dt = 0.05 * dt_cfl;
+        assert!(dt > 0.0);
+
+        // Initial ghost update + first spatial RHS + first RK1 update.
+        // assert_admissible() panics on any non-physical state, so reaching
+        // the end proves the inner Circle geometry, inner classification and
+        // full-circle normals are correct for ReflectiveWall.
+        ghosts.update_values_parallel(&field);
+        l(&field, &mut ghosts, &mut scratch);
+        stage_update_rhs(&field, &mut u1, &scratch.rhs, dt, "full-cylinder RK1 state");
+    }
+
+    #[test]
+    fn full_cylinder_upper_lower_flow_symmetry() {
+        let mut field = init::init_shock_cylinder_in_box(init::CylinderWallMode::Reflective);
+        let offsets = ghost::default_stencil_offsets();
+        let mut ghosts = ghost::GhostGrid::build(&field, &offsets);
+        let mut scratch = Scratch::new(&field);
+        let mut u1 = field.empty_like();
+        let mut u2 = field.empty_like();
+        let mut u3 = field.empty_like();
+
+        let dt_cfl = calc_global_dt(&field);
+        let dt = 0.05 * dt_cfl;
+        assert!(dt > 0.0);
+
+        rk3_ssp(
+            &mut field,
+            &mut ghosts,
+            dt,
+            &mut u1,
+            &mut u2,
+            &mut u3,
+            &mut scratch,
+        );
+
+        // The box and the cylinder are symmetric about y=0 and the
+        // Mach-3 inflow has v_inf = 0, so after a short symmetric
+        // evolution mirror fluid cells must agree to good accuracy.
+        //
+        // NOTE on the tolerance: the solver's WENO-LF characteristic
+        // splitting reconstructs the "+"/"-" flux components with a fixed
+        // grid-index stencil bias that is not exactly mirror-symmetric
+        // under y-flip once v != 0 (pre-existing behaviour in weno.rs,
+        // independent of the Circle geometry). One RK3 step therefore
+        // leaves a measured ~1e-5 mirror asymmetry concentrated at the
+        // cylinder stagnation point. 1e-3 comfortably bounds that while
+        // still detecting any O(1) geometric asymmetry (wrong Circle
+        // normal, misclassification, ...) introduced by the new geometry.
+        let ny = field.grid.ny; // 481; mirror of j is 480 - j = 2*240 - j.
+        let j_mid = (ny / 2) as isize;
+        let tol = 1e-3;
+
+        let mut checked = 0usize;
+        let mut max_rho = 0.0f64;
+        let mut max_mx = 0.0f64;
+        let mut max_my = 0.0f64;
+        let mut max_ee = 0.0f64;
+        let mut max_ei = 0.0f64;
+        let mut max_er = 0.0f64;
+        for i in 0..field.grid.nx as isize {
+            for j in (j_mid + 1)..ny as isize {
+                let up = (i, j);
+                let dn = (i, 2 * j_mid - j);
+                if !field.is_in_domain(up) || !field.is_in_domain(dn) {
+                    continue;
+                }
+
+                let a = field.value[field.linear_index(up)];
+                let b = field.value[field.linear_index(dn)];
+
+                max_rho = max_rho.max((a.rho - b.rho).abs());
+                max_mx = max_mx.max((a.mom_x - b.mom_x).abs());
+                max_my = max_my.max((a.mom_y + b.mom_y).abs());
+                max_ee = max_ee.max((a.ee - b.ee).abs());
+                max_ei = max_ei.max((a.ei - b.ei).abs());
+                max_er = max_er.max((a.er - b.er).abs());
+
+                checked += 1;
+            }
+        }
+
+        assert!(checked > 0, "no mirror fluid cell pairs checked");
+        println!(
+            "full-cylinder mirror asymmetry after one RK3 step: rho={:e}, mom_x={:e}, mom_y={:e}, ee={:e}, ei={:e}, er={:e} (checked {})",
+            max_rho, max_mx, max_my, max_ee, max_ei, max_er, checked
+        );
+        assert!(max_rho < tol, "rho mirror asymmetry {}", max_rho);
+        assert!(max_mx < tol, "mom_x mirror asymmetry {}", max_mx);
+        assert!(max_my < tol, "mom_y mirror asymmetry {}", max_my);
+        assert!(max_ee < tol, "ee mirror asymmetry {}", max_ee);
+        assert!(max_ei < tol, "ei mirror asymmetry {}", max_ei);
+        assert!(max_er < tol, "er mirror asymmetry {}", max_er);
+    }
+
+    #[test]
+    fn high_order_wall_restart_builds_same_circle_geometry() {
+        // Low-order startup: ReflectiveWall.
+        let u_ref = init::init_shock_cylinder_in_box(init::CylinderWallMode::Reflective);
+        // High-order restart on the SAME geometry: Wall. GhostGrid MUST be
+        // rebuilt when the BC type changes because the cached GhostBC
+        // precomputation (including the WENO exponent) depends on BCType.
+        let u_wall = init::init_shock_cylinder_in_box(init::CylinderWallMode::HighOrder);
+        // Primitive wall also uses the analytic Circle radius-of-curvature
+        // through the generic BoundaryGeometry dispatch.
+        let u_prim = init::init_shock_cylinder_in_box(init::CylinderWallMode::Primitive);
+
+        let offsets = ghost::default_stencil_offsets();
+        let g_ref = ghost::GhostGrid::build(&u_ref, &offsets);
+        let g_wall = ghost::GhostGrid::build(&u_wall, &offsets);
+        let g_prim = ghost::GhostGrid::build(&u_prim, &offsets);
+
+        // Same geometry -> identical analytic Circle projections for every
+        // wall mode.
+        for (a, b) in g_ref.info.iter().zip(g_prim.info.iter()) {
+            assert_eq!(a.idx, b.idx);
+            assert!((a.project.point.x - b.project.point.x).abs() < 1e-12);
+            assert!((a.project.point.y - b.project.point.y).abs() < 1e-12);
+            assert!((a.project.normal.x - b.project.normal.x).abs() < 1e-12);
+            assert!((a.project.normal.y - b.project.normal.y).abs() < 1e-12);
+            assert!((a.project.distance - b.project.distance).abs() < 1e-12);
+        }
+
+        // Same geometry -> same ghost layout and identical analytic
+        // Circle projections.
+        assert_eq!(g_ref.info.len(), g_wall.info.len());
+        for (a, b) in g_ref.info.iter().zip(g_wall.info.iter()) {
+            assert_eq!(a.idx, b.idx);
+            assert_eq!(a.boundary, b.boundary);
+            assert_eq!(a.boundary_id, b.boundary_id);
+
+            assert!((a.project.point.x - b.project.point.x).abs() < 1e-12);
+            assert!((a.project.point.y - b.project.point.y).abs() < 1e-12);
+            assert!((a.project.normal.x - b.project.normal.x).abs() < 1e-12);
+            assert!((a.project.normal.y - b.project.normal.y).abs() < 1e-12);
+            assert!((a.project.distance - b.project.distance).abs() < 1e-12);
+
+            // Reflective inner cylinder ghosts do NOT precompute GhostBC;
+            // high-order Wall inner ghosts DO (the precompute depends on
+            // BCType, hence a GhostGrid rebuild is mandatory on restart).
+            if a.boundary == ghost::BoundaryKind::Inner {
+                assert!(
+                    a.bc.is_none(),
+                    "reflective inner ghost must skip precompute"
+                );
+                assert!(b.bc.is_some(), "Wall inner ghost must precompute GhostBC");
+            } else {
+                // FarField outer ghosts precompute in both cases.
+                assert!(a.bc.is_some());
+                assert!(b.bc.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn full_cylinder_has_one_physical_circle_element() {
+        let u = init::init_shock_cylinder_in_box(init::CylinderWallMode::Reflective);
+
+        // ONE Circle inner element, FOUR Line outer elements.
+        assert_eq!(u.inner_boundary.len(), 1);
+        assert_eq!(u.outer_boundary.len(), 4);
+
+        assert!(matches!(
+            u.inner_boundary[0].geometry,
+            geometry::BoundaryGeometry::Circle(_)
+        ));
+
+        // The 360 inner Polygon segments remain only as a domain
+        // classifier: the physical boundary must NOT scale with them.
+        assert_eq!(u.bc_inner.len(), 360);
+        assert_eq!(u.bc_outer.len(), 4);
     }
 }

@@ -1,4 +1,3 @@
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
     pub x: f64,
@@ -32,11 +31,7 @@ pub fn point_on_segment(p: Point, a: Point, b: Point, eps: f64) -> bool {
         && p.y <= a.y.max(b.y) + eps
 }
 
-pub fn find_boundary_sides(
-    p: Point,
-    polygon: &Polygon,
-    eps: f64,
-) -> Vec<usize> {
+pub fn find_boundary_sides(p: Point, polygon: &Polygon, eps: f64) -> Vec<usize> {
     let n = polygon.points.len();
     let pts = &polygon.points;
 
@@ -86,24 +81,22 @@ impl Vec2 {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Projection {
-    pub point: Point,    // P0
-    pub normal: Vec2,    // fluid-domain outward normal
-    pub distance: f64,  // D = (P - P0) dot n
+    pub point: Point,  // P0
+    pub normal: Vec2,  // fluid-domain outward normal
+    pub distance: f64, // D = (P - P0) dot n
 }
 
 impl Projection {
-    
-
-    pub fn gloabl2local_coord(&self,p: Point) -> (f64, f64) {
+    pub fn gloabl2local_coord(&self, p: Point) -> (f64, f64) {
         let p0 = self.point;
         let normal = self.normal;
         let dx = p.x - p0.x;
         let dy = p.y - p0.y;
 
-        let nor = normal.x*dx + normal.y*dy;
-        let tan = -dx*normal.y + dy*normal.x;
+        let nor = normal.x * dx + normal.y * dy;
+        let tan = -dx * normal.y + dy * normal.x;
 
-        (nor,tan)
+        (nor, tan)
     }
 }
 
@@ -118,10 +111,7 @@ pub trait Geometry {
     fn normal(&self, p0: Point) -> Vec2;
 }
 
-pub fn project<G: Geometry + ?Sized>(
-    geom: &G,
-    p: Point,
-) -> Projection {
+pub fn project<G: Geometry + ?Sized>(geom: &G, p: Point) -> Projection {
     let p0 = geom.closest_point(p);
     let n = geom.normal(p0);
 
@@ -149,7 +139,7 @@ pub struct Polygon {
 }
 
 impl Polygon {
-    pub fn new(points: Vec<Point>,fluid_side: FluidSide) -> Self {
+    pub fn new(points: Vec<Point>, fluid_side: FluidSide) -> Self {
         Self {
             points: points,
             fluid: fluid_side,
@@ -209,10 +199,7 @@ impl Polygon {
         dx * dx + dy * dy
     }
 
-    pub fn outward_normal_of_side(
-        &self,
-        side: usize,
-    ) -> Vec2 {
+    pub fn outward_normal_of_side(&self, side: usize) -> Vec2 {
         let n = self.points.len();
 
         let a = self.points[side];
@@ -227,39 +214,46 @@ impl Polygon {
 
         let left = Vec2 {
             x: -ty / len,
-            y:  tx / len,
+            y: tx / len,
         };
 
         let right = Vec2 {
-            x:  ty / len,
+            x: ty / len,
             y: -tx / len,
         };
 
-        let ccw =
-            self.signed_area2() > 0.0;
+        let ccw = self.signed_area2() > 0.0;
 
         match self.fluid {
             FluidSide::Inside => {
-                if ccw { right } else { left }
+                if ccw {
+                    right
+                } else {
+                    left
+                }
             }
 
             FluidSide::Outside => {
-                if ccw { left } else { right }
+                if ccw {
+                    left
+                } else {
+                    right
+                }
             }
         }
     }
 }
 
 impl Geometry for Polygon {
-    fn is_fluid(&self, p: Point)-> bool{
+    fn is_fluid(&self, p: Point) -> bool {
         let n = self.points.len();
-        if n< 3 {
-            return false
+        if n < 3 {
+            return false;
         }
         let mut inside = false;
         for i in 0..n {
             let a = self.points[i];
-            let b = self.points[(i+1)%n];
+            let b = self.points[(i + 1) % n];
             let crosses = (a.y > p.y) != (b.y > p.y);
 
             if crosses {
@@ -322,10 +316,7 @@ impl Geometry for Polygon {
          * For a clockwise polygon, this is reversed.
          */
         let area2 = self.signed_area2();
-        assert!(
-            area2.abs() > 1e-14,
-            "Degenerate polygon has zero area"
-        );
+        assert!(area2.abs() > 1e-14, "Degenerate polygon has zero area");
 
         let ccw = area2 > 0.0;
 
@@ -354,10 +345,7 @@ impl Geometry for Polygon {
 
         let tangent_norm = tx.hypot(ty);
 
-        assert!(
-            tangent_norm > 1e-14,
-            "Degenerate polygon edge"
-        );
+        assert!(tangent_norm > 1e-14, "Degenerate polygon edge");
 
         /*
          * Left-hand normal:
@@ -370,7 +358,7 @@ impl Geometry for Polygon {
          */
         let left = Vec2 {
             x: -ty / tangent_norm,
-            y:  tx / tangent_norm,
+            y: tx / tangent_norm,
         };
 
         let right = Vec2 {
@@ -419,6 +407,118 @@ impl Geometry for Polygon {
         }
     }
 }
+/// Analytic COMPLETE circular boundary geometry (no endpoints).
+///
+/// Unlike CircularArc a complete circle has no start/end: the closest
+/// point is always the radial projection and no endpoint clamping or
+/// angle checks are performed.
+///
+/// The `fluid` field determines the FLUID-DOMAIN outward normal:
+///
+///     FluidSide::Inside  -> normal = +radial
+///     FluidSide::Outside -> normal = -radial
+///
+/// For an interior solid cylinder obstacle (fluid outside the disk),
+/// use `FluidSide::Outside`, which makes the outward fluid normal point
+/// from the fluid across the wall toward the cylinder center.
+#[derive(Clone, Copy, Debug)]
+pub struct Circle {
+    pub center: Point,
+    pub radius: f64,
+
+    /// Determines the fluid-domain outward normal.
+    pub fluid: FluidSide,
+}
+
+impl Circle {
+    pub fn new(center: Point, radius: f64, fluid: FluidSide) -> Self {
+        assert!(
+            radius > 0.0,
+            "Circle radius must be positive (got {})",
+            radius
+        );
+
+        Self {
+            center,
+            radius,
+            fluid,
+        }
+    }
+
+    /// Exact closest point on the complete circle.
+    ///
+    /// Let r = p - center, rmag = |r|. For a nondegenerate point the
+    /// closest point is P0 = center + radius * (r / rmag). A complete
+    /// circle has no endpoints, so there are no angle checks and no
+    /// endpoint clamping.
+    pub fn closest_point(&self, p: Point) -> Point {
+        let rx = p.x - self.center.x;
+        let ry = p.y - self.center.y;
+        let rmag = rx.hypot(ry);
+
+        assert!(
+            rmag > 1e-14,
+            "Circle::closest_point: query point coincides with the circle center; \
+             the closest point on a complete circle is not unique"
+        );
+
+        let s = self.radius / rmag;
+
+        Point {
+            x: self.center.x + s * rx,
+            y: self.center.y + s * ry,
+        }
+    }
+
+    /// FLUID-DOMAIN outward normal at a point on the circle.
+    ///
+    /// Projection.normal in this solver means the OUTWARD NORMAL OF THE
+    /// FLUID DOMAIN:
+    ///
+    ///     FluidSide::Inside  -> normal = +radial
+    ///     FluidSide::Outside -> normal = -radial
+    pub fn outward_normal(&self, p0: Point) -> Vec2 {
+        let dx = p0.x - self.center.x;
+        let dy = p0.y - self.center.y;
+        let nrm = dx.hypot(dy);
+
+        assert!(
+            nrm > 1e-14,
+            "Circle::outward_normal: point coincides with the circle center"
+        );
+
+        let radial = Vec2 {
+            x: dx / nrm,
+            y: dy / nrm,
+        };
+
+        match self.fluid {
+            FluidSide::Inside => radial,
+            FluidSide::Outside => Vec2 {
+                x: -radial.x,
+                y: -radial.y,
+            },
+        }
+    }
+
+    /// Exact projection: P0 = closest point, n = fluid outward normal,
+    /// D = (p - P0) . n, matching the existing Projection convention.
+    pub fn project(&self, p: Point) -> Projection {
+        let p0 = self.closest_point(p);
+        let n = self.outward_normal(p0);
+
+        let dx = p.x - p0.x;
+        let dy = p.y - p0.y;
+
+        let distance = dx * n.x + dy * n.y;
+
+        Projection {
+            point: p0,
+            normal: n,
+            distance,
+        }
+    }
+}
 
 // ============================================================================
 // Analytic circular arc boundary geometry.
@@ -456,13 +556,7 @@ pub struct CircularArc {
 
 impl CircularArc {
     /// Canonical low-level constructor.
-    pub fn new(
-        center: Point,
-        radius: f64,
-        theta_start: f64,
-        sweep: f64,
-        fluid: FluidSide,
-    ) -> Self {
+    pub fn new(center: Point, radius: f64, theta_start: f64, sweep: f64, fluid: FluidSide) -> Self {
         assert!(radius > 0.0, "CircularArc radius must be positive");
         assert!(
             sweep.abs() > ARC_ANGLE_TOL,
@@ -489,12 +583,7 @@ impl CircularArc {
     /// The three points are used ONLY for construction: afterwards the
     /// arc is fully described by the canonical (center, radius,
     /// theta_start, sweep, fluid) representation.
-    pub fn from_three_points(
-        start: Point,
-        mid: Point,
-        end: Point,
-        fluid: FluidSide,
-    ) -> Self {
+    pub fn from_three_points(start: Point, mid: Point, end: Point, fluid: FluidSide) -> Self {
         let (x1, y1) = (start.x, start.y);
         let (x2, y2) = (mid.x, mid.y);
         let (x3, y3) = (end.x, end.y);
@@ -551,11 +640,9 @@ impl CircularArc {
     /// True if polar angle `theta` lies on the finite arc.
     pub fn contains_angle(&self, theta: f64) -> bool {
         if self.sweep > 0.0 {
-            normalize_angle(theta - self.theta_start)
-                <= self.sweep + ARC_ANGLE_TOL
+            normalize_angle(theta - self.theta_start) <= self.sweep + ARC_ANGLE_TOL
         } else {
-            normalize_angle(self.theta_start - theta)
-                <= -self.sweep + ARC_ANGLE_TOL
+            normalize_angle(self.theta_start - theta) <= -self.sweep + ARC_ANGLE_TOL
         }
     }
 
@@ -668,11 +755,7 @@ pub struct LineSegment {
 }
 
 impl LineSegment {
-    pub fn new(
-        start: Point,
-        end: Point,
-        normal: Vec2,
-    ) -> Self {
+    pub fn new(start: Point, end: Point, normal: Vec2) -> Self {
         let len = (end.x - start.x).hypot(end.y - start.y);
         assert!(len > 1e-14, "LineSegment must have nonzero length");
 
@@ -732,6 +815,7 @@ impl LineSegment {
 pub enum BoundaryGeometry {
     Line(LineSegment),
     Arc(CircularArc),
+    Circle(Circle),
 }
 
 impl BoundaryGeometry {
@@ -739,6 +823,7 @@ impl BoundaryGeometry {
         match self {
             BoundaryGeometry::Line(l) => l.closest_point(p),
             BoundaryGeometry::Arc(a) => a.closest_point(p),
+            BoundaryGeometry::Circle(c) => c.closest_point(p),
         }
     }
 
@@ -746,16 +831,18 @@ impl BoundaryGeometry {
         match self {
             BoundaryGeometry::Line(l) => l.project(p),
             BoundaryGeometry::Arc(a) => a.project(p),
+            BoundaryGeometry::Circle(c) => c.project(p),
         }
     }
 
     /// Local radius of curvature for the primitive curved-wall condition.
     ///
-    /// Lines: +infinity (curvature 0). Arcs: |R| = arc radius.
+    /// Lines: +infinity (curvature 0). Arcs / Circles: |R| = radius.
     pub fn radius_of_curvature(&self, _p0: Point) -> f64 {
         match self {
             BoundaryGeometry::Line(_) => f64::INFINITY,
             BoundaryGeometry::Arc(a) => a.radius,
+            BoundaryGeometry::Circle(c) => c.radius,
         }
     }
 }
@@ -969,10 +1056,222 @@ mod arc_tests {
             Point { x: 1.0, y: 0.0 },
             Vec2 { x: 0.0, y: -1.0 },
         );
-        assert!(
-            BoundaryGeometry::Line(line)
-                .radius_of_curvature(Point { x: 0.5, y: 0.0 })
-                .is_infinite()
+        assert!(BoundaryGeometry::Line(line)
+            .radius_of_curvature(Point { x: 0.5, y: 0.0 })
+            .is_infinite());
+    }
+}
+
+// ============================================================
+// Complete-Circle analytic boundary tests.
+//
+// Convention under test: Projection.normal is the OUTWARD NORMAL OF
+// THE FLUID DOMAIN. For an interior solid cylinder (fluid OUTSIDE the
+// disk) the outward fluid normal is -radial, i.e.
+//
+//     P0=(-1,0) -> n=(+1,0)
+//     P0=(+1,0) -> n=(-1,0)
+//     P0=(0,+1) -> n=(0,-1)
+//     P0=(0,-1) -> n=(0,+1)
+//
+// and D = (p-P0).n is negative on the fluid side, positive on the
+// solid side (inner-cylinder ghosts).
+// ============================================================
+#[cfg(test)]
+mod circle_tests {
+    use super::*;
+    use std::f64::consts::FRAC_1_SQRT_2;
+
+    fn unit_circle_outside() -> Circle {
+        Circle::new(Point { x: 0.0, y: 0.0 }, 1.0, FluidSide::Outside)
+    }
+
+    fn assert_close_point(a: Point, bx: f64, by: f64) {
+        assert!((a.x - bx).abs() < 1e-12, "P0.x={} != {}", a.x, bx);
+        assert!((a.y - by).abs() < 1e-12, "P0.y={} != {}", a.y, by);
+    }
+
+    fn assert_close_vec(a: Vec2, bx: f64, by: f64) {
+        assert!((a.x - bx).abs() < 1e-12, "n.x={} != {}", a.x, bx);
+        assert!((a.y - by).abs() < 1e-12, "n.y={} != {}", a.y, by);
+    }
+
+    #[test]
+    #[should_panic(expected = "radius")]
+    fn constructor_rejects_nonpositive_radius() {
+        let _ = Circle::new(Point { x: 0.0, y: 0.0 }, 0.0, FluidSide::Outside);
+    }
+
+    #[test]
+    fn cardinal_direction_normals() {
+        let c = unit_circle_outside();
+
+        // LEFT: p = (-1.2, 0) -> P0 = (-1, 0), n = (+1, 0).
+        let left = c.project(Point { x: -1.2, y: 0.0 });
+        assert_close_point(left.point, -1.0, 0.0);
+        assert_close_vec(left.normal, 1.0, 0.0);
+
+        // RIGHT: p = (+1.2, 0) -> P0 = (+1, 0), n = (-1, 0).
+        let right = c.project(Point { x: 1.2, y: 0.0 });
+        assert_close_point(right.point, 1.0, 0.0);
+        assert_close_vec(right.normal, -1.0, 0.0);
+
+        // TOP: p = (0, +1.2) -> P0 = (0, +1), n = (0, -1).
+        let top = c.project(Point { x: 0.0, y: 1.2 });
+        assert_close_point(top.point, 0.0, 1.0);
+        assert_close_vec(top.normal, 0.0, -1.0);
+
+        // BOTTOM: p = (0, -1.2) -> P0 = (0, -1), n = (0, +1).
+        let bottom = c.project(Point { x: 0.0, y: -1.2 });
+        assert_close_point(bottom.point, 0.0, -1.0);
+        assert_close_vec(bottom.normal, 0.0, 1.0);
+    }
+
+    #[test]
+    fn non_axis_aligned_projection() {
+        let c = unit_circle_outside();
+        let s = FRAC_1_SQRT_2; // cos45 = sin45 = 1/sqrt(2)
+
+        // Fluid side (outside the obstacle): D = |p| - R < 0.
+        let fluid_side = c.project(Point {
+            x: 1.4 * s,
+            y: 1.4 * s,
+        });
+        assert_close_point(fluid_side.point, s, s);
+        assert_close_vec(fluid_side.normal, -s, -s);
+        assert!((fluid_side.distance + 0.4).abs() < 1e-12);
+
+        // Solid side (inside the obstacle): D = |p| - R > 0.
+        let solid_side = c.project(Point {
+            x: 0.6 * s,
+            y: 0.6 * s,
+        });
+        assert_close_point(solid_side.point, s, s);
+        assert_close_vec(solid_side.normal, -s, -s);
+        assert!((solid_side.distance - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn signed_distance_inner_solid_ghosts() {
+        let c = unit_circle_outside();
+
+        // Ghost points inside the solid: all four cardinal directions
+        // must give the same consistent positive signed distance
+        // D = R - |p| = 0.1.
+        for p in [
+            Point { x: -0.9, y: 0.0 },
+            Point { x: 0.9, y: 0.0 },
+            Point { x: 0.0, y: 0.9 },
+            Point { x: 0.0, y: -0.9 },
+        ] {
+            let proj = c.project(p);
+            assert!(
+                (proj.distance - 0.1).abs() < 1e-12,
+                "D = {} != 0.1 at p=({},{})",
+                proj.distance,
+                p.x,
+                p.y
+            );
+        }
+    }
+
+    #[test]
+    fn complete_circle_symmetry() {
+        let c = unit_circle_outside();
+
+        // Upper/lower mirror: p_upper=(x,+y), p_lower=(x,-y).
+        for x in [-0.9, -0.4, 0.3, 0.8] {
+            let up = c.project(Point { x, y: 0.35 });
+            let dn = c.project(Point { x, y: -0.35 });
+
+            assert!((up.point.x - dn.point.x).abs() < 1e-12);
+            assert!((up.point.y + dn.point.y).abs() < 1e-12);
+
+            assert!((up.normal.x - dn.normal.x).abs() < 1e-12);
+            assert!((up.normal.y + dn.normal.y).abs() < 1e-12);
+
+            assert!((up.distance - dn.distance).abs() < 1e-12);
+        }
+
+        // Left/right mirror: p_left=(-x,+y), p_right=(+x,+y).
+        let left = c.project(Point { x: -0.3, y: 0.4 });
+        let right = c.project(Point { x: 0.3, y: 0.4 });
+
+        assert!((left.point.x + right.point.x).abs() < 1e-12);
+        assert!((left.point.y - right.point.y).abs() < 1e-12);
+
+        assert!((left.normal.x + right.normal.x).abs() < 1e-12);
+        assert!((left.normal.y - right.normal.y).abs() < 1e-12);
+
+        assert!((left.distance - right.distance).abs() < 1e-12);
+    }
+
+    #[test]
+    fn circle_matches_arc_on_left_semicircle() {
+        let circle = unit_circle_outside();
+
+        let arc = CircularArc::from_three_points(
+            Point { x: 0.0, y: -1.0 },
+            Point { x: -1.0, y: 0.0 },
+            Point { x: 0.0, y: 1.0 },
+            FluidSide::Outside,
         );
+
+        // Points whose closest projection lies on the LEFT semicircle.
+        for p in [
+            Point { x: -1.1, y: 0.3 },
+            Point { x: -0.8, y: -0.5 },
+            Point { x: -1.3, y: 0.1 },
+            Point { x: -1.05, y: -0.7 },
+        ] {
+            let cp = circle.project(p);
+            let ap = arc.project(p);
+
+            assert!((cp.point.x - ap.point.x).abs() < 1e-12);
+            assert!((cp.point.y - ap.point.y).abs() < 1e-12);
+            assert!((cp.normal.x - ap.normal.x).abs() < 1e-12);
+            assert!((cp.normal.y - ap.normal.y).abs() < 1e-12);
+            assert!((cp.distance - ap.distance).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn inside_fluid_side_uses_radial_normal() {
+        // Fluid INSIDE the disk: outward fluid normal = +radial.
+        let c = Circle::new(Point { x: 0.0, y: 0.0 }, 1.0, FluidSide::Inside);
+
+        let right = c.project(Point { x: 1.2, y: 0.0 });
+        assert_close_vec(right.normal, 1.0, 0.0);
+
+        let left = c.project(Point { x: -1.2, y: 0.0 });
+        assert_close_vec(left.normal, -1.0, 0.0);
+
+        let top = c.project(Point { x: 0.0, y: 1.2 });
+        assert_close_vec(top.normal, 0.0, 1.0);
+    }
+
+    #[test]
+    fn boundary_geometry_circle_dispatch() {
+        let circle = unit_circle_outside();
+        let geom = BoundaryGeometry::Circle(circle);
+
+        let p = Point { x: -1.2, y: 0.0 };
+        let proj = geom.project(p);
+        assert_close_point(proj.point, -1.0, 0.0);
+        assert_close_vec(proj.normal, 1.0, 0.0);
+        assert!((proj.distance + 0.2).abs() < 1e-12);
+
+        // Radius of curvature dispatch: Circle -> its radius.
+        let r = geom.radius_of_curvature(Point { x: -1.0, y: 0.0 });
+        assert!((r - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    #[should_panic(expected = "center")]
+    fn circle_center_degneracy_panics() {
+        // p == center: closest point on a complete circle is not unique.
+        // Must panic rather than silently divide by zero.
+        let c = unit_circle_outside();
+        let _ = c.project(Point { x: 0.0, y: 0.0 });
     }
 }

@@ -1306,7 +1306,7 @@ pub fn set_ghost_point_value(
                 let m_local = (un0 / a).abs(); // TODO: swap for a stored global M_max if you track one
                 let l1 = *sigma * (1.0 - m_local.powi(2)) * a / *l_domain * (p0 - *p_inf);
                 rhs1[0] = l1 / lambda1;
-                println!("Capture subsonic outlet case");
+                //println!("Capture subsonic outlet case");
             }
             // else: this boundary point is locally supersonic-out; row 0 is
             // also outgoing there, so leave the WENO-extrapolated value alone.

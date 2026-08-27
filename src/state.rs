@@ -201,6 +201,17 @@ impl State {
             er: self.er * scalar,
         }
     }
+
+    pub fn cs(&self) -> f64 {
+        let s: Derived = Derived::from_state(*self);
+        let ge = constant::GAMMA_E - 1.0;
+        let gi = constant::GAMMA_I - 1.0;
+        let gr = constant::GAMMA_R - 1.0;
+        let cs = (constant::GAMMA_E*ge*s.e_e + 
+            constant::GAMMA_I*gi*s.e_i + 
+            constant::GAMMA_R*gr*s.e_r).sqrt();
+        cs
+    }
 }
 
 

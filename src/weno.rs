@@ -728,13 +728,39 @@ impl Stencil6 {
             }
         }
 
+        /*
+        1 define cs value
+        2 modify wave speed of each component
+        */
+        
+        let u1 = match dir {
+            state::Direction::X => points[2].mom_x/points[2].rho,
+            state::Direction::Y => points[2].mom_y/points[2].rho,
+        };
+        let u2 = match dir {
+            state::Direction::X => points[3].mom_x/points[3].rho,
+            state::Direction::Y => points[3].mom_y/points[3].rho,
+        };
+
+        let cs1 = points[2].cs();
+        let cs1= (constant::PHI*u1.abs()).min(cs1);
+        let cs2 = points[3].cs();
+        let cs2 = (constant::PHI*u2.abs()).min(cs2);
+
+        let a0 = ((u1-cs1).abs()).max((u2-cs2).abs());
+        let a1 = (u1.abs()).max(u2.abs());
+        let a2 = (u1.abs()).max(u2.abs());
+        let a3 = (u1.abs()).max(u2.abs());
+        let a4 = (u1.abs()).max(u2.abs());
+        let a5 = ((u1+cs1).abs()).max((u2+cs2).abs());
+        /* 
         let a0 = lambda[0].abs();
         let a1 = lambda[1].abs();
         let a2 = lambda[2].abs();
         let a3 = lambda[3].abs();
         let a4 = lambda[4].abs();
         let a5 = lambda[5].abs();
-
+        */
         let mut f_plus_stencil = [state::State::new(); 6];
         let mut f_minus_stencil = [state::State::new(); 6];
 

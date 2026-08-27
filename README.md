@@ -43,6 +43,14 @@ The main algorithm is:
 
 The paper explicitly notes that the 2D finite-difference method can reuse the 1D algorithm independently in each coordinate direction. This project follows that structure: the WENO reconstruction is called once for x-directed stencils and once for y-directed stencils.
 
+### Grid-aligned shock instability cure
+
+To suppress the carbuncle-type instability that appears when a shock aligns with the grid lines, the flux splitting in `reconstruction_fast()` (`weno.rs`) uses a low-dissipation wave-speed estimate following Fleischmann, Adami, Hu and Adams (2020) instead of the Roe-averaged eigenvalues:
+
+- For each acoustic wave the local sound speed is capped by the normal velocity magnitude: `cs_i = min(PHI * |u_i|, cs_i)` on each side of the interface.
+- The interface wave speeds are then `a_k = max(|u_L - cs_L|, |u_R - cs_R|)` for the left-running acoustic wave and `a_k = max(|u_L + cs_L|, |u_R + cs_R|)` for the right-running one; the four linearly-degenerate waves use `max(|u_L|, |u_R|)`.
+- The capped sound speed reduces the numerical dissipation of acoustic waves near grid-aligned shocks while retaining upwinding robustness; `PHI = 5.0` is set in `constant.rs`. 
+
 ## Time integration
 
 Time advancement uses the three-stage, third-order SSP Runge-Kutta method from the paper:
@@ -205,7 +213,7 @@ KAPPA_E = KAPPA_I = KAPPA_R = 0   (no diffusion)
 OMEGA_EI = OMEGA_ER = 0           (no energy exchange)
 CVE = CVI = 1, A = 1
 GAMMA_E = GAMMA_I = GAMMA_R = 1.4
-LAMBDA = 0.5, WENO_Q = 2.0
+LAMBDA = 0.5, WENO_Q = 2.0, PHI = 5.0
 ```
 
 With these settings the code reduces to the 3-T Euler equations; diffusion and exchange terms are in place but inactive.
@@ -230,3 +238,7 @@ Recommended verification workflow:
 The boundary treatment follows:
 
 > S. Tan, C. Wang, C.-W. Shu, and J. Ning, "Efficient implementation of high order inverse Lax–Wendroff boundary treatment for conservation laws," *Journal of Computational Physics* 231 (2012), 2510–2527.
+
+The grid-aligned shock instability cure follows:
+
+> N. Fleischmann, S. Adami, X. Y. Hu, and N. A. Adams, "A low dissipation method to cure the grid-aligned shock instability," *Journal of Computational Physics* 401 (2020), 109004.

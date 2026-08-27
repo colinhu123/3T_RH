@@ -1136,7 +1136,7 @@ pub fn init_rotated_shock_cylinder(
         360,
         3.0,
         -1.10,
-        20.0,
+        5.0,
     )
 }
 
@@ -1632,6 +1632,463 @@ pub fn init_rotated_shock_cylinder_with(
         radius,
         wall,
     );
+
+    u
+}
+
+
+pub fn init_planar_shock_channel() -> Field {
+    init_planar_shock_channel_with(
+        1.0 / 40.0, // h
+        20.0,        // shock Mach number
+        -2.0,       // initial shock position
+    )
+}
+
+
+pub fn init_planar_shock_channel_with(
+    h: f64,
+    shock_mach: f64,
+    shock_x0: f64,
+) -> Field {
+    assert!(h > 0.0);
+    assert!(shock_mach > 1.0);
+
+    // ============================================================
+    // Gas
+    // ============================================================
+
+    let gamma = 1.4_f64;
+
+    // ============================================================
+    // Pre-shock state
+    //
+    // Stationary gas.
+    // ============================================================
+
+    let rho_pre = 1.0_f64;
+    let p_pre = 1.0_f64;
+
+    let ux_pre = 0.0_f64;
+    let uy_pre = 0.0_f64;
+
+    let a_pre =
+        (gamma * p_pre / rho_pre).sqrt();
+
+    // ============================================================
+    // Shock speed
+    // ============================================================
+
+    let shock_speed =
+        shock_mach * a_pre;
+
+    // ============================================================
+    // Normal-shock Rankine-Hugoniot relations
+    // ============================================================
+
+    let ms2 =
+        shock_mach * shock_mach;
+
+    let density_ratio =
+        ((gamma + 1.0) * ms2)
+            /
+        ((gamma - 1.0) * ms2 + 2.0);
+
+    let pressure_ratio =
+        1.0
+            + 2.0 * gamma
+                / (gamma + 1.0)
+                * (ms2 - 1.0);
+
+    let rho_post =
+        rho_pre * density_ratio;
+
+    let p_post =
+        p_pre * pressure_ratio;
+
+    // ============================================================
+    // Post-shock lab-frame velocity
+    //
+    // rho1 * D
+    //      =
+    // rho2 * (D - u2)
+    //
+    // therefore
+    //
+    // u2 =
+    // D * (1 - rho1/rho2)
+    // ============================================================
+
+    let ux_post =
+        shock_speed
+            * (1.0 - rho_pre / rho_post);
+
+    let uy_post = 0.0_f64;
+
+    // ============================================================
+    // Convert to three-energy state
+    // ============================================================
+
+    let pre =
+        euler_to_three_energy(
+            rho_pre,
+            ux_pre,
+            uy_pre,
+            p_pre,
+            gamma,
+        );
+
+    let post =
+        euler_to_three_energy(
+            rho_post,
+            ux_post,
+            uy_post,
+            p_post,
+            gamma,
+        );
+
+    // ============================================================
+    // Computational domain
+    //
+    // Long enough that the shock can propagate for a while before
+    // reaching the outlet.
+    // ============================================================
+
+    let xmin = -4.0_f64;
+    let xmax = 12.0_f64;
+
+    let ymin = -2.0_f64;
+    let ymax = 2.0_f64;
+
+    let lx = xmax - xmin;
+    let ly = ymax - ymin;
+
+    let nx =
+        (lx / h).round() as usize + 1;
+
+    let ny =
+        (ly / h).round() as usize + 1;
+
+    let grid =
+        GridInfo::new(
+            nx,
+            ny,
+            h,
+            h,
+            xmin,
+            ymin,
+        );
+
+    // ============================================================
+    // Outer-domain classifier
+    //
+    // Counter-clockwise rectangle.
+    // ============================================================
+
+    let p_bottom_left =
+        Point {
+            x: xmin,
+            y: ymin,
+        };
+
+    let p_bottom_right =
+        Point {
+            x: xmax,
+            y: ymin,
+        };
+
+    let p_top_right =
+        Point {
+            x: xmax,
+            y: ymax,
+        };
+
+    let p_top_left =
+        Point {
+            x: xmin,
+            y: ymax,
+        };
+
+    let outer_bound =
+        Polygon::new(
+            vec![
+                p_bottom_left,
+                p_bottom_right,
+                p_top_right,
+                p_top_left,
+            ],
+            FluidSide::Inside,
+        );
+
+    // ============================================================
+    // No physical inner boundary.
+    //
+    // Field currently expects an inner Polygon, so put a tiny
+    // dummy polygon far outside the computational domain.
+    //
+    // If your Field now supports "no inner boundary", replace this
+    // with your corresponding empty/no-inner-boundary constructor.
+    // ============================================================
+
+    let dummy_x = xmin - 100.0;
+    let dummy_y = ymin - 100.0;
+
+    let inner_bound =
+        Polygon::new(
+            vec![
+                Point {
+                    x: dummy_x,
+                    y: dummy_y,
+                },
+                Point {
+                    x: dummy_x + 1.0,
+                    y: dummy_y,
+                },
+                Point {
+                    x: dummy_x,
+                    y: dummy_y + 1.0,
+                },
+            ],
+            FluidSide::Outside,
+        );
+
+    // ============================================================
+    // OUTER BC
+    //
+    // Polygon side order:
+    //
+    //      0: bottom
+    //      1: right
+    //      2: top
+    //      3: left
+    //
+    // Start with ReflectiveWall because it gives us a robust
+    // baseline.
+    //
+    // Once this works, replace top/bottom with BCType::Wall.
+    // ============================================================
+
+    let p_inf =
+        p_pre;
+
+    let sigma =
+        0.25_f64;
+
+    let l_domain =
+        xmax - xmin;
+
+    let outflow_bc =
+        BCType::Outflow {
+            p_inf,
+            sigma,
+            l_domain,
+        };
+    let outflow_bc = BCType::ZerothOrder;
+
+    let bc_outer =
+        vec![
+            // bottom
+            BCType::ReflectiveWall,
+
+            // right
+            outflow_bc.clone(),
+
+            // top
+            BCType::ReflectiveWall,
+
+            // left
+            BCType::Constant(post),
+        ];
+
+    // Dummy inner BC.
+    let bc_inner =
+        vec![
+            BCType::ZerothOrder;
+            3
+        ];
+
+    // ============================================================
+    // Construct Field
+    // ============================================================
+
+    let mut u =
+        Field::new(
+            grid,
+            bc_inner,
+            bc_outer,
+            State::new(),
+            outer_bound,
+            inner_bound,
+            0.0,
+        );
+
+    // ============================================================
+    // Analytic physical outer boundaries
+    // ============================================================
+
+    u.outer_boundary =
+        vec![
+            // ----------------------------------------------------
+            // Bottom wall
+            //
+            // CCW:
+            //
+            // bottom-left -> bottom-right
+            // ----------------------------------------------------
+
+            line_element(
+                p_bottom_left,
+                p_bottom_right,
+                BCType::ReflectiveWall,
+            ),
+
+            // ----------------------------------------------------
+            // Right outlet
+            // ----------------------------------------------------
+
+            line_element(
+                p_bottom_right,
+                p_top_right,
+                outflow_bc,
+            ),
+
+            // ----------------------------------------------------
+            // Top wall
+            // ----------------------------------------------------
+
+            line_element(
+                p_top_right,
+                p_top_left,
+                BCType::ReflectiveWall,
+            ),
+
+            // ----------------------------------------------------
+            // Left post-shock inflow
+            // ----------------------------------------------------
+
+            line_element(
+                p_top_left,
+                p_bottom_left,
+                BCType::Constant(post),
+            ),
+        ];
+
+    // No physical inner BoundaryElement.
+    u.inner_boundary = Vec::new();
+
+    // ============================================================
+    // Initial condition
+    //
+    //          POST      PRE
+    //
+    //      -------->|-----------
+    //                 shock_x0
+    //
+    // ============================================================
+
+    for i in 0..nx {
+        for j in 0..ny {
+            let idx =
+                (
+                    i as isize,
+                    j as isize,
+                );
+
+            if !u.is_in_domain(idx) {
+                continue;
+            }
+
+            let x =
+                grid.x(idx.0);
+
+            let state =
+                if x <= shock_x0 {
+                    post
+                } else {
+                    pre
+                };
+
+            u.set(
+                idx,
+                state,
+            );
+        }
+    }
+
+    // ============================================================
+    // Diagnostics
+    // ============================================================
+
+    println!();
+    println!("==============================================");
+    println!("PLANAR SHOCK CHANNEL");
+    println!("==============================================");
+
+    println!(
+        "grid: nx={}, ny={}, h={:.8e}",
+        nx,
+        ny,
+        h,
+    );
+
+    println!(
+        "domain: [{:.4},{:.4}] x [{:.4},{:.4}]",
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+    );
+
+    println!(
+        "shock Mach = {:.8}",
+        shock_mach,
+    );
+
+    println!(
+        "shock x0   = {:.8}",
+        shock_x0,
+    );
+
+    println!(
+        "shock speed = {:.8e}",
+        shock_speed,
+    );
+
+    println!(
+        "pre : rho={:.8e}, p={:.8e}, ux={:.8e}",
+        rho_pre,
+        p_pre,
+        ux_pre,
+    );
+
+    println!(
+        "post: rho={:.8e}, p={:.8e}, ux={:.8e}",
+        rho_post,
+        p_post,
+        ux_post,
+    );
+
+    // Time at which shock reaches outlet:
+    //
+    // x_s(t) = shock_x0 + D_s t
+
+    let outlet_hit_time =
+        (xmax - shock_x0)
+            / shock_speed;
+
+    println!(
+        "expected shock/outlet time = {:.8e}",
+        outlet_hit_time,
+    );
+
+    println!(
+        "BC: left=Constant(post), \
+         right=Outflow, \
+         top/bottom=ReflectiveWall"
+    );
+
+    println!("==============================================");
+    println!();
 
     u
 }

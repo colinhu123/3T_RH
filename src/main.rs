@@ -495,7 +495,7 @@ fn main() {
     }
 
     let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::Reflective);
-
+    //let mut u = init::init_planar_shock_channel();
     let t_store_interval = 0.01_f64;
 
     // ---------------------------------------------------------

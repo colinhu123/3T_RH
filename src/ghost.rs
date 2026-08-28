@@ -360,9 +360,18 @@ fn build_ghost_info(
                 bc1::BCType::PrimitiveWall => bc1::PRIMITIVE_WALL_WENO_Q,
                 _ => crate::constant::WENO_Q,
             };
-            Some(Box::new(bc1::precompute_ghost_bc(
-                &project, field, beta_forms, q,
-            )))
+
+            // Wall ghosts use the FALLIBLE precompute: a ghost whose paper
+            // WENO stencil cannot be formed (corners, thin embedded
+            // geometries) simply carries no precomputed data and the
+            // per-stage Wall reconstruction degrades LOCALLY to
+            // ReflectiveWall instead of aborting the build.
+            let pre = match &elements[boundary_id].bc {
+                bc1::BCType::Wall => bc1::try_precompute_ghost_bc(&project, field, beta_forms, q),
+                _ => Some(bc1::precompute_ghost_bc(&project, field, beta_forms, q)),
+            };
+
+            pre.map(Box::new)
         }
         _ => None,
     };

@@ -584,15 +584,13 @@ impl CylinderWallMode {
 ///     cylinder center (0,0), radius 1
 ///     n_circle = 360 classifier segments
 
-pub fn init_shock_cylinder_in_box(
-    wall: CylinderWallMode,
-) -> Field {
+pub fn init_shock_cylinder_in_box(wall: CylinderWallMode) -> Field {
     init_shock_cylinder_in_box_with(
         wall,
         1.0 / 40.0, // h
         360,        // inner Polygon classifier resolution
         3.0,        // shock Mach number
-        -1.10,       // initial shock position
+        -1.10,      // initial shock position
     )
 }
 
@@ -610,10 +608,7 @@ pub fn init_shock_cylinder_in_box_with(
         "circle classifier polygon needs at least 3 points"
     );
 
-    assert!(
-        shock_mach > 1.0,
-        "shock Mach number must be > 1"
-    );
+    assert!(shock_mach > 1.0, "shock Mach number must be > 1");
 
     let gamma = 1.4_f64;
 
@@ -623,93 +618,49 @@ pub fn init_shock_cylinder_in_box_with(
     let ux_pre = 0.0_f64;
     let uy_pre = 0.0_f64;
 
-    let a_pre =
-        (gamma * p_pre / rho_pre).sqrt();
+    let a_pre = (gamma * p_pre / rho_pre).sqrt();
 
-    let shock_speed =
-        shock_mach * a_pre;
-    let ms2 =
-        shock_mach * shock_mach;
+    let shock_speed = shock_mach * a_pre;
+    let ms2 = shock_mach * shock_mach;
 
-    let density_ratio =
-        ((gamma + 1.0) * ms2)
-        /
-        ((gamma - 1.0) * ms2 + 2.0);
+    let density_ratio = ((gamma + 1.0) * ms2) / ((gamma - 1.0) * ms2 + 2.0);
 
-    let pressure_ratio =
-        1.0
-        + 2.0 * gamma
-            / (gamma + 1.0)
-            * (ms2 - 1.0);
+    let pressure_ratio = 1.0 + 2.0 * gamma / (gamma + 1.0) * (ms2 - 1.0);
 
-    let rho_post =
-        rho_pre * density_ratio;
+    let rho_post = rho_pre * density_ratio;
 
-    let p_post =
-        p_pre * pressure_ratio;
+    let p_post = p_pre * pressure_ratio;
 
-    let ux_post =
-        shock_speed
-        * (1.0 - rho_pre / rho_post);
+    let ux_post = shock_speed * (1.0 - rho_pre / rho_post);
 
     let uy_post = 0.0_f64;
 
-    let pre =
-        euler_to_three_energy(
-            rho_pre,
-            ux_pre,
-            uy_pre,
-            p_pre,
-            gamma,
-        );
+    let pre = euler_to_three_energy(rho_pre, ux_pre, uy_pre, p_pre, gamma);
 
-    let post =
-        euler_to_three_energy(
-            rho_post,
-            ux_post,
-            uy_post,
-            p_post,
-            gamma,
-        );
+    let post = euler_to_three_energy(rho_post, ux_post, uy_post, p_post, gamma);
 
     // ============================================================
     // Diagnostics
     // ============================================================
 
-    println!(
-        "Shock-cylinder case:"
-    );
+    println!("Shock-cylinder case:");
 
-    println!(
-        "  gamma       = {:.8e}",
-        gamma,
-    );
+    println!("  gamma       = {:.8e}", gamma,);
 
-    println!(
-        "  shock Mach  = {:.8e}",
-        shock_mach,
-    );
+    println!("  shock Mach  = {:.8e}", shock_mach,);
 
-    println!(
-        "  shock x0    = {:.8e}",
-        shock_x0,
-    );
+    println!("  shock x0    = {:.8e}", shock_x0,);
 
-    println!("  shock speed = {:.8e}",shock_speed,);
+    println!("  shock speed = {:.8e}", shock_speed,);
 
     println!(
         "  pre-shock : rho={:.8e}, p={:.8e}, u={:.8e}, a={:.8e}",
-        rho_pre,
-        p_pre,
-        ux_pre,
-        a_pre,
+        rho_pre, p_pre, ux_pre, a_pre,
     );
 
     println!(
         "  post-shock: rho={:.8e}, p={:.8e}, u={:.8e}",
-        rho_post,
-        p_post,
-        ux_post,
+        rho_post, p_post, ux_post,
     );
 
     let xmin = -4.0_f64;
@@ -729,97 +680,46 @@ pub fn init_shock_cylinder_in_box_with(
     let lx = xmax - xmin;
     let ly = ymax - ymin;
 
-    let nx =
-        (lx / h).round() as usize + 1;
+    let nx = (lx / h).round() as usize + 1;
 
-    let ny =
-        (ly / h).round() as usize + 1;
+    let ny = (ly / h).round() as usize + 1;
 
-    let grid =
-        GridInfo::new(
-            nx,
-            ny,
-            h,
-            h,
-            x0,
-            y0,
-        );
+    let grid = GridInfo::new(nx, ny, h, h, x0, y0);
 
+    let outer_bound = Polygon::new(
+        vec![
+            Point { x: xmin, y: ymin },
+            Point { x: xmax, y: ymin },
+            Point { x: xmax, y: ymax },
+            Point { x: xmin, y: ymax },
+        ],
+        FluidSide::Inside,
+    );
 
-    let outer_bound =
-        Polygon::new(
-            vec![
-                Point {
-                    x: xmin,
-                    y: ymin,
-                },
-
-                Point {
-                    x: xmax,
-                    y: ymin,
-                },
-
-                Point {
-                    x: xmax,
-                    y: ymax,
-                },
-
-                Point {
-                    x: xmin,
-                    y: ymax,
-                },
-            ],
-
-            FluidSide::Inside,
-        );
-
-    let mut inner_points =
-        Vec::with_capacity(n_circle);
+    let mut inner_points = Vec::with_capacity(n_circle);
 
     for k in 0..n_circle {
-        let theta =
-            2.0
-            * std::f64::consts::PI
-            * k as f64
-            / n_circle as f64;
+        let theta = 2.0 * std::f64::consts::PI * k as f64 / n_circle as f64;
 
-        inner_points.push(
-            Point {
-                x:
-                    cx
-                    + radius * theta.cos(),
+        inner_points.push(Point {
+            x: cx + radius * theta.cos(),
 
-                y: cy + radius * theta.sin(),
-            },
-        );
+            y: cy + radius * theta.sin(),
+        });
     }
 
-    let inner_bound =
-        Polygon::new(
-            inner_points,
-            FluidSide::Outside,
-        );
+    let inner_bound = Polygon::new(inner_points, FluidSide::Outside);
 
     let shock_bc =
-        BCType::TimeDependent(
-            Arc::new(
-                move |
-                    p: Point,
-                    _normal: Vec2,
-                    t: f64
-                | -> State {
-                    let x_shock =
-                        shock_x0
-                        + shock_speed * t;
+        BCType::TimeDependent(Arc::new(move |p: Point, _normal: Vec2, t: f64| -> State {
+            let x_shock = shock_x0 + shock_speed * t;
 
-                    if p.x <= x_shock {
-                        post
-                    } else {
-                        pre
-                    }
-                },
-            ),
-        );
+            if p.x <= x_shock {
+                post
+            } else {
+                pre
+            }
+        }));
 
     // ============================================================
     // Legacy Polygon-side BC arrays.
@@ -835,39 +735,33 @@ pub fn init_shock_cylinder_in_box_with(
     // physical ghost geometry/BC lookup.
     // ============================================================
 
-    let bc_outer =
-        vec![
-            BCType::FarField(post),
-            BCType::ZerothOrder,
-            BCType::FarField(post),
-            BCType::Constant(post),
-        ];
+    let bc_outer = vec![
+        BCType::FarField(post),
+        BCType::ZerothOrder,
+        BCType::FarField(post),
+        BCType::Constant(post),
+    ];
 
     // Inner Polygon has n_circle sides.
     //
     // This is legacy/domain compatibility data only.
     // Physical cylinder BC comes from ONE Circle element.
 
-    let bc_inner =
-        vec![
-            wall.bc();
-            n_circle
-        ];
+    let bc_inner = vec![wall.bc(); n_circle];
 
     // ============================================================
     // Construct Field
     // ============================================================
 
-    let mut u =
-        Field::new(
-            grid,
-            bc_inner,
-            bc_outer,
-            State::new(),
-            outer_bound,
-            inner_bound,
-            0.0,
-        );
+    let mut u = Field::new(
+        grid,
+        bc_inner,
+        bc_outer,
+        State::new(),
+        outer_bound,
+        inner_bound,
+        0.0,
+    );
 
     // ============================================================
     // ANALYTIC OUTER PHYSICAL BOUNDARY
@@ -899,80 +793,40 @@ pub fn init_shock_cylinder_in_box_with(
     //
     // ============================================================
 
-    u.outer_boundary =
-        vec![
-            // ----------------------------------------------------
-            // Bottom
-            // ----------------------------------------------------
-
-            line_element(
-                Point {
-                    x: xmin,
-                    y: ymin,
-                },
-
-                Point {
-                    x: xmax,
-                    y: ymin,
-                },
-
-                BCType::ReflectiveWall,
-            ),
-
-            // ----------------------------------------------------
-            // Right
-            // ----------------------------------------------------
-
-            line_element(
-                Point {
-                    x: xmax,
-                    y: ymin,
-                },
-
-                Point {
-                    x: xmax,
-                    y: ymax,
-                },
-
-                BCType::ZerothOrder,
-            ),
-
-            // ----------------------------------------------------
-            // Top
-            // ----------------------------------------------------
-
-            line_element(
-                Point {
-                    x: xmax,
-                    y: ymax,
-                },
-
-                Point {
-                    x: xmin,
-                    y: ymax,
-                },
-
-                BCType::ReflectiveWall,
-            ),
-
-            // ----------------------------------------------------
-            // Left
-            // ----------------------------------------------------
-
-            line_element(
-                Point {
-                    x: xmin,
-                    y: ymax,
-                },
-
-                Point {
-                    x: xmin,
-                    y: ymin,
-                },
-
-                BCType::Constant(post),
-            ),
-        ];
+    u.outer_boundary = vec![
+        // ----------------------------------------------------
+        // Bottom
+        // ----------------------------------------------------
+        line_element(
+            Point { x: xmin, y: ymin },
+            Point { x: xmax, y: ymin },
+            BCType::ReflectiveWall,
+        ),
+        // ----------------------------------------------------
+        // Right
+        // ----------------------------------------------------
+        line_element(
+            Point { x: xmax, y: ymin },
+            Point { x: xmax, y: ymax },
+            BCType::ZerothOrder,
+        ),
+        // ----------------------------------------------------
+        // Top
+        // ----------------------------------------------------
+        line_element(
+            Point { x: xmax, y: ymax },
+            Point { x: xmin, y: ymax },
+            BCType::ReflectiveWall,
+        ),
+        // ----------------------------------------------------
+        // Left
+        // ----------------------------------------------------
+        line_element(
+            Point { x: xmin, y: ymax },
+            Point { x: xmin, y: ymin },
+            BCType::Constant(post),
+        ),
+    ];
 
     // ============================================================
     // ANALYTIC INNER PHYSICAL BOUNDARY
@@ -985,27 +839,15 @@ pub fn init_shock_cylinder_in_box_with(
     // from fluid into the solid cylinder.
     // ============================================================
 
-    u.inner_boundary =
-        vec![
-            BoundaryElement {
-                geometry:
-                    BoundaryGeometry::Circle(
-                        Circle::new(
-                            Point {
-                                x: cx,
-                                y: cy,
-                            },
+    u.inner_boundary = vec![BoundaryElement {
+        geometry: BoundaryGeometry::Circle(Circle::new(
+            Point { x: cx, y: cy },
+            radius,
+            FluidSide::Outside,
+        )),
 
-                            radius,
-
-                            FluidSide::Outside,
-                        ),
-                    ),
-
-                bc:
-                    wall.bc(),
-            },
-        ];
+        bc: wall.bc(),
+    }];
 
     // ============================================================
     // INITIAL CONDITION
@@ -1033,30 +875,17 @@ pub fn init_shock_cylinder_in_box_with(
 
     for i in 0..nx {
         for j in 0..ny {
-            let idx =
-                (
-                    i as isize,
-                    j as isize,
-                );
+            let idx = (i as isize, j as isize);
 
             if !u.is_in_domain(idx) {
                 continue;
             }
 
-            let x =
-                grid.x(idx.0);
+            let x = grid.x(idx.0);
 
-            let state =
-                if x <= shock_x0 {
-                    post
-                } else {
-                    pre
-                };
+            let state = if x <= shock_x0 { post } else { pre };
 
-            u.set(
-                idx,
-                state,
-            );
+            u.set(idx, state);
         }
     }
 
@@ -1067,23 +896,13 @@ pub fn init_shock_cylinder_in_box_with(
     println!(
         "Shock-cylinder grid: nx={}, ny={}, h={:.8e}, \
          bbox=({:.6},{:.6})x({:.6},{:.6})",
-        nx,
-        ny,
-        h,
-        xmin,
-        xmax,
-        ymin,
-        ymax,
+        nx, ny, h, xmin, xmax, ymin, ymax,
     );
 
     println!(
         "Cylinder: center=({:.6},{:.6}), R={}, \
          classifier segments={}, wall mode={:?}",
-        cx,
-        cy,
-        radius,
-        n_circle,
-        wall,
+        cx, cy, radius, n_circle, wall,
     );
 
     println!(
@@ -1096,48 +915,23 @@ pub fn init_shock_cylinder_in_box_with(
     // Useful physical time estimates
     // ============================================================
 
-    let cylinder_front_x =
-        cx - radius;
+    let cylinder_front_x = cx - radius;
 
-    let impact_time =
-        (cylinder_front_x - shock_x0)
-        / shock_speed;
+    let impact_time = (cylinder_front_x - shock_x0) / shock_speed;
 
-    println!(
-        "Shock-cylinder impact estimate:"
-    );
+    println!("Shock-cylinder impact estimate:");
 
-    println!(
-        "  cylinder front x = {:.8e}",
-        cylinder_front_x,
-    );
+    println!("  cylinder front x = {:.8e}", cylinder_front_x,);
 
-    println!(
-        "  initial distance = {:.8e}",
-        cylinder_front_x - shock_x0,
-    );
+    println!("  initial distance = {:.8e}", cylinder_front_x - shock_x0,);
 
-    println!(
-        "  impact time      = {:.8e}",
-        impact_time,
-    );
+    println!("  impact time      = {:.8e}", impact_time,);
 
     u
 }
 
-
-
-pub fn init_rotated_shock_cylinder(
-    wall: CylinderWallMode,
-) -> Field {
-    init_rotated_shock_cylinder_with(
-        wall,
-        1.0 / 40.0,
-        360,
-        3.0,
-        -1.10,
-        5.0,
-    )
+pub fn init_rotated_shock_cylinder(wall: CylinderWallMode) -> Field {
+    init_rotated_shock_cylinder_with(wall, 1.0 / 40.0, 360, 3.0, -1.10, 30.0)
 }
 
 pub fn init_rotated_shock_cylinder_with(
@@ -1158,8 +952,7 @@ pub fn init_rotated_shock_cylinder_with(
     // Rotation
     // ============================================================
 
-    let theta =
-        angle_deg.to_radians();
+    let theta = angle_deg.to_radians();
 
     let ct = theta.cos();
     let st = theta.sin();
@@ -1179,69 +972,40 @@ pub fn init_rotated_shock_cylinder_with(
     let rho_pre = 1.0_f64;
     let p_pre = 1.0_f64;
 
-    let a_pre =
-        (gamma * p_pre / rho_pre).sqrt();
+    let a_pre = (gamma * p_pre / rho_pre).sqrt();
 
-    let shock_speed =
-        shock_mach * a_pre;
+    let shock_speed = shock_mach * a_pre;
 
-    let ms2 =
-        shock_mach * shock_mach;
+    let ms2 = shock_mach * shock_mach;
 
-    let density_ratio =
-        ((gamma + 1.0) * ms2)
-            / ((gamma - 1.0) * ms2 + 2.0);
+    let density_ratio = ((gamma + 1.0) * ms2) / ((gamma - 1.0) * ms2 + 2.0);
 
-    let pressure_ratio =
-        1.0
-            + 2.0 * gamma
-                / (gamma + 1.0)
-                * (ms2 - 1.0);
+    let pressure_ratio = 1.0 + 2.0 * gamma / (gamma + 1.0) * (ms2 - 1.0);
 
-    let rho_post =
-        rho_pre * density_ratio;
+    let rho_post = rho_pre * density_ratio;
 
-    let p_post =
-        p_pre * pressure_ratio;
+    let p_post = p_pre * pressure_ratio;
 
     // Post-shock velocity magnitude in lab frame.
-    let u_post =
-        shock_speed
-            * (1.0 - rho_pre / rho_post);
+    let u_post = shock_speed * (1.0 - rho_pre / rho_post);
 
     // ------------------------------------------------------------
     // PRE state:
     // stationary gas
     // ------------------------------------------------------------
 
-    let pre =
-        euler_to_three_energy(
-            rho_pre,
-            0.0,
-            0.0,
-            p_pre,
-            gamma,
-        );
+    let pre = euler_to_three_energy(rho_pre, 0.0, 0.0, p_pre, gamma);
 
     // ------------------------------------------------------------
     // POST state:
     // velocity follows rotated channel direction
     // ------------------------------------------------------------
 
-    let ux_post =
-        u_post * ct;
+    let ux_post = u_post * ct;
 
-    let uy_post =
-        u_post * st;
+    let uy_post = u_post * st;
 
-    let post =
-        euler_to_three_energy(
-            rho_post,
-            ux_post,
-            uy_post,
-            p_post,
-            gamma,
-        );
+    let post = euler_to_three_energy(rho_post, ux_post, uy_post, p_post, gamma);
 
     // ============================================================
     // Channel geometry in LOCAL coordinates
@@ -1257,13 +1021,12 @@ pub fn init_rotated_shock_cylinder_with(
     let eta_max = 6.0_f64;
 
     // Rotate local point into global Cartesian coordinates.
-    let rotate =
-        |xi: f64, eta: f64| -> Point {
-            Point {
-                x: ct * xi - st * eta,
-                y: st * xi + ct * eta,
-            }
-        };
+    let rotate = |xi: f64, eta: f64| -> Point {
+        Point {
+            x: ct * xi - st * eta,
+            y: st * xi + ct * eta,
+        }
+    };
 
     // ============================================================
     // Four physical corners
@@ -1272,17 +1035,13 @@ pub fn init_rotated_shock_cylinder_with(
     // Keep CCW ordering.
     // ============================================================
 
-    let p00 =
-        rotate(xi_min, eta_min);
+    let p00 = rotate(xi_min, eta_min);
 
-    let p10 =
-        rotate(xi_max, eta_min);
+    let p10 = rotate(xi_max, eta_min);
 
-    let p11 =
-        rotate(xi_max, eta_max);
+    let p11 = rotate(xi_max, eta_max);
 
-    let p01 =
-        rotate(xi_min, eta_max);
+    let p01 = rotate(xi_min, eta_max);
 
     // ============================================================
     // Cartesian bounding box containing the rotated channel
@@ -1290,29 +1049,13 @@ pub fn init_rotated_shock_cylinder_with(
     // The computational GridInfo remains Cartesian.
     // ============================================================
 
-    let xmin =
-        p00.x
-            .min(p10.x)
-            .min(p11.x)
-            .min(p01.x);
+    let xmin = p00.x.min(p10.x).min(p11.x).min(p01.x);
 
-    let xmax =
-        p00.x
-            .max(p10.x)
-            .max(p11.x)
-            .max(p01.x);
+    let xmax = p00.x.max(p10.x).max(p11.x).max(p01.x);
 
-    let ymin =
-        p00.y
-            .min(p10.y)
-            .min(p11.y)
-            .min(p01.y);
+    let ymin = p00.y.min(p10.y).min(p11.y).min(p01.y);
 
-    let ymax =
-        p00.y
-            .max(p10.y)
-            .max(p11.y)
-            .max(p01.y);
+    let ymax = p00.y.max(p10.y).max(p11.y).max(p01.y);
 
     // Give the Cartesian bbox a small margin.
     //
@@ -1321,33 +1064,19 @@ pub fn init_rotated_shock_cylinder_with(
 
     let pad = 2.0 * h;
 
-    let x0 =
-        xmin - pad;
+    let x0 = xmin - pad;
 
-    let y0 =
-        ymin - pad;
+    let y0 = ymin - pad;
 
-    let lx =
-        (xmax + pad) - x0;
+    let lx = (xmax + pad) - x0;
 
-    let ly =
-        (ymax + pad) - y0;
+    let ly = (ymax + pad) - y0;
 
-    let nx =
-        (lx / h).ceil() as usize + 1;
+    let nx = (lx / h).ceil() as usize + 1;
 
-    let ny =
-        (ly / h).ceil() as usize + 1;
+    let ny = (ly / h).ceil() as usize + 1;
 
-    let grid =
-        GridInfo::new(
-            nx,
-            ny,
-            h,
-            h,
-            x0,
-            y0,
-        );
+    let grid = GridInfo::new(nx, ny, h, h, x0, y0);
 
     // ============================================================
     // OUTER DOMAIN CLASSIFIER
@@ -1357,16 +1086,7 @@ pub fn init_rotated_shock_cylinder_with(
     // Fluid is inside.
     // ============================================================
 
-    let outer_bound =
-        Polygon::new(
-            vec![
-                p00,
-                p10,
-                p11,
-                p01,
-            ],
-            FluidSide::Inside,
-        );
+    let outer_bound = Polygon::new(vec![p00, p10, p11, p01], FluidSide::Inside);
 
     // ============================================================
     // INNER CIRCLE CLASSIFIER
@@ -1374,33 +1094,22 @@ pub fn init_rotated_shock_cylinder_with(
     // Circle center remains at global (0,0).
     // ============================================================
 
-    let cx = 0.0+h/3.0;
-    let cy = 0.0+h/3.0;
+    let cx = 0.0 + h / 3.0;
+    let cy = 0.0 + h / 3.0;
     let radius = 1.0_f64;
 
-    let mut inner_points =
-        Vec::with_capacity(n_circle);
+    let mut inner_points = Vec::with_capacity(n_circle);
 
     for k in 0..n_circle {
-        let phi =
-            2.0
-                * std::f64::consts::PI
-                * k as f64
-                / n_circle as f64;
+        let phi = 2.0 * std::f64::consts::PI * k as f64 / n_circle as f64;
 
-        inner_points.push(
-            Point {
-                x: cx + radius * phi.cos(),
-                y: cy + radius * phi.sin(),
-            },
-        );
+        inner_points.push(Point {
+            x: cx + radius * phi.cos(),
+            y: cy + radius * phi.sin(),
+        });
     }
 
-    let inner_bound =
-        Polygon::new(
-            inner_points,
-            FluidSide::Outside,
-        );
+    let inner_bound = Polygon::new(inner_points, FluidSide::Outside);
 
     // ============================================================
     // Polygon-side BC compatibility arrays
@@ -1413,34 +1122,28 @@ pub fn init_rotated_shock_cylinder_with(
     // p01 -> p00 : upstream inflow
     // ============================================================
 
-    let bc_outer =
-        vec![
-            BCType::Wall,
-            BCType::ZerothOrder,
-            BCType::Wall,
-            BCType::Constant(post),
-        ];
+    let bc_outer = vec![
+        BCType::Wall,
+        BCType::ZerothOrder,
+        BCType::Wall,
+        BCType::Constant(post),
+    ];
 
-    let bc_inner =
-        vec![
-            wall.bc();
-            n_circle
-        ];
+    let bc_inner = vec![wall.bc(); n_circle];
 
     // ============================================================
     // Field
     // ============================================================
 
-    let mut u =
-        Field::new(
-            grid,
-            bc_inner,
-            bc_outer,
-            State::new(),
-            outer_bound,
-            inner_bound,
-            0.0,
-        );
+    let mut u = Field::new(
+        grid,
+        bc_inner,
+        bc_outer,
+        State::new(),
+        outer_bound,
+        inner_bound,
+        0.0,
+    );
 
     // ============================================================
     // ANALYTIC OUTER BOUNDARIES
@@ -1450,60 +1153,30 @@ pub fn init_rotated_shock_cylinder_with(
     // automatically.
     // ============================================================
 
-    u.outer_boundary =
-        vec![
-            // lower reflective wall
-            line_element(
-                p00,
-                p10,
-                BCType::ReflectiveWall,
-            ),
-
-            // downstream outflow
-            line_element(
-                p10,
-                p11,
-                BCType::ZerothOrder,
-            ),
-
-            // upper reflective wall
-            line_element(
-                p11,
-                p01,
-                BCType::ReflectiveWall,
-            ),
-
-            // upstream post-shock inflow
-            line_element(
-                p01,
-                p00,
-                BCType::Constant(post),
-            ),
-        ];
+    u.outer_boundary = vec![
+        // lower reflective wall
+        line_element(p00, p10, BCType::Wall),
+        // downstream outflow
+        line_element(p10, p11, BCType::ZerothOrder),
+        // upper reflective wall
+        line_element(p11, p01, BCType::Wall),
+        // upstream post-shock inflow
+        line_element(p01, p00, BCType::Constant(post)),
+    ];
 
     // ============================================================
     // ANALYTIC CYLINDER
     // ============================================================
 
-    u.inner_boundary =
-        vec![
-            BoundaryElement {
-                geometry:
-                    BoundaryGeometry::Circle(
-                        Circle::new(
-                            Point {
-                                x: cx,
-                                y: cy,
-                            },
-                            radius,
-                            FluidSide::Outside,
-                        ),
-                    ),
+    u.inner_boundary = vec![BoundaryElement {
+        geometry: BoundaryGeometry::Circle(Circle::new(
+            Point { x: cx, y: cy },
+            radius,
+            FluidSide::Outside,
+        )),
 
-                bc:
-                    wall.bc(),
-            },
-        ];
+        bc: wall.bc(),
+    }];
 
     // ============================================================
     // INITIAL CONDITION
@@ -1528,40 +1201,25 @@ pub fn init_rotated_shock_cylinder_with(
 
     for i in 0..nx {
         for j in 0..ny {
-            let idx =
-                (
-                    i as isize,
-                    j as isize,
-                );
+            let idx = (i as isize, j as isize);
 
             if !u.is_in_domain(idx) {
                 continue;
             }
 
-            let x =
-                grid.x(idx.0);
+            let x = grid.x(idx.0);
 
-            let y =
-                grid.y(idx.1);
+            let y = grid.y(idx.1);
 
             // inverse rotation:
             //
             // xi = x cos(theta) + y sin(theta)
 
-            let xi =
-                x * ct + y * st;
+            let xi = x * ct + y * st;
 
-            let state =
-                if xi <= shock_xi0 {
-                    post
-                } else {
-                    pre
-                };
+            let state = if xi <= shock_xi0 { post } else { pre };
 
-            u.set(
-                idx,
-                state,
-            );
+            u.set(idx, state);
         }
     }
 
@@ -1569,54 +1227,29 @@ pub fn init_rotated_shock_cylinder_with(
     // Diagnostics
     // ============================================================
 
-    println!(
-        "Rotated shock-cylinder channel:"
-    );
+    println!("Rotated shock-cylinder channel:");
 
-    println!(
-        "  angle       = {:.8} deg",
-        angle_deg,
-    );
+    println!("  angle       = {:.8} deg", angle_deg,);
 
-    println!(
-        "  shock Mach  = {:.8}",
-        shock_mach,
-    );
+    println!("  shock Mach  = {:.8}", shock_mach,);
 
-    println!(
-        "  shock xi0   = {:.8}",
-        shock_xi0,
-    );
+    println!("  shock xi0   = {:.8}", shock_xi0,);
 
-    println!(
-        "  shock speed = {:.8e}",
-        shock_speed,
-    );
+    println!("  shock speed = {:.8e}", shock_speed,);
 
     println!(
         "  post state: rho={:.8e}, p={:.8e}, \
          ux={:.8e}, uy={:.8e}",
-        rho_post,
-        p_post,
-        ux_post,
-        uy_post,
+        rho_post, p_post, ux_post, uy_post,
     );
 
     println!(
         "  channel local domain: \
          xi=[{:.4},{:.4}], eta=[{:.4},{:.4}]",
-        xi_min,
-        xi_max,
-        eta_min,
-        eta_max,
+        xi_min, xi_max, eta_min, eta_max,
     );
 
-    println!(
-        "  Cartesian grid: nx={}, ny={}, h={:.8e}",
-        nx,
-        ny,
-        h,
-    );
+    println!("  Cartesian grid: nx={}, ny={}, h={:.8e}", nx, ny, h,);
 
     println!(
         "  Cartesian bbox: \
@@ -1627,30 +1260,20 @@ pub fn init_rotated_shock_cylinder_with(
         y0 + (ny - 1) as f64 * h,
     );
 
-    println!(
-        "  cylinder: center=(0,0), R={}, wall={:?}",
-        radius,
-        wall,
-    );
+    println!("  cylinder: center=(0,0), R={}, wall={:?}", radius, wall,);
 
     u
 }
 
-
 pub fn init_planar_shock_channel() -> Field {
     init_planar_shock_channel_with(
         1.0 / 40.0, // h
-        20.0,        // shock Mach number
+        20.0,       // shock Mach number
         -2.0,       // initial shock position
     )
 }
 
-
-pub fn init_planar_shock_channel_with(
-    h: f64,
-    shock_mach: f64,
-    shock_x0: f64,
-) -> Field {
+pub fn init_planar_shock_channel_with(h: f64, shock_mach: f64, shock_x0: f64) -> Field {
     assert!(h > 0.0);
     assert!(shock_mach > 1.0);
 
@@ -1672,39 +1295,27 @@ pub fn init_planar_shock_channel_with(
     let ux_pre = 0.0_f64;
     let uy_pre = 0.0_f64;
 
-    let a_pre =
-        (gamma * p_pre / rho_pre).sqrt();
+    let a_pre = (gamma * p_pre / rho_pre).sqrt();
 
     // ============================================================
     // Shock speed
     // ============================================================
 
-    let shock_speed =
-        shock_mach * a_pre;
+    let shock_speed = shock_mach * a_pre;
 
     // ============================================================
     // Normal-shock Rankine-Hugoniot relations
     // ============================================================
 
-    let ms2 =
-        shock_mach * shock_mach;
+    let ms2 = shock_mach * shock_mach;
 
-    let density_ratio =
-        ((gamma + 1.0) * ms2)
-            /
-        ((gamma - 1.0) * ms2 + 2.0);
+    let density_ratio = ((gamma + 1.0) * ms2) / ((gamma - 1.0) * ms2 + 2.0);
 
-    let pressure_ratio =
-        1.0
-            + 2.0 * gamma
-                / (gamma + 1.0)
-                * (ms2 - 1.0);
+    let pressure_ratio = 1.0 + 2.0 * gamma / (gamma + 1.0) * (ms2 - 1.0);
 
-    let rho_post =
-        rho_pre * density_ratio;
+    let rho_post = rho_pre * density_ratio;
 
-    let p_post =
-        p_pre * pressure_ratio;
+    let p_post = p_pre * pressure_ratio;
 
     // ============================================================
     // Post-shock lab-frame velocity
@@ -1719,9 +1330,7 @@ pub fn init_planar_shock_channel_with(
     // D * (1 - rho1/rho2)
     // ============================================================
 
-    let ux_post =
-        shock_speed
-            * (1.0 - rho_pre / rho_post);
+    let ux_post = shock_speed * (1.0 - rho_pre / rho_post);
 
     let uy_post = 0.0_f64;
 
@@ -1729,23 +1338,9 @@ pub fn init_planar_shock_channel_with(
     // Convert to three-energy state
     // ============================================================
 
-    let pre =
-        euler_to_three_energy(
-            rho_pre,
-            ux_pre,
-            uy_pre,
-            p_pre,
-            gamma,
-        );
+    let pre = euler_to_three_energy(rho_pre, ux_pre, uy_pre, p_pre, gamma);
 
-    let post =
-        euler_to_three_energy(
-            rho_post,
-            ux_post,
-            uy_post,
-            p_post,
-            gamma,
-        );
+    let post = euler_to_three_energy(rho_post, ux_post, uy_post, p_post, gamma);
 
     // ============================================================
     // Computational domain
@@ -1763,21 +1358,11 @@ pub fn init_planar_shock_channel_with(
     let lx = xmax - xmin;
     let ly = ymax - ymin;
 
-    let nx =
-        (lx / h).round() as usize + 1;
+    let nx = (lx / h).round() as usize + 1;
 
-    let ny =
-        (ly / h).round() as usize + 1;
+    let ny = (ly / h).round() as usize + 1;
 
-    let grid =
-        GridInfo::new(
-            nx,
-            ny,
-            h,
-            h,
-            xmin,
-            ymin,
-        );
+    let grid = GridInfo::new(nx, ny, h, h, xmin, ymin);
 
     // ============================================================
     // Outer-domain classifier
@@ -1785,40 +1370,18 @@ pub fn init_planar_shock_channel_with(
     // Counter-clockwise rectangle.
     // ============================================================
 
-    let p_bottom_left =
-        Point {
-            x: xmin,
-            y: ymin,
-        };
+    let p_bottom_left = Point { x: xmin, y: ymin };
 
-    let p_bottom_right =
-        Point {
-            x: xmax,
-            y: ymin,
-        };
+    let p_bottom_right = Point { x: xmax, y: ymin };
 
-    let p_top_right =
-        Point {
-            x: xmax,
-            y: ymax,
-        };
+    let p_top_right = Point { x: xmax, y: ymax };
 
-    let p_top_left =
-        Point {
-            x: xmin,
-            y: ymax,
-        };
+    let p_top_left = Point { x: xmin, y: ymax };
 
-    let outer_bound =
-        Polygon::new(
-            vec![
-                p_bottom_left,
-                p_bottom_right,
-                p_top_right,
-                p_top_left,
-            ],
-            FluidSide::Inside,
-        );
+    let outer_bound = Polygon::new(
+        vec![p_bottom_left, p_bottom_right, p_top_right, p_top_left],
+        FluidSide::Inside,
+    );
 
     // ============================================================
     // No physical inner boundary.
@@ -1833,24 +1396,23 @@ pub fn init_planar_shock_channel_with(
     let dummy_x = xmin - 100.0;
     let dummy_y = ymin - 100.0;
 
-    let inner_bound =
-        Polygon::new(
-            vec![
-                Point {
-                    x: dummy_x,
-                    y: dummy_y,
-                },
-                Point {
-                    x: dummy_x + 1.0,
-                    y: dummy_y,
-                },
-                Point {
-                    x: dummy_x,
-                    y: dummy_y + 1.0,
-                },
-            ],
-            FluidSide::Outside,
-        );
+    let inner_bound = Polygon::new(
+        vec![
+            Point {
+                x: dummy_x,
+                y: dummy_y,
+            },
+            Point {
+                x: dummy_x + 1.0,
+                y: dummy_y,
+            },
+            Point {
+                x: dummy_x,
+                y: dummy_y + 1.0,
+            },
+        ],
+        FluidSide::Outside,
+    );
 
     // ============================================================
     // OUTER BC
@@ -1868,110 +1430,73 @@ pub fn init_planar_shock_channel_with(
     // Once this works, replace top/bottom with BCType::Wall.
     // ============================================================
 
-    let p_inf =
-        p_pre;
+    let p_inf = p_pre;
 
-    let sigma =
-        0.25_f64;
+    let sigma = 0.25_f64;
 
-    let l_domain =
-        xmax - xmin;
+    let l_domain = xmax - xmin;
 
-    let outflow_bc =
-        BCType::Outflow {
-            p_inf,
-            sigma,
-            l_domain,
-        };
+    let outflow_bc = BCType::Outflow {
+        p_inf,
+        sigma,
+        l_domain,
+    };
     let outflow_bc = BCType::ZerothOrder;
 
-    let bc_outer =
-        vec![
-            // bottom
-            BCType::ReflectiveWall,
-
-            // right
-            outflow_bc.clone(),
-
-            // top
-            BCType::ReflectiveWall,
-
-            // left
-            BCType::Constant(post),
-        ];
+    let bc_outer = vec![
+        // bottom
+        BCType::ReflectiveWall,
+        // right
+        outflow_bc.clone(),
+        // top
+        BCType::ReflectiveWall,
+        // left
+        BCType::Constant(post),
+    ];
 
     // Dummy inner BC.
-    let bc_inner =
-        vec![
-            BCType::ZerothOrder;
-            3
-        ];
+    let bc_inner = vec![BCType::ZerothOrder; 3];
 
     // ============================================================
     // Construct Field
     // ============================================================
 
-    let mut u =
-        Field::new(
-            grid,
-            bc_inner,
-            bc_outer,
-            State::new(),
-            outer_bound,
-            inner_bound,
-            0.0,
-        );
+    let mut u = Field::new(
+        grid,
+        bc_inner,
+        bc_outer,
+        State::new(),
+        outer_bound,
+        inner_bound,
+        0.0,
+    );
 
     // ============================================================
     // Analytic physical outer boundaries
     // ============================================================
 
-    u.outer_boundary =
-        vec![
-            // ----------------------------------------------------
-            // Bottom wall
-            //
-            // CCW:
-            //
-            // bottom-left -> bottom-right
-            // ----------------------------------------------------
-
-            line_element(
-                p_bottom_left,
-                p_bottom_right,
-                BCType::ReflectiveWall,
-            ),
-
-            // ----------------------------------------------------
-            // Right outlet
-            // ----------------------------------------------------
-
-            line_element(
-                p_bottom_right,
-                p_top_right,
-                outflow_bc,
-            ),
-
-            // ----------------------------------------------------
-            // Top wall
-            // ----------------------------------------------------
-
-            line_element(
-                p_top_right,
-                p_top_left,
-                BCType::ReflectiveWall,
-            ),
-
-            // ----------------------------------------------------
-            // Left post-shock inflow
-            // ----------------------------------------------------
-
-            line_element(
-                p_top_left,
-                p_bottom_left,
-                BCType::Constant(post),
-            ),
-        ];
+    u.outer_boundary = vec![
+        // ----------------------------------------------------
+        // Bottom wall
+        //
+        // CCW:
+        //
+        // bottom-left -> bottom-right
+        // ----------------------------------------------------
+        line_element(p_bottom_left, p_bottom_right, BCType::ReflectiveWall),
+        // ----------------------------------------------------
+        // Right outlet
+        // ----------------------------------------------------
+        line_element(p_bottom_right, p_top_right, outflow_bc),
+        // ----------------------------------------------------
+        // Top wall
+        // ----------------------------------------------------
+        line_element(p_top_right, p_top_left, BCType::ReflectiveWall),
+        // ----------------------------------------------------
+        // Left post-shock inflow
+        // ----------------------------------------------------
+        line_element(p_top_left, p_bottom_left, BCType::Constant(post)),
+    ];
 
     // No physical inner BoundaryElement.
     u.inner_boundary = Vec::new();
@@ -1988,30 +1513,17 @@ pub fn init_planar_shock_channel_with(
 
     for i in 0..nx {
         for j in 0..ny {
-            let idx =
-                (
-                    i as isize,
-                    j as isize,
-                );
+            let idx = (i as isize, j as isize);
 
             if !u.is_in_domain(idx) {
                 continue;
             }
 
-            let x =
-                grid.x(idx.0);
+            let x = grid.x(idx.0);
 
-            let state =
-                if x <= shock_x0 {
-                    post
-                } else {
-                    pre
-                };
+            let state = if x <= shock_x0 { post } else { pre };
 
-            u.set(
-                idx,
-                state,
-            );
+            u.set(idx, state);
         }
     }
 
@@ -2024,62 +1536,36 @@ pub fn init_planar_shock_channel_with(
     println!("PLANAR SHOCK CHANNEL");
     println!("==============================================");
 
-    println!(
-        "grid: nx={}, ny={}, h={:.8e}",
-        nx,
-        ny,
-        h,
-    );
+    println!("grid: nx={}, ny={}, h={:.8e}", nx, ny, h,);
 
     println!(
         "domain: [{:.4},{:.4}] x [{:.4},{:.4}]",
-        xmin,
-        xmax,
-        ymin,
-        ymax,
+        xmin, xmax, ymin, ymax,
     );
 
-    println!(
-        "shock Mach = {:.8}",
-        shock_mach,
-    );
+    println!("shock Mach = {:.8}", shock_mach,);
 
-    println!(
-        "shock x0   = {:.8}",
-        shock_x0,
-    );
+    println!("shock x0   = {:.8}", shock_x0,);
 
-    println!(
-        "shock speed = {:.8e}",
-        shock_speed,
-    );
+    println!("shock speed = {:.8e}", shock_speed,);
 
     println!(
         "pre : rho={:.8e}, p={:.8e}, ux={:.8e}",
-        rho_pre,
-        p_pre,
-        ux_pre,
+        rho_pre, p_pre, ux_pre,
     );
 
     println!(
         "post: rho={:.8e}, p={:.8e}, ux={:.8e}",
-        rho_post,
-        p_post,
-        ux_post,
+        rho_post, p_post, ux_post,
     );
 
     // Time at which shock reaches outlet:
     //
     // x_s(t) = shock_x0 + D_s t
 
-    let outlet_hit_time =
-        (xmax - shock_x0)
-            / shock_speed;
+    let outlet_hit_time = (xmax - shock_x0) / shock_speed;
 
-    println!(
-        "expected shock/outlet time = {:.8e}",
-        outlet_hit_time,
-    );
+    println!("expected shock/outlet time = {:.8e}", outlet_hit_time,);
 
     println!(
         "BC: left=Constant(post), \
@@ -2088,6 +1574,372 @@ pub fn init_planar_shock_channel_with(
     );
 
     println!("==============================================");
+    println!();
+
+    u
+}
+
+pub fn init_forward_facing_step_rotated() -> Field {
+    init_forward_facing_step_rotated_with(1.0 / 80.0, 8.0, 0.2, 0.0)
+}
+
+pub fn init_forward_facing_step_rotated_with(
+    h: f64,
+    shock_mach: f64,
+    shock_xi0: f64,
+    angle_deg: f64,
+) -> Field {
+    assert!(h > 0.0);
+    assert!(shock_mach > 1.0);
+
+    let gamma = 1.4_f64;
+
+    // ============================================================
+    // Rotation
+    // ============================================================
+
+    let theta = angle_deg.to_radians();
+    let ct = theta.cos();
+    let st = theta.sin();
+
+    // Local -> global Cartesian
+    let rotate = |xi: f64, eta: f64| -> Point {
+        Point {
+            x: ct * xi - st * eta,
+            y: st * xi + ct * eta,
+        }
+    };
+
+    // ============================================================
+    // Pre-shock state: stationary gas
+    // ============================================================
+
+    let rho_pre = 1.0_f64;
+    let p_pre = 1.0_f64;
+
+    let a_pre = (gamma * p_pre / rho_pre).sqrt();
+
+    let shock_speed = shock_mach * a_pre;
+
+    // ============================================================
+    // Normal-shock RH relations
+    // ============================================================
+
+    let ms2 = shock_mach * shock_mach;
+
+    let density_ratio = ((gamma + 1.0) * ms2) / ((gamma - 1.0) * ms2 + 2.0);
+
+    let pressure_ratio = 1.0 + 2.0 * gamma / (gamma + 1.0) * (ms2 - 1.0);
+
+    let rho_post = rho_pre * density_ratio;
+
+    let p_post = p_pre * pressure_ratio;
+
+    // Post-shock velocity magnitude along +xi.
+    let u_post = shock_speed * (1.0 - rho_pre / rho_post);
+
+    // Rotate velocity into Cartesian coordinates.
+    let ux_post = u_post * ct;
+
+    let uy_post = u_post * st;
+
+    let gamma = 1.4_f64;
+
+    let rho_inf = 1.0_f64;
+    let p_inf = 1.0_f64;
+    let mach_inf = 3.0_f64;
+
+    let a_inf = (gamma * p_inf / rho_inf).sqrt();
+    let v_inf = mach_inf * a_inf;
+
+    let ux_inf = v_inf * ct;
+    let uy_inf = v_inf * st;
+
+    let inflow = euler_to_three_energy(rho_inf, ux_inf, uy_inf, p_inf, gamma);
+
+    // ============================================================
+    // States
+    // ============================================================
+
+    let pre = euler_to_three_energy(rho_pre, 0.0, 0.0, p_pre, gamma);
+
+    let post = euler_to_three_energy(rho_post, ux_post, uy_post, p_post, gamma);
+
+    // ============================================================
+    // Physical geometry in LOCAL coordinates (xi, eta)
+    // ============================================================
+
+    let xi_min = -1.0_f64;
+    let xi_max = 5.0_f64;
+
+    let eta_min = 0.0_f64;
+    let eta_max = 1.5_f64;
+
+    let step_xi = 0.6_f64;
+
+    // Keep your current slightly offset step height.
+    let step_eta = 0.2 + 0.3 * h;
+
+    assert!(shock_xi0 > xi_min && shock_xi0 < step_xi);
+
+    // ============================================================
+    // Forward-step vertices in LOCAL coordinates
+    //
+    // p5 ----------------------------- p4
+    // |                                  |
+    // |                                  |
+    // |        p2 -------------------- p3
+    // |        |
+    // |        |
+    // p0 ----- p1
+    //
+    // ============================================================
+
+    let p0 = rotate(xi_min, eta_min);
+
+    let p1 = rotate(step_xi, eta_min);
+
+    let p2 = rotate(step_xi, step_eta);
+
+    let p3 = rotate(xi_max, step_eta);
+
+    let p4 = rotate(xi_max, eta_max);
+
+    let p5 = rotate(xi_min, eta_max);
+
+    // ============================================================
+    // Cartesian bounding box containing the rotated polygon
+    // ============================================================
+
+    let points = [p0, p1, p2, p3, p4, p5];
+
+    let mut xmin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+
+    let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+
+    for p in points {
+        xmin = xmin.min(p.x);
+        xmax = xmax.max(p.x);
+
+        ymin = ymin.min(p.y);
+        ymax = ymax.max(p.y);
+    }
+
+    // Padding gives the embedded outer boundary enough ghost space.
+    let pad = 4.0 * h;
+
+    xmin -= pad;
+    xmax += pad;
+
+    ymin -= pad;
+    ymax += pad;
+
+    let nx = ((xmax - xmin) / h).ceil() as usize + 1;
+
+    let ny = ((ymax - ymin) / h).ceil() as usize + 1;
+
+    let grid = GridInfo::new(nx, ny, h, h, xmin, ymin);
+
+    // ============================================================
+    // Rotated forward-step polygon
+    // ============================================================
+
+    let outer_bound = Polygon::new(vec![p0, p1, p2, p3, p4, p5], FluidSide::Inside);
+
+    // ============================================================
+    // Dummy inner boundary
+    // ============================================================
+
+    let inner_bound = Polygon::new(
+        vec![
+            Point {
+                x: -100.0,
+                y: -100.0,
+            },
+            Point {
+                x: -99.0,
+                y: -100.0,
+            },
+            Point {
+                x: -100.0,
+                y: -99.0,
+            },
+        ],
+        FluidSide::Outside,
+    );
+
+    // ============================================================
+    // Outflow
+    //
+    // IMPORTANT:
+    // This outlet is now oblique relative to the Cartesian grid.
+    //
+    // Since you already found that the high-order Outflow stencil
+    // can fail on oblique outer boundaries, I recommend routing
+    // this BC through robust_outflow_copy for this experiment.
+    // ============================================================
+
+    let outflow_bc = BCType::ZerothOrder;
+    BCType::Outflow {
+        p_inf: p_pre,
+        sigma: 0.25,
+        l_domain: xi_max - xi_min,
+    };
+
+    // ============================================================
+    // Polygon BCs
+    //
+    // p0 -> p1 : bottom Wall
+    // p1 -> p2 : step front Wall
+    // p2 -> p3 : step top Wall
+    // p3 -> p4 : outlet
+    // p4 -> p5 : top Wall
+    // p5 -> p0 : inflow
+    // ============================================================
+
+    let bc_outer = vec![
+        // Wall: high-order ILW with a LOCAL ReflectiveWall fallback
+        // for ghosts where the ILW reconstruction is untrustworthy.
+        BCType::Wall,
+        BCType::Wall,
+        BCType::Wall,
+        outflow_bc.clone(),
+        BCType::Wall,
+        BCType::Constant(post),
+    ];
+
+    let bc_inner = vec![BCType::ZerothOrder; 3];
+
+    // ============================================================
+    // Field
+    // ============================================================
+
+    let mut u = Field::new(
+        grid,
+        bc_inner,
+        bc_outer,
+        State::new(),
+        outer_bound,
+        inner_bound,
+        0.0,
+    );
+
+    // ============================================================
+    // Analytic rotated boundaries
+    // ============================================================
+
+    u.outer_boundary = vec![
+        // bottom
+        line_element(p0, p1, BCType::Wall),
+        // step vertical face
+        line_element(p1, p2, BCType::Wall),
+        // step top
+        line_element(p2, p3, BCType::Wall),
+        // downstream outlet
+        line_element(p3, p4, outflow_bc),
+        // upper wall
+        line_element(p4, p5, BCType::Wall),
+        // upstream boundary
+        line_element(p5, p0, BCType::Constant(inflow)),
+    ];
+
+    u.inner_boundary = Vec::new();
+
+    // ============================================================
+    // Initial condition
+    //
+    // Convert every Cartesian grid point back into local
+    // forward-step coordinates:
+    //
+    //     xi  =  x cos(theta) + y sin(theta)
+    //     eta = -x sin(theta) + y cos(theta)
+    //
+    // Shock:
+    //
+    //     xi = shock_xi0
+    //
+    // ============================================================
+
+    for i in 0..nx {
+        for j in 0..ny {
+            let idx = (i as isize, j as isize);
+
+            if !u.is_in_domain(idx) {
+                continue;
+            }
+
+            let x = grid.x(idx.0);
+
+            let y = grid.y(idx.1);
+
+            // Inverse rotation.
+            let xi = x * ct + y * st;
+
+            let state = if xi <= shock_xi0 { post } else { post };
+
+            u.set(idx, inflow);
+        }
+    }
+
+    // ============================================================
+    // Diagnostics
+    // ============================================================
+
+    let step_hit_time = (step_xi - shock_xi0) / shock_speed;
+
+    println!();
+    println!("============================================================");
+
+    println!("ROTATED SHOCK-DRIVEN FORWARD-FACING STEP");
+
+    println!("============================================================");
+
+    println!("rotation angle = {:.8} deg", angle_deg,);
+
+    println!("grid: nx={}, ny={}, h={:.8e}", nx, ny, h,);
+
+    println!(
+        "Cartesian bbox: [{:.8},{:.8}] x [{:.8},{:.8}]",
+        xmin, xmax, ymin, ymax,
+    );
+
+    println!("local step: xi={:.8}, eta={:.8}", step_xi, step_eta,);
+
+    println!("initial shock: xi={:.8}", shock_xi0,);
+
+    println!("shock equation:");
+
+    println!("  x*cos(theta) + y*sin(theta) = {:.8}", shock_xi0,);
+
+    println!("shock speed = {:.8e}", shock_speed,);
+
+    println!("post velocity magnitude = {:.8e}", u_post,);
+
+    println!(
+        "post Cartesian velocity = ({:.8e}, {:.8e})",
+        ux_post, uy_post,
+    );
+
+    println!("expected shock-step impact time = {:.8e}", step_hit_time,);
+
+    println!("BC:");
+
+    println!("  bottom     = Wall");
+
+    println!("  step front = Wall");
+
+    println!("  step top   = Wall");
+
+    println!("  top        = Wall");
+
+    println!("  left       = Constant(post)");
+
+    println!("  right      = Outflow");
+
+    println!("============================================================");
+
     println!();
 
     u

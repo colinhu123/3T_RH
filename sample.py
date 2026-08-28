@@ -95,10 +95,11 @@ def get_component(data, name):
         6 = ei
         7 = er
 
-    Additional derived quantities:
+    Derived:
         ux
         uy
         speed
+        mach
     """
 
     direct = {
@@ -118,6 +119,9 @@ def get_component(data, name):
     rho = np.asarray(data[:, :, 2])
     mom_x = np.asarray(data[:, :, 3])
     mom_y = np.asarray(data[:, :, 4])
+    ee = np.asarray(data[:, :, 5])
+    ei = np.asarray(data[:,:,6])
+    er = np.asarray(data[:,:,7])
 
     with np.errstate(
         divide="ignore",
@@ -126,6 +130,10 @@ def get_component(data, name):
         ux = mom_x / rho
         uy = mom_y / rho
 
+        speed = np.sqrt(
+            ux * ux + uy * uy
+        )
+
     if name == "ux":
         return ux
 
@@ -133,9 +141,51 @@ def get_component(data, name):
         return uy
 
     if name == "speed":
-        return np.sqrt(
+        return speed
+
+    if name == "mach":
+        gamma = 1.4
+
+        kinetic = 0.5 * rho * (
             ux * ux + uy * uy
         )
+
+        pressure = (
+            (gamma - 1.0)
+            * (ee + ei + er - kinetic)
+        )
+
+        with np.errstate(
+            divide="ignore",
+            invalid="ignore",
+        ):
+            sound_speed = np.sqrt(
+                gamma * pressure / rho
+            )
+
+            mach = speed / sound_speed
+
+        # Invalid / nonphysical states -> NaN
+        mach[
+            (rho <= 0.0)
+            | (pressure <= 0.0)
+            | (~np.isfinite(mach))
+        ] = np.nan
+
+        return mach
+
+    if name == "pressure":
+        gamma = 1.4
+        
+        kinetic = 0.5 * rho * (
+                    ux * ux + uy * uy
+                )
+        
+        pressure = (
+                    (gamma - 1.0)
+                    * (ee + ei + er - kinetic)
+                )
+        return pressure
 
     raise ValueError(
         f"Unknown component: {name}"
@@ -518,6 +568,8 @@ def main():
             "ux",
             "uy",
             "speed",
+            "mach",
+            "pressure",
         ],
     )
 

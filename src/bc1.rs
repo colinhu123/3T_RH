@@ -1,15 +1,210 @@
-use ndarray::{Array1, Array2, array};
-use nalgebra::{DMatrix, DVector};
+use crate::constant;
 use crate::field1::{self, GridInfo};
 use crate::geometry::Geometry;
-use ndarray_linalg::Solve;
 use crate::state::{self, State};
 use crate::{geometry, weno};
-use crate::constant;
+use nalgebra::{DMatrix, DVector};
+use ndarray::{array, Array1, Array2};
+use ndarray_linalg::Solve;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const WALL_TAYLOR_ORDER: usize = 4;
-const OUTFLOW_TAYLOR_ORDER: usize = 0;
+const OUTFLOW_TAYLOR_ORDER: usize = 4;
+
+// ============================================================================
+// Wall (ILW) reconstruction failure taxonomy and fallback statistics.
+//
+// BCType::Wall is a hierarchy:
+//
+//     try high-order ILW Wall reconstruction
+//         +-- success and trustworthy --> use ILW ghost state
+//         +-- failure -----------------> use ReflectiveWall ghost state
+//
+// The fallback is LOCAL to the individual ghost point. A missing stencil
+// near a corner or a locally nonphysical ILW intermediate is an EXPECTED
+// numerical failure mode, not a programming error; it must never abort the
+// whole simulation. True invariant violations (impossible array sizes,
+// corrupt GhostInfo, ...) still panic as before.
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WallReconstructionFailure {
+    /// The paper WENO stencil E_r cannot be formed (corners, thin
+    /// embedded-boundary geometries, insufficient fluid-side points).
+    InsufficientStencil,
+    /// A boundary WENO extrapolation V^(k) contains NaN or Inf.
+    NonFiniteWeno,
+    /// The zeroth-order boundary state U^(0) (or the interior state used
+    /// to build the characteristic matrices) is nonphysical.
+    NonPhysicalBoundaryState,
+    /// The local sound speed a^2 is non-finite or non-positive.
+    InvalidSoundSpeed,
+    /// The ILW linear system is singular / the solve failed.
+    SingularIlwSystem,
+    /// An ILW derivative U^(k), k >= 1, is non-finite.
+    NonFiniteDerivative,
+    /// The final Taylor-expanded ghost state is non-finite.
+    NonFiniteGhost,
+    /// The final Taylor-expanded ghost state is thermodynamically
+    /// inadmissible (rho <= 0 or non-positive internal energies).
+    NonPhysicalGhost,
+}
+
+static ILW_WALL_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+static ILW_WALL_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+static ILW_FALLBACK_STENCIL: AtomicUsize = AtomicUsize::new(0);
+static ILW_FALLBACK_WENO: AtomicUsize = AtomicUsize::new(0);
+static ILW_FALLBACK_U0: AtomicUsize = AtomicUsize::new(0);
+static ILW_FALLBACK_SOUND_SPEED: AtomicUsize = AtomicUsize::new(0);
+static ILW_FALLBACK_SINGULAR: AtomicUsize = AtomicUsize::new(0);
+static ILW_FALLBACK_DERIVATIVE: AtomicUsize = AtomicUsize::new(0);
+static ILW_FALLBACK_GHOST_NONFINITE: AtomicUsize = AtomicUsize::new(0);
+static ILW_FALLBACK_GHOST_NONPHYSICAL: AtomicUsize = AtomicUsize::new(0);
+
+/// Record one local ILW Wall reconstruction failure and its reason.
+///
+/// Atomic + Relaxed: boundary reconstruction runs under Rayon and exact
+/// synchronization is unnecessary for diagnostics.
+#[inline]
+fn record_wall_fallback(reason: WallReconstructionFailure) {
+    ILW_WALL_FALLBACK.fetch_add(1, Ordering::Relaxed);
+    match reason {
+        WallReconstructionFailure::InsufficientStencil => {
+            ILW_FALLBACK_STENCIL.fetch_add(1, Ordering::Relaxed);
+        }
+        WallReconstructionFailure::NonFiniteWeno => {
+            ILW_FALLBACK_WENO.fetch_add(1, Ordering::Relaxed);
+        }
+        WallReconstructionFailure::NonPhysicalBoundaryState => {
+            ILW_FALLBACK_U0.fetch_add(1, Ordering::Relaxed);
+        }
+        WallReconstructionFailure::InvalidSoundSpeed => {
+            ILW_FALLBACK_SOUND_SPEED.fetch_add(1, Ordering::Relaxed);
+        }
+        WallReconstructionFailure::SingularIlwSystem => {
+            ILW_FALLBACK_SINGULAR.fetch_add(1, Ordering::Relaxed);
+        }
+        WallReconstructionFailure::NonFiniteDerivative => {
+            ILW_FALLBACK_DERIVATIVE.fetch_add(1, Ordering::Relaxed);
+        }
+        WallReconstructionFailure::NonFiniteGhost => {
+            ILW_FALLBACK_GHOST_NONFINITE.fetch_add(1, Ordering::Relaxed);
+        }
+        WallReconstructionFailure::NonPhysicalGhost => {
+            ILW_FALLBACK_GHOST_NONPHYSICAL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Zero all ILW Wall statistics (used by tests).
+#[cfg(test)]
+pub fn reset_ilw_wall_statistics() {
+    ILW_WALL_SUCCESS.store(0, Ordering::Relaxed);
+    ILW_WALL_FALLBACK.store(0, Ordering::Relaxed);
+    ILW_FALLBACK_STENCIL.store(0, Ordering::Relaxed);
+    ILW_FALLBACK_WENO.store(0, Ordering::Relaxed);
+    ILW_FALLBACK_U0.store(0, Ordering::Relaxed);
+    ILW_FALLBACK_SOUND_SPEED.store(0, Ordering::Relaxed);
+    ILW_FALLBACK_SINGULAR.store(0, Ordering::Relaxed);
+    ILW_FALLBACK_DERIVATIVE.store(0, Ordering::Relaxed);
+    ILW_FALLBACK_GHOST_NONFINITE.store(0, Ordering::Relaxed);
+    ILW_FALLBACK_GHOST_NONPHYSICAL.store(0, Ordering::Relaxed);
+}
+
+/// Aggregate ILW Wall success / fallback statistics.
+///
+/// Called periodically (or on demand) from the time loop; never from
+/// inside the per-ghost hot path.
+pub fn print_ilw_wall_statistics() {
+    let success = ILW_WALL_SUCCESS.load(Ordering::Relaxed);
+    let fallback = ILW_WALL_FALLBACK.load(Ordering::Relaxed);
+    let total = success + fallback;
+    let ratio = if total > 0 {
+        100.0 * fallback as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    println!("ILW Wall statistics");
+    println!("  success                = {}", success);
+    println!("  fallback               = {}", fallback);
+    println!("  fallback ratio         = {:.3} %", ratio);
+    println!("  fallback reasons:");
+    println!(
+        "    insufficient stencil = {}",
+        ILW_FALLBACK_STENCIL.load(Ordering::Relaxed)
+    );
+    println!(
+        "    nonfinite WENO       = {}",
+        ILW_FALLBACK_WENO.load(Ordering::Relaxed)
+    );
+    println!(
+        "    nonphysical U0       = {}",
+        ILW_FALLBACK_U0.load(Ordering::Relaxed)
+    );
+    println!(
+        "    invalid sound speed  = {}",
+        ILW_FALLBACK_SOUND_SPEED.load(Ordering::Relaxed)
+    );
+    println!(
+        "    singular ILW         = {}",
+        ILW_FALLBACK_SINGULAR.load(Ordering::Relaxed)
+    );
+    println!(
+        "    nonfinite derivative = {}",
+        ILW_FALLBACK_DERIVATIVE.load(Ordering::Relaxed)
+    );
+    println!(
+        "    nonfinite ghost      = {}",
+        ILW_FALLBACK_GHOST_NONFINITE.load(Ordering::Relaxed)
+    );
+    println!(
+        "    nonphysical ghost    = {}",
+        ILW_FALLBACK_GHOST_NONPHYSICAL.load(Ordering::Relaxed)
+    );
+}
+
+// ============================================================================
+// ReflectiveWall source-selection statistics.
+//
+// The reflective source hierarchy is:
+//
+//     1. inward normal search P(s) = P0 - s n          (preferred)
+//     2. local 2-D square-shell search near P0         (corner/endpoint)
+//     3. panic (geometry genuinely inconsistent)
+//
+// These counters reveal whether smooth-wall ghosts use the normal path
+// (they should: ~100%) and whether the 2-D fallback fires only at true
+// corners / segment endpoints.
+// ============================================================================
+
+static REFLECTIVE_NORMAL_SUCCESS: AtomicUsize = AtomicUsize::new(0);
+static REFLECTIVE_CORNER_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+static REFLECTIVE_SOURCE_FAILURE: AtomicUsize = AtomicUsize::new(0);
+
+/// Maximum square-shell radius (in grid cells) of the local 2-D corner
+/// search around `project.point`.
+const REFLECTIVE_CORNER_SEARCH_RADIUS: isize = 4;
+
+/// Aggregate ReflectiveWall source-selection statistics.
+pub fn print_reflective_wall_statistics() {
+    let normal = REFLECTIVE_NORMAL_SUCCESS.load(Ordering::Relaxed);
+    let corner = REFLECTIVE_CORNER_FALLBACK.load(Ordering::Relaxed);
+    let failure = REFLECTIVE_SOURCE_FAILURE.load(Ordering::Relaxed);
+    let total = normal + corner;
+    let corner_ratio = if total > 0 {
+        100.0 * corner as f64 / total as f64
+    } else {
+        0.0
+    };
+
+    println!("ReflectiveWall source statistics");
+    println!("  normal search success = {}", normal);
+    println!("  corner 2-D fallback   = {}", corner);
+    println!("  source search failure = {}", failure);
+    println!("  corner fallback ratio = {:.3} %", corner_ratio);
+}
 
 // ============================================================================
 // PRIMITIVE-VARIABLE WALL (Euler-equivalent benchmark specialization).
@@ -52,7 +247,6 @@ const PRIMITIVE_WALL_ILW_K1: bool = false;
 /// WENO and other boundary types keep constant::WENO_Q.
 pub const PRIMITIVE_WALL_WENO_Q: f64 = 10.0;
 
-
 pub type TimeBCFn = Arc<dyn Fn(geometry::Point, geometry::Vec2, f64) -> state::State + Send + Sync>;
 
 #[derive(Clone)]
@@ -67,7 +261,11 @@ pub enum BCType {
     Constant(State),
     /// Prescribed boundary state U(P0,n,t).
     TimeDependent(TimeBCFn),
-    Outflow { p_inf: f64, sigma: f64, l_domain: f64 },
+    Outflow {
+        p_inf: f64,
+        sigma: f64,
+        l_domain: f64,
+    },
     ZerothOrder,
     FarField(State),
     NonReflective,
@@ -241,6 +439,39 @@ pub fn precompute_ghost_bc(
     beta_forms: &[DMatrix<f64>; 5],
     q: f64,
 ) -> GhostBC {
+    let mut stencils = Vec::with_capacity(5);
+    for r in 0..=4usize {
+        stencils.push(weno_stencil_extractor_indices(*project, field, r));
+    }
+    precompute_ghost_bc_from_stencils(project, field, beta_forms, q, &stencils)
+}
+
+/// Fallible variant of `precompute_ghost_bc`: returns `None` instead of
+/// panicking when the paper WENO stencil cannot be formed (corners, thin
+/// embedded-boundary geometries, ...). A `None` result is a NORMAL
+/// geometric limitation, not a programming error.
+pub fn try_precompute_ghost_bc(
+    project: &geometry::Projection,
+    field: &field1::Field,
+    beta_forms: &[DMatrix<f64>; 5],
+    q: f64,
+) -> Option<GhostBC> {
+    let mut stencils = Vec::with_capacity(5);
+    for r in 0..=4usize {
+        stencils.push(try_weno_stencil_extractor_indices(*project, field, r)?);
+    }
+    Some(precompute_ghost_bc_from_stencils(
+        project, field, beta_forms, q, &stencils,
+    ))
+}
+
+fn precompute_ghost_bc_from_stencils(
+    project: &geometry::Projection,
+    field: &field1::Field,
+    beta_forms: &[DMatrix<f64>; 5],
+    q: f64,
+    stencils: &[Vec<(isize, isize)>],
+) -> GhostBC {
     let nearest = find_nearest_grid_point(*project, field);
     let h = (field.grid.dx * field.grid.dy).sqrt();
 
@@ -264,7 +495,7 @@ pub fn precompute_ghost_bc(
         let m = (r + 1) * (r + 1);
         let n_terms = (r + 1) * (r + 2) / 2;
 
-        let idxs = weno_stencil_extractor_indices(*project, field, r);
+        let idxs = &stencils[r];
 
         let mut xy = [[0.0; 2]; 25];
         for a in 0..m {
@@ -284,8 +515,7 @@ pub fn precompute_ghost_bc(
             for t in 0..=r {
                 for i2 in 0..=t {
                     let j2 = t - i2;
-                    a_mat[(row, col)] =
-                        xy[row][0].powi(i2 as i32) * xy[row][1].powi(j2 as i32);
+                    a_mat[(row, col)] = xy[row][0].powi(i2 as i32) * xy[row][1].powi(j2 as i32);
                     col += 1;
                 }
             }
@@ -316,9 +546,20 @@ pub fn precompute_ghost_bc(
         }
     }
 
-    debug_assert!(bc.s.iter().all(|x| x.is_finite()), "GhostBC.s contains non-finite at nearest={:?}", nearest);
-debug_assert!(bc.w.iter().all(|x| x.is_finite()), "GhostBC.w contains non-finite at nearest={:?}", nearest);
-debug_assert!(bc.normal.x.is_finite() && bc.normal.y.is_finite(), "GhostBC.normal non-finite");
+    debug_assert!(
+        bc.s.iter().all(|x| x.is_finite()),
+        "GhostBC.s contains non-finite at nearest={:?}",
+        nearest
+    );
+    debug_assert!(
+        bc.w.iter().all(|x| x.is_finite()),
+        "GhostBC.w contains non-finite at nearest={:?}",
+        nearest
+    );
+    debug_assert!(
+        bc.normal.x.is_finite() && bc.normal.y.is_finite(),
+        "GhostBC.normal non-finite"
+    );
 
     bc
 }
@@ -349,8 +590,12 @@ pub fn weno_extrapolation_pre(
             let u6 = [s.rho, mn, mt, s.ee, s.ei, s.er];
             for c in 0..6 {
                 let row = &left[c];
-                data[c][a] = row[0]*u6[0] + row[1]*u6[1] + row[2]*u6[2]
-                    + row[3]*u6[3] + row[4]*u6[4] + row[5]*u6[5];
+                data[c][a] = row[0] * u6[0]
+                    + row[1] * u6[1]
+                    + row[2] * u6[2]
+                    + row[3] * u6[3]
+                    + row[4] * u6[4]
+                    + row[5] * u6[5];
             }
         }
 
@@ -388,13 +633,15 @@ pub fn weno_extrapolation_pre(
     }
 
     debug_assert!(
-    alpha_sum.iter().all(|&s| s.is_finite() && s > 0.0),
-    "alpha_sum non-finite/non-positive: {:?}", alpha_sum
-);
-debug_assert!(
-    result.iter().all(|x| x.is_finite()),
-    "weno_extrapolation_pre produced non-finite result: {:?}", result
-);
+        alpha_sum.iter().all(|&s| s.is_finite() && s > 0.0),
+        "alpha_sum non-finite/non-positive: {:?}",
+        alpha_sum
+    );
+    debug_assert!(
+        result.iter().all(|x| x.is_finite()),
+        "weno_extrapolation_pre produced non-finite result: {:?}",
+        result
+    );
 
     result
 }
@@ -429,10 +676,7 @@ struct EulerPrimitiveLocal {
 ///
 /// Total pressure is obtained from the existing Derived EOS helpers:
 /// p = pe + pi + pr.
-fn state_to_local_euler_primitive(
-    state: State,
-    normal: geometry::Vec2,
-) -> EulerPrimitiveLocal {
+fn state_to_local_euler_primitive(state: State, normal: geometry::Vec2) -> EulerPrimitiveLocal {
     let ux = state.mom_x / state.rho;
     let uy = state.mom_y / state.rho;
 
@@ -457,15 +701,11 @@ fn state_to_local_euler_primitive(
 ///
 /// The full kinetic energy must NOT be placed into every mode (that
 /// would triple-count it).
-fn local_euler_primitive_to_state(
-    w: EulerPrimitiveLocal,
-    normal: geometry::Vec2,
-) -> State {
+fn local_euler_primitive_to_state(w: EulerPrimitiveLocal, normal: geometry::Vec2) -> State {
     let ux = w.un * normal.x - w.ut * normal.y;
     let uy = w.un * normal.y + w.ut * normal.x;
 
-    let kinetic_mode =
-        0.5 * w.rho * (ux * ux + uy * uy) / 3.0;
+    let kinetic_mode = 0.5 * w.rho * (ux * ux + uy * uy) / 3.0;
 
     let pe = w.p / 3.0;
     let pi = w.p / 3.0;
@@ -506,11 +746,7 @@ fn primitive_curved_pressure_gradient(rho: f64, ut: f64, radius: f64) -> f64 {
 /// Identical machinery to `weno_extrapolation_pre`, but the extrapolated
 /// DATA are primitive variables rather than L-projected characteristics.
 /// Returns the k-th normal derivative of each primitive component.
-fn weno_extrapolation_pre_primitive(
-    bc: &GhostBC,
-    field: &field1::Field,
-    k: usize,
-) -> [f64; 4] {
+fn weno_extrapolation_pre_primitive(bc: &GhostBC, field: &field1::Field, k: usize) -> [f64; 4] {
     let n = bc.normal;
     let mut alpha = [[0.0; 5]; 4];
     let mut vks = [[0.0; 5]; 4];
@@ -639,11 +875,7 @@ fn primitive_wall_value(
         } else if k == 1 && PRIMITIVE_WALL_ILW_K1 {
             // EXPERIMENTAL curved-wall first normal derivative:
             // dp/dn = rho * ut^2 / R (paper Eq. (2.23)).
-            wk[3] = primitive_curved_pressure_gradient(
-                w0[0],
-                w0[2],
-                radius_of_curvature,
-            );
+            wk[3] = primitive_curved_pressure_gradient(w0[0], w0[2], radius_of_curvature);
         }
 
         for c in 0..4 {
@@ -704,11 +936,24 @@ fn primitive_wall_value(
     state
 }
 
-pub fn find_nearest_grid_point(project: geometry::Projection, field: &field1::Field) -> (isize, isize) {
-    let (i,j) = field.grid.coord2idx(project.point);
+pub fn find_nearest_grid_point(
+    project: geometry::Projection,
+    field: &field1::Field,
+) -> (isize, isize) {
+    let (i, j) = field.grid.coord2idx(project.point);
 
-    let idx_list = [(i,j),(i-1,j),(i+1,j),(i,j-1),(i,j+1),(i+1,j+1),(i+1,j-1),(i-1,j+1),(i-1,j-1)];
-    let mut target_idx = (0,0);
+    let idx_list = [
+        (i, j),
+        (i - 1, j),
+        (i + 1, j),
+        (i, j - 1),
+        (i, j + 1),
+        (i + 1, j + 1),
+        (i + 1, j - 1),
+        (i - 1, j + 1),
+        (i - 1, j - 1),
+    ];
+    let mut target_idx = (0, 0);
     let mut target_distance = 1e50;
     for k in 0..9 {
         if field.is_in_domain(idx_list[k]) {
@@ -718,20 +963,22 @@ pub fn find_nearest_grid_point(project: geometry::Projection, field: &field1::Fi
             if dis < target_distance {
                 target_idx = idx_list[k];
                 target_distance = dis;
-            }
-            else {
+            } else {
                 continue;
             }
-        }
-        else {
+        } else {
             continue;
         }
     }
     target_idx
 }
 /// build_local returns (L, R, lambda) in sequence
-/// 
-pub fn build_local(project: geometry::Projection,idx: (isize, isize), field: &field1::Field)->(Array2<f64>,Array2<f64>,Array1<f64>) {
+///
+pub fn build_local(
+    project: geometry::Projection,
+    idx: (isize, isize),
+    field: &field1::Field,
+) -> (Array2<f64>, Array2<f64>, Array1<f64>) {
     let (l, r, lambda) = build_local_plain(project.normal, idx, field);
     (
         Array2::from_shape_fn((6, 6), |(i, j)| l[i][j]),
@@ -741,11 +988,14 @@ pub fn build_local(project: geometry::Projection,idx: (isize, isize), field: &fi
 }
 
 /// Allocation-free variant of `build_local`.
-pub fn build_local_plain(normal: geometry::Vec2, idx: (isize, isize), field: &field1::Field)
-    -> ([[f64; 6]; 6], [[f64; 6]; 6], [f64; 6]) {
+pub fn build_local_plain(
+    normal: geometry::Vec2,
+    idx: (isize, isize),
+    field: &field1::Field,
+) -> ([[f64; 6]; 6], [[f64; 6]; 6], [f64; 6]) {
     let val = field.value[field.linear_index(idx)];
-    let mom_n = val.mom_x*normal.x + val.mom_y*normal.y;
-    let mom_t = -val.mom_x*normal.y + val.mom_y*normal.x;
+    let mom_n = val.mom_x * normal.x + val.mom_y * normal.y;
+    let mom_t = -val.mom_x * normal.y + val.mom_y * normal.x;
     let s1 = state::State {
         rho: val.rho,
         mom_x: mom_n,
@@ -761,8 +1011,7 @@ pub fn build_local_plain(normal: geometry::Vec2, idx: (isize, isize), field: &fi
     (l, r, lambda)
 }
 
-fn stencil2arr(stencil: Vec<(f64, f64, state::State)>) 
--> [Vec<(f64,f64,f64)>;6] {
+fn stencil2arr(stencil: Vec<(f64, f64, state::State)>) -> [Vec<(f64, f64, f64)>; 6] {
     let mut rho_list = vec![];
     let mut momx_list = vec![];
     let mut momy_list = vec![];
@@ -771,26 +1020,23 @@ fn stencil2arr(stencil: Vec<(f64, f64, state::State)>)
     let mut er_list = vec![];
 
     for i in 0..stencil.len() {
-        rho_list.push((stencil[i].0,stencil[i].1,stencil[i].2.rho));
-        momx_list.push((stencil[i].0,stencil[i].1,stencil[i].2.mom_x));
-        momy_list.push((stencil[i].0,stencil[i].1,stencil[i].2.mom_y));
-        ee_list.push((stencil[i].0,stencil[i].1,stencil[i].2.ee));
-        ei_list.push((stencil[i].0,stencil[i].1,stencil[i].2.ei));
-        er_list.push((stencil[i].0,stencil[i].1,stencil[i].2.er));
+        rho_list.push((stencil[i].0, stencil[i].1, stencil[i].2.rho));
+        momx_list.push((stencil[i].0, stencil[i].1, stencil[i].2.mom_x));
+        momy_list.push((stencil[i].0, stencil[i].1, stencil[i].2.mom_y));
+        ee_list.push((stencil[i].0, stencil[i].1, stencil[i].2.ee));
+        ei_list.push((stencil[i].0, stencil[i].1, stencil[i].2.ei));
+        er_list.push((stencil[i].0, stencil[i].1, stencil[i].2.er));
     }
-    [rho_list,momx_list,momy_list,ee_list,ei_list,er_list]
-
+    [rho_list, momx_list, momy_list, ee_list, ei_list, er_list]
 }
-
 
 /*
 This part is gonna be WENO extrpolation code, stencil extractor and ILW.
 A bridge between common boundary condition and characteristic wave should be built.
 */
 
-
 ///k indicate the derivative requested from this extrapolation,
-/// 
+///
 /// return should be \[V^(k); 6\], or `state::State`
 pub fn weno_extrapolation(
     project: geometry::Projection,
@@ -825,17 +1071,23 @@ pub fn weno_extrapolation(
         }
 
         let (b, v) = poly_regression(project, &rho_list, k, r, field);
-        beta[[r, 0]] = b; vk[[r, 0]] = v;
+        beta[[r, 0]] = b;
+        vk[[r, 0]] = v;
         let (b, v) = poly_regression(project, &momx_list, k, r, field);
-        beta[[r, 1]] = b; vk[[r, 1]] = v;
+        beta[[r, 1]] = b;
+        vk[[r, 1]] = v;
         let (b, v) = poly_regression(project, &momy_list, k, r, field);
-        beta[[r, 2]] = b; vk[[r, 2]] = v;
+        beta[[r, 2]] = b;
+        vk[[r, 2]] = v;
         let (b, v) = poly_regression(project, &ee_list, k, r, field);
-        beta[[r, 3]] = b; vk[[r, 3]] = v;
+        beta[[r, 3]] = b;
+        vk[[r, 3]] = v;
         let (b, v) = poly_regression(project, &ei_list, k, r, field);
-        beta[[r, 4]] = b; vk[[r, 4]] = v;
+        beta[[r, 4]] = b;
+        vk[[r, 4]] = v;
         let (b, v) = poly_regression(project, &er_list, k, r, field);
-        beta[[r, 5]] = b; vk[[r, 5]] = v;
+        beta[[r, 5]] = b;
+        vk[[r, 5]] = v;
     }
 
     // The paper assumes a uniform Cartesian mesh with dx=dy=h.
@@ -870,7 +1122,6 @@ pub fn weno_extrapolation(
     result
 }
 
-
 fn local_pressure_and_a2(rho: f64, u: f64, v: f64, ee: f64, ei: f64, er: f64) -> (f64, f64) {
     let w2 = u * u + v * v;
     let ee1 = ee / rho - w2 / 6.0;
@@ -882,9 +1133,8 @@ fn local_pressure_and_a2(rho: f64, u: f64, v: f64, ee: f64, ei: f64, er: f64) ->
     let gr = constant::GAMMA_R - 1.0;
 
     let p = rho * (ge * ee1 + gi * ei1 + gr * er1);
-    let a2 = constant::GAMMA_E * ge * ee1
-        + constant::GAMMA_I * gi * ei1
-        + constant::GAMMA_R * gr * er1;
+    let a2 =
+        constant::GAMMA_E * ge * ee1 + constant::GAMMA_I * gi * ei1 + constant::GAMMA_R * gr * er1;
 
     (p, a2)
 }
@@ -914,8 +1164,88 @@ fn build_ilw_row1(u0: &Array1<f64>) -> Array1<f64> {
     ]
 }
 
-fn solve6(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
-    a.solve(b).expect("singular ILW/extrapolation system at boundary")
+/// Fallible 6x6 dense solve for the ILW boundary systems.
+///
+/// A singular / numerically failed solve is an EXPECTED local failure
+/// mode for the high-order wall reconstruction (ill-conditioned local
+/// data near shocks / corners); the caller falls back to ReflectiveWall.
+#[inline]
+fn try_solve6(a: &Array2<f64>, b: &Array1<f64>) -> Option<Array1<f64>> {
+    a.solve(b).ok()
+}
+
+#[inline]
+fn state_is_finite(s: state::State) -> bool {
+    s.rho.is_finite()
+        && s.mom_x.is_finite()
+        && s.mom_y.is_finite()
+        && s.ee.is_finite()
+        && s.ei.is_finite()
+        && s.er.is_finite()
+}
+
+/// Finite, positive density and strictly positive modal internal energies
+/// (positive modal pressures). Reuses the existing `Derived` admissibility
+/// logic.
+#[inline]
+fn state_is_admissible(s: state::State) -> bool {
+    if !state_is_finite(s) || s.rho <= 0.0 {
+        return false;
+    }
+    let d = state::Derived::from_state(s);
+    d.e_e > 0.0 && d.e_i > 0.0 && d.e_r > 0.0
+}
+
+#[inline]
+fn arr6_is_finite(a: &[f64; 6]) -> bool {
+    a.iter().all(|x| x.is_finite())
+}
+
+/// Local-frame conservative array [rho, mom_n, mom_t, ee, ei, er] ->
+/// temporary physical State (rotation-invariant thermodynamic quantities).
+#[inline]
+fn local_arr_to_state(u: &Array1<f64>) -> state::State {
+    state::State {
+        rho: u[0],
+        mom_x: u[1],
+        mom_y: u[2],
+        ee: u[3],
+        ei: u[4],
+        er: u[5],
+    }
+}
+
+/// Rotate the Taylor-expanded local state back to Cartesian momentum and
+/// validate the FINAL ILW ghost before it is accepted.
+#[inline]
+fn finalize_ghost(
+    u_ghost: &Array1<f64>,
+    project: geometry::Projection,
+) -> Result<state::State, WallReconstructionFailure> {
+    // rotate momentum back: local (normal, tangential) -> global (x, y)
+    let n = project.normal;
+    let mom_n = u_ghost[1];
+    let mom_t = u_ghost[2];
+    let mom_x = mom_n * n.x - mom_t * n.y;
+    let mom_y = mom_n * n.y + mom_t * n.x;
+
+    let ghost = state::State {
+        rho: u_ghost[0],
+        mom_x,
+        mom_y,
+        ee: u_ghost[3],
+        ei: u_ghost[4],
+        er: u_ghost[5],
+    };
+
+    if !state_is_finite(ghost) {
+        return Err(WallReconstructionFailure::NonFiniteGhost);
+    }
+    if !state_is_admissible(ghost) {
+        return Err(WallReconstructionFailure::NonPhysicalGhost);
+    }
+
+    Ok(ghost)
 }
 
 fn zeroth_order_value(
@@ -968,9 +1298,7 @@ fn zeroth_order_value(
         let xq = field.grid.x(q.0);
         let yq = field.grid.y(q.1);
 
-        let d2 =
-            (xq - pi.x).powi(2)
-            + (yq - pi.y).powi(2);
+        let d2 = (xq - pi.x).powi(2) + (yq - pi.y).powi(2);
 
         if d2 < best_d2 {
             best_d2 = d2;
@@ -1026,8 +1354,7 @@ fn periodic_value(
     // Here the translating-shock case uses Ly = 0.5.
     let ly = 0.5_f64;
 
-    let np =
-        (ly / dy).round() as isize;
+    let np = (ly / dy).round() as isize;
 
     debug_assert!(np > 0);
 
@@ -1045,21 +1372,14 @@ fn periodic_value(
         panic!(
             "periodic wrapped point is not fluid: \
              ghost={:?}, wrapped={:?}, np={}, P0=({:.8e},{:.8e})",
-            idx,
-            wrapped_idx,
-            np,
-            project.point.x,
-            project.point.y,
+            idx, wrapped_idx, np, project.point.x, project.point.y,
         );
     }
 
     field.get(wrapped_idx)
 }
 
-fn robust_outflow_copy(
-    project: geometry::Projection,
-    field: &field1::Field,
-) -> State {
+fn robust_outflow_copy(project: geometry::Projection, field: &field1::Field) -> State {
     let n = project.normal;
     let h = field.grid.dx.min(field.grid.dy);
 
@@ -1084,27 +1404,221 @@ fn robust_outflow_copy(
     );
 }
 
+// ============================================================================
+// High-order ILW Wall reconstruction (fallible).
+//
+// BCType::Wall dispatch:
+//
+//     try_ilw_wall_value(...)
+//         Ok(ghost)                 -> ILW ghost (highest-quality local state)
+//         Err(reason)               -> LOCAL ReflectiveWall fallback
+//
+// The mathematics of a SUCCESSFUL reconstruction is unchanged from the
+// original inline Wall implementation (same characteristic matrices, same
+// WENO extrapolation, same ILW row substitution, same Taylor expansion,
+// same momentum rotation). The fallback is per ghost point; it never
+// downgrades the whole boundary.
+// ============================================================================
+
+/// Wall hierarchy dispatch for one ghost point.
+#[inline]
+fn wall_value_with_fallback(
+    idx: (isize, isize),
+    project: geometry::Projection,
+    field: &field1::Field,
+    bc_pre: Option<&GhostBC>,
+) -> state::State {
+    match try_ilw_wall_value::<WALL_TAYLOR_ORDER>(idx, project, field, bc_pre) {
+        Ok(s) => {
+            ILW_WALL_SUCCESS.fetch_add(1, Ordering::Relaxed);
+            s
+        }
+        Err(reason) => {
+            record_wall_fallback(reason);
+            reflective_wall_value(idx, project, field)
+        }
+    }
+}
+
+/// High-order ILW Wall reconstruction with explicit, validated failure
+/// modes. `ORDER` is the Taylor order (0..=4); only the derivative orders
+/// up to `ORDER` are computed.
+fn try_ilw_wall_value<const ORDER: usize>(
+    idx: (isize, isize),
+    project: geometry::Projection,
+    field: &field1::Field,
+    bc_pre: Option<&GhostBC>,
+) -> Result<state::State, WallReconstructionFailure> {
+    const {
+        assert!(ORDER <= 4, "WALL_TAYLOR_ORDER must be in 0..=4");
+    }
+
+    // --------------------------------------------------------------------
+    // Characteristic matrix source state / stencil availability.
+    //
+    // The characteristic matrix is evaluated at U_0, the interior grid
+    // point nearest to the boundary foot P_0 (Tan et al., Sec. 2.3),
+    // never at the ghost-cell index itself.
+    //
+    // Fast path: per-ghost stencil/regression data were precomputed at
+    // GhostGrid build time. Slow path (tests / standalone use): rebuild
+    // everything per call — but FIRST check that the paper WENO stencils
+    // can even be formed; a missing stencil is a normal failure mode.
+    // --------------------------------------------------------------------
+    let nearest_idx = match bc_pre {
+        Some(pre) => pre.nearest,
+        None => {
+            if !weno_stencil_available(project, field) {
+                return Err(WallReconstructionFailure::InsufficientStencil);
+            }
+            find_nearest_grid_point(project, field)
+        }
+    };
+
+    // --------------------------------------------------------------------
+    // The interior state feeding build_local/build_local_plain must be
+    // admissible, otherwise cs^2 <= 0 turns the characteristic matrices
+    // into NaN and poisons every downstream quantity.
+    // --------------------------------------------------------------------
+    let near_state = field.value[field.linear_index(nearest_idx)];
+    if !state_is_admissible(near_state) {
+        return Err(WallReconstructionFailure::NonPhysicalBoundaryState);
+    }
+
+    let mut v = [[0.0; 6]; 5];
+    let (left, right) = if let Some(pre) = bc_pre {
+        let (l_plain, r_plain, _lam) = build_local_plain(project.normal, pre.nearest, field);
+        let left = Array2::from_shape_fn((6, 6), |(i, j)| l_plain[i][j]);
+        let right = Array2::from_shape_fn((6, 6), |(i, j)| r_plain[i][j]);
+        if !left.iter().all(|x| x.is_finite()) || !right.iter().all(|x| x.is_finite()) {
+            return Err(WallReconstructionFailure::InvalidSoundSpeed);
+        }
+        for k in 0..=ORDER {
+            v[k] = weno_extrapolation_pre(&l_plain, pre, field, k);
+        }
+        (left, right)
+    } else {
+        let (left, right, _lam) = build_local(project, nearest_idx, field);
+        if !left.iter().all(|x| x.is_finite()) || !right.iter().all(|x| x.is_finite()) {
+            return Err(WallReconstructionFailure::InvalidSoundSpeed);
+        }
+        for k in 0..=ORDER {
+            v[k] = weno_extrapolation(project, field, k);
+        }
+        (left, right)
+    };
+
+    // --------------------------------------------------------------------
+    // Validate every required WENO extrapolation BEFORE it propagates
+    // into the ILW systems / characteristic transforms.
+    // --------------------------------------------------------------------
+    for k in 0..=ORDER {
+        if !arr6_is_finite(&v[k]) {
+            return Err(WallReconstructionFailure::NonFiniteWeno);
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // k = 0: enforce mom_n = 0 (no-penetration), and extrapolate the
+    // other five outgoing characteristics — Eq. (2.19).
+    // --------------------------------------------------------------------
+    let mut left0 = left.clone();
+    for c in 0..6 {
+        left0[[0, c]] = if c == 1 { 1.0 } else { 0.0 };
+    }
+    let mut rhs0 = Array1::from_vec(v[0].to_vec());
+    rhs0[0] = 0.0;
+    let u0 = try_solve6(&left0, &rhs0).ok_or(WallReconstructionFailure::SingularIlwSystem)?;
+    debug_assert!(
+        u0.iter().all(|x| x.is_finite()),
+        "u0 non-finite, idx={:?}",
+        idx
+    );
+    if !u0.iter().all(|x| x.is_finite()) {
+        return Err(WallReconstructionFailure::NonFiniteWeno);
+    }
+    let s0 = local_arr_to_state(&u0);
+    if !state_is_admissible(s0) {
+        return Err(WallReconstructionFailure::NonPhysicalBoundaryState);
+    }
+
+    // --------------------------------------------------------------------
+    // Sound speed of U^(0): must be finite and positive before any
+    // higher-order work proceeds.
+    // --------------------------------------------------------------------
+    let (_p0, a2) = local_pressure_and_a2(u0[0], u0[1] / u0[0], u0[2] / u0[0], u0[3], u0[4], u0[5]);
+    if !a2.is_finite() || a2 <= 0.0 {
+        return Err(WallReconstructionFailure::InvalidSoundSpeed);
+    }
+
+    if ORDER == 0 {
+        return finalize_ghost(&u0, project);
+    }
+
+    // --------------------------------------------------------------------
+    // k = 1: ILW momentum row + extrapolation rows — Eq. (2.20)/(2.22)
+    // analogue. R -> infinity for flat polygon walls, so the curvature
+    // RHS term is 0.
+    // --------------------------------------------------------------------
+    let mut left1 = left.clone();
+    let row1 = build_ilw_row1(&u0);
+    for c in 0..6 {
+        left1[[0, c]] = row1[c];
+    }
+    let mut rhs1 = Array1::from_vec(v[1].to_vec());
+    rhs1[0] = 0.0; // TODO: nonzero once curved geometries are supported
+    let u1 = try_solve6(&left1, &rhs1).ok_or(WallReconstructionFailure::SingularIlwSystem)?;
+    if !u1.iter().all(|x| x.is_finite()) {
+        return Err(WallReconstructionFailure::NonFiniteDerivative);
+    }
+
+    // --------------------------------------------------------------------
+    // Taylor expansion to the ghost point, Eq. (2.17). project.distance
+    // is the signed normal offset D of the ghost point relative to the
+    // boundary foot point x0.
+    // --------------------------------------------------------------------
+    let d = project.distance;
+    let mut u_ghost = u0.clone();
+    let mut coef = 1.0;
+    coef *= d;
+    u_ghost = u_ghost + coef * &u1;
+
+    if ORDER == 1 {
+        return finalize_ghost(&u_ghost, project);
+    }
+
+    // --------------------------------------------------------------------
+    // k = 2..=ORDER: pure WENO extrapolation, Eq. (2.21).
+    // No ILW / PDE substitution needed here.
+    // --------------------------------------------------------------------
+    for k in 2..=ORDER {
+        let rhs_k = Array1::from_vec(v[k].to_vec());
+        let uk = right.dot(&rhs_k);
+        if !uk.iter().all(|x| x.is_finite()) {
+            return Err(WallReconstructionFailure::NonFiniteDerivative);
+        }
+        coef *= d / (k as f64);
+        u_ghost = u_ghost + coef * &uk;
+    }
+
+    finalize_ghost(&u_ghost, project)
+}
+
 pub fn set_ghost_point_value(
-    idx:(isize,isize),
+    idx: (isize, isize),
     project: geometry::Projection,
     boundary: crate::ghost::BoundaryKind,
     boundary_id: usize,
     field: &field1::Field,
     bc_pre: Option<&GhostBC>,
-)
--> state::State {
-
+) -> state::State {
     let bc = match boundary {
-    crate::ghost::BoundaryKind::Outer => {
-        &field.outer_boundary[boundary_id].bc
-    }
+        crate::ghost::BoundaryKind::Outer => &field.outer_boundary[boundary_id].bc,
 
-    crate::ghost::BoundaryKind::Inner => {
-        &field.inner_boundary[boundary_id].bc
-    }
+        crate::ghost::BoundaryKind::Inner => &field.inner_boundary[boundary_id].bc,
     };
 
-    let t= field.time;
+    let t = field.time;
 
     if let BCType::Constant(value) = bc {
         return *value;
@@ -1114,29 +1628,21 @@ pub fn set_ghost_point_value(
     }
 
     if let BCType::ReflectiveWall = bc {
-        return reflective_wall_value(
-            idx,
-            project,
-            field,
-        );
+        return reflective_wall_value(idx, project, field);
     }
 
     if let BCType::ZerothOrder = bc {
         return robust_outflow_copy(project, field);
-    //return zeroth_order_value(
-    //    idx,
-    //    project,
-    //    field,
-    //);
+        //return zeroth_order_value(
+        //    idx,
+        //    project,
+        //    field,
+        //);
     }
 
     if let BCType::Periodic = bc {
-    return periodic_value(
-        idx,
-        project,
-        field,
-    );
-    }   
+        return periodic_value(idx, project, field);
+    }
 
     // ------------------------------------------------------------
     // PrimitiveWall: local Euler primitive [rho, un, ut, p] wall.
@@ -1147,16 +1653,12 @@ pub fn set_ghost_point_value(
     // ------------------------------------------------------------
     if let BCType::PrimitiveWall = bc {
         let radius = match boundary {
-            crate::ghost::BoundaryKind::Outer => {
-                field.outer_boundary[boundary_id]
-                    .geometry
-                    .radius_of_curvature(project.point)
-            }
-            crate::ghost::BoundaryKind::Inner => {
-                field.inner_boundary[boundary_id]
-                    .geometry
-                    .radius_of_curvature(project.point)
-            }
+            crate::ghost::BoundaryKind::Outer => field.outer_boundary[boundary_id]
+                .geometry
+                .radius_of_curvature(project.point),
+            crate::ghost::BoundaryKind::Inner => field.inner_boundary[boundary_id]
+                .geometry
+                .radius_of_curvature(project.point),
         };
 
         if let Some(pre) = bc_pre {
@@ -1171,6 +1673,15 @@ pub fn set_ghost_point_value(
         return primitive_wall_value(idx, project, &own, field, radius);
     }
 
+    // ------------------------------------------------------------
+    // Wall: high-order ILW reconstruction with a LOCAL ReflectiveWall
+    // fallback. A single untrustworthy ILW ghost never aborts the
+    // simulation nor downgrades the rest of the boundary.
+    // ------------------------------------------------------------
+    if let BCType::Wall = bc {
+        return wall_value_with_fallback(idx, project, field, bc_pre);
+    }
+
     let mut v = [[0.0; 6]; 5];
     // The characteristic matrix is evaluated at U_0, the interior grid
     // point nearest to the boundary foot P_0 (Tan et al., Sec. 2.3),
@@ -1180,8 +1691,7 @@ pub fn set_ghost_point_value(
     // GhostGrid build time. Slow path (tests / standalone use): rebuild
     // everything per call.
     let (left, right, lambda) = if let Some(pre) = bc_pre {
-        let (l_plain, r_plain, lam) =
-            build_local_plain(project.normal, pre.nearest, field);
+        let (l_plain, r_plain, lam) = build_local_plain(project.normal, pre.nearest, field);
         for k in 0..5 {
             v[k] = weno_extrapolation_pre(&l_plain, pre, field, k);
         }
@@ -1209,76 +1719,14 @@ pub fn set_ghost_point_value(
 
             state::State::new()
         }
-        BCType::Wall => {
-            // ---------------------------------------------------------
-            // k = 0: enforce mom_n = 0 (no-penetration), and extrapolate
-            //        the other five outgoing characteristics — Eq. (2.19).
-            // ---------------------------------------------------------
-            let mut left0 = left.clone();
-            for c in 0..6 {
-                left0[[0, c]] = if c == 1 { 1.0 } else { 0.0 };
-            }
-            let mut rhs0 = Array1::from_vec(v[0].to_vec());
-            rhs0[0] = 0.0;
-            let u0 = solve6(&left0, &rhs0);
-            debug_assert!(u0.iter().all(|x| x.is_finite()), "u0 non-finite, idx={:?}", idx);
-            // ---------------------------------------------------------
-            // k = 1: ILW momentum row + extrapolation rows — Eq. (2.20)/(2.22)
-            //        analogue. R -> infinity for flat polygon walls,
-            //        so the curvature RHS term is 0.
-            // ---------------------------------------------------------
-            let mut left1 = left.clone();
-            let row1 = build_ilw_row1(&u0);
-            for c in 0..6 {
-                left1[[0, c]] = row1[c];
-            }
-            let mut rhs1 = Array1::from_vec(v[1].to_vec());
-            rhs1[0] = 0.0; // TODO: nonzero once curved geometries are supported
-            let u1 = solve6(&left1, &rhs1);
-
-            // ---------------------------------------------------------
-            // k = 2,3,4: pure WENO extrapolation, Eq. (2.21).
-            //            No ILW / PDE substitution needed here.
-            // ---------------------------------------------------------
-            let mut u = vec![u0, u1, Array1::zeros(6), Array1::zeros(6), Array1::zeros(6)];
-            for k in 2..=4 {
-                let rhs_k = Array1::from_vec(v[k].to_vec());
-                u[k] = right.dot(&rhs_k);
-            }
-
-            // ---------------------------------------------------------
-            // Taylor expansion to the ghost point, Eq. (2.17).
-            // project.distance is the signed normal offset D of the
-            // ghost point relative to the boundary foot point x0.
-            // ---------------------------------------------------------
-            let d = project.distance;
-            let mut u_ghost = u[0].clone();
-            let mut coef = 1.0;
-            for k in 1..=WALL_TAYLOR_ORDER {
-                coef *= d / (k as f64);
-                u_ghost = u_ghost + coef * &u[k];
-            }
-
-            // rotate momentum back: local (normal, tangential) -> global (x, y)
-            let n = project.normal;
-            let mom_n = u_ghost[1];
-            let mom_t = u_ghost[2];
-            let mom_x = mom_n * n.x - mom_t * n.y;
-            let mom_y = mom_n * n.y + mom_t * n.x;
-
-            state::State {
-                rho: u_ghost[0],
-                mom_x,
-                mom_y,
-                ee: u_ghost[3],
-                ei: u_ghost[4],
-                er: u_ghost[5],
-            }
-        }
 
         // Symmetry / Periodic / Constant(_) still need their own row-0
         // substitution (different g(t), different BC-row structure).
-        BCType::Outflow { p_inf, sigma, l_domain } => {
+        BCType::Outflow {
+            p_inf,
+            sigma,
+            l_domain,
+        } => {
             // ---------------------------------------------------------
             // k = 0: no algebraic constraint on the state itself at this
             //        order — LODI relaxation only touches the wave
@@ -1310,9 +1758,9 @@ pub fn set_ghost_point_value(
             }
             // else: this boundary point is locally supersonic-out; row 0 is
             // also outgoing there, so leave the WENO-extrapolated value alone.
-        
+
             let u1 = right.dot(&rhs1);
-        
+
             // ---------------------------------------------------------
             // k = 2,3,4: pure extrapolation, unchanged left/right.
             // ---------------------------------------------------------
@@ -1321,24 +1769,24 @@ pub fn set_ghost_point_value(
                 let rhs_k = Array1::from_vec(v[k].to_vec());
                 u[k] = right.dot(&rhs_k);
             }
-        
+
             // ---------------------------------------------------------
             // Taylor expansion + rotate back to global frame (same as Wall).
             // ---------------------------------------------------------
             let d = project.distance;
             let mut u_ghost = u[0].clone();
             let mut coef = 1.0;
-            for k in 1..= OUTFLOW_TAYLOR_ORDER {
+            for k in 1..=OUTFLOW_TAYLOR_ORDER {
                 coef *= d / (k as f64);
                 u_ghost = u_ghost + coef * &u[k];
             }
-        
+
             let n = project.normal;
             let mom_n = u_ghost[1];
             let mom_t = u_ghost[2];
             let mom_x = mom_n * n.x - mom_t * n.y;
             let mom_y = mom_n * n.y + mom_t * n.x;
-        
+
             state::State {
                 rho: u_ghost[0],
                 mom_x,
@@ -1347,108 +1795,196 @@ pub fn set_ghost_point_value(
                 ei: u_ghost[4],
                 er: u_ghost[5],
             }
-        },
-        BCType::FarField(u_inf) => {
-    // Characteristic matrices are evaluated from the nearest
-    // interior state, exactly as in the existing BC machinery
-    // (already computed above with the correct idx_near).
-
-    // ------------------------------------------------------------
-    // Convert freestream state to the LOCAL (normal,tangential)
-    // coordinate system before applying L.
-    // ------------------------------------------------------------
-    let n = project.normal;
-
-    let uinf_local = rotate_state_to_local(*u_inf, n);
-    let uinf_arr =
-        Array1::from_vec(uinf_local.state2arr().to_vec());
-
-    let v_inf = left.dot(&uinf_arr);
-
-    // u[k] = kth normal derivative of conservative state
-    let mut u = vec![
-        Array1::zeros(6),
-        Array1::zeros(6),
-        Array1::zeros(6),
-        Array1::zeros(6),
-        Array1::zeros(6),
-    ];
-
-    // ------------------------------------------------------------
-    // k = 0
-    //
-    // outgoing characteristic : WENO extrapolation
-    // incoming characteristic : freestream
-    // ------------------------------------------------------------
-    let mut rhs0 =
-        Array1::from_vec(v[0].to_vec());
-
-    for m in 0..6 {
-        if lambda[m] < 0.0 {
-            rhs0[m] = v_inf[m];
         }
-    }
+        BCType::FarField(u_inf) => {
+            // Characteristic matrices are evaluated from the nearest
+            // interior state, exactly as in the existing BC machinery
+            // (already computed above with the correct idx_near).
 
-    u[0] = right.dot(&rhs0);
+            // ------------------------------------------------------------
+            // Convert freestream state to the LOCAL (normal,tangential)
+            // coordinate system before applying L.
+            // ------------------------------------------------------------
+            let n = project.normal;
 
-    // ------------------------------------------------------------
-    // k = 1..4
-    //
-    // Far-field state is spatially constant, therefore incoming
-    // characteristic derivatives are zero.
-    // ------------------------------------------------------------
-    for k in 1..=4 {
-        let mut rhs_k =
-            Array1::from_vec(v[k].to_vec());
+            let uinf_local = rotate_state_to_local(*u_inf, n);
+            let uinf_arr = Array1::from_vec(uinf_local.state2arr().to_vec());
 
-        for m in 0..6 {
-            if lambda[m] < 0.0 {
-                rhs_k[m] = 0.0;
+            let v_inf = left.dot(&uinf_arr);
+
+            // u[k] = kth normal derivative of conservative state
+            let mut u = vec![
+                Array1::zeros(6),
+                Array1::zeros(6),
+                Array1::zeros(6),
+                Array1::zeros(6),
+                Array1::zeros(6),
+            ];
+
+            // ------------------------------------------------------------
+            // k = 0
+            //
+            // outgoing characteristic : WENO extrapolation
+            // incoming characteristic : freestream
+            // ------------------------------------------------------------
+            let mut rhs0 = Array1::from_vec(v[0].to_vec());
+
+            for m in 0..6 {
+                if lambda[m] < 0.0 {
+                    rhs0[m] = v_inf[m];
+                }
+            }
+
+            u[0] = right.dot(&rhs0);
+
+            // ------------------------------------------------------------
+            // k = 1..4
+            //
+            // Far-field state is spatially constant, therefore incoming
+            // characteristic derivatives are zero.
+            // ------------------------------------------------------------
+            for k in 1..=4 {
+                let mut rhs_k = Array1::from_vec(v[k].to_vec());
+
+                for m in 0..6 {
+                    if lambda[m] < 0.0 {
+                        rhs_k[m] = 0.0;
+                    }
+                }
+
+                u[k] = right.dot(&rhs_k);
+            }
+
+            // ------------------------------------------------------------
+            // Taylor expansion from boundary foot P0 to ghost point
+            // ------------------------------------------------------------
+            let d = project.distance;
+
+            let mut u_ghost = u[0].clone();
+            let mut coef = 1.0;
+
+            for k in 1..=WALL_TAYLOR_ORDER {
+                coef *= d / (k as f64);
+                u_ghost = u_ghost + coef * &u[k];
+            }
+
+            // ------------------------------------------------------------
+            // local momentum -> global momentum
+            // ------------------------------------------------------------
+            let mom_n = u_ghost[1];
+            let mom_t = u_ghost[2];
+
+            let mom_x = mom_n * n.x - mom_t * n.y;
+
+            let mom_y = mom_n * n.y + mom_t * n.x;
+
+            state::State {
+                rho: u_ghost[0],
+                mom_x,
+                mom_y,
+                ee: u_ghost[3],
+                ei: u_ghost[4],
+                er: u_ghost[5],
             }
         }
-
-        u[k] = right.dot(&rhs_k);
-    }
-
-    // ------------------------------------------------------------
-    // Taylor expansion from boundary foot P0 to ghost point
-    // ------------------------------------------------------------
-    let d = project.distance;
-
-    let mut u_ghost = u[0].clone();
-    let mut coef = 1.0;
-
-    for k in 1..=WALL_TAYLOR_ORDER {
-        coef *= d / (k as f64);
-        u_ghost = u_ghost + coef * &u[k];
-    }
-
-    // ------------------------------------------------------------
-    // local momentum -> global momentum
-    // ------------------------------------------------------------
-    let mom_n = u_ghost[1];
-    let mom_t = u_ghost[2];
-
-    let mom_x =
-        mom_n * n.x - mom_t * n.y;
-
-    let mom_y =
-        mom_n * n.y + mom_t * n.x;
-
-    state::State {
-        rho: u_ghost[0],
-        mom_x,
-        mom_y,
-        ee: u_ghost[3],
-        ei: u_ghost[4],
-        er: u_ghost[5],
-    }
-},
         BCType::Constant(_) | BCType::TimeDependent(_) | BCType::ReflectiveWall => unreachable!(),
         _ => state::State::new(),
     }
 }
 
+/// ReflectiveWall interior source selection.
+///
+/// Hierarchy:
+///
+///     1. PREFERRED: inward search along the owner boundary normal,
+///        P(s) = P0 - s n, s > 0. project.normal is the FLUID-DOMAIN
+///        outward normal, so -n points into the fluid. This behaves well
+///        for smooth walls (better than the old arbitrary 3x3
+///        nearest-image-node search) and remains the fast path.
+///
+///     2. CORNER/ENDPOINT FALLBACK: at polygon corners and LineSegment
+///        endpoints a single segment normal is insufficient: the inward
+///        ray may lie ON an adjacent boundary (e.g. P0 = (20,-5),
+///        n = (0,-1) with x = 20 itself a wall). Search progressively
+///        larger square shells around coord2idx(P0) for a fluid cell,
+///        choosing the physically closest cell in the first shell that
+///        contains one. Physical Cartesian distance is used because dx
+///        and dy may differ.
+///
+/// NOTE: momentum reflection afterwards still uses project.normal (the
+/// owner segment normal). A dedicated corner-normal treatment is a
+/// possible future improvement; it is deliberately out of scope here.
+#[inline]
+fn find_reflective_wall_source(
+    project: geometry::Projection,
+    field: &field1::Field,
+) -> Option<(isize, isize)> {
+    let n = project.normal;
+
+    let h = field.grid.dx.min(field.grid.dy);
+
+    // ------------------------------------------------------------
+    // 1. Preferred: inward normal search.
+    // ------------------------------------------------------------
+    for k in 1..=16 {
+        let d = 0.5 * k as f64 * h;
+
+        let p = geometry::Point {
+            x: project.point.x - d * n.x,
+            y: project.point.y - d * n.y,
+        };
+
+        let q = field.grid.coord2idx(p);
+
+        if field.is_in_domain(q) {
+            REFLECTIVE_NORMAL_SUCCESS.fetch_add(1, Ordering::Relaxed);
+            return Some(q);
+        }
+    }
+
+    // ------------------------------------------------------------
+    // 2. Corner / endpoint fallback: local 2-D square-shell search.
+    //    No allocations; only the current shell is scanned.
+    // ------------------------------------------------------------
+    let (ic, jc) = field.grid.coord2idx(project.point);
+
+    for radius in 1..=REFLECTIVE_CORNER_SEARCH_RADIUS {
+        let mut best: Option<((isize, isize), f64)> = None;
+
+        for di in -radius..=radius {
+            for dj in -radius..=radius {
+                if di.abs() != radius && dj.abs() != radius {
+                    continue;
+                }
+
+                let q = (ic + di, jc + dj);
+
+                if !field.is_in_domain(q) {
+                    continue;
+                }
+
+                let xq = field.grid.x(q.0);
+                let yq = field.grid.y(q.1);
+
+                let d2 = (xq - project.point.x).powi(2) + (yq - project.point.y).powi(2);
+
+                if best.is_none_or(|(_, bd2)| d2 < bd2) {
+                    best = Some((q, d2));
+                }
+            }
+        }
+
+        if let Some((q, _)) = best {
+            REFLECTIVE_CORNER_FALLBACK.fetch_add(1, Ordering::Relaxed);
+            return Some(q);
+        }
+    }
+
+    REFLECTIVE_SOURCE_FAILURE.fetch_add(1, Ordering::Relaxed);
+    None
+}
+
+#[inline]
 fn reflective_wall_value(
     idx: (isize, isize),
     project: geometry::Projection,
@@ -1457,96 +1993,50 @@ fn reflective_wall_value(
     let n = project.normal;
 
     // ------------------------------------------------------------
-    // Mirror the ghost point geometrically across the wall.
-    //
-    // project.distance = signed normal distance from ghost to P0.
-    //
-    // If Pg is the ghost point and P0 the wall foot,
-    //
-    //     Pi = 2 P0 - Pg
-    //
+    // Find a robust interior source state: inward normal search
+    // first, local 2-D corner/endpoint search as fallback.
     // ------------------------------------------------------------
 
-    let pg = geometry::Point {
-        x: field.grid.x(idx.0),
-        y: field.grid.y(idx.1),
-    };
+    let source = find_reflective_wall_source(project, field).unwrap_or_else(|| {
+        let pg = geometry::Point {
+            x: field.grid.x(idx.0),
+            y: field.grid.y(idx.1),
+        };
+        let (ic, jc) = field.grid.coord2idx(project.point);
+        panic!(
+            "cannot find reflective-wall interior source\n\
+             ghost         = {:?}\n\
+             Pg            = ({:.16e}, {:.16e})\n\
+             P0            = ({:.16e}, {:.16e})\n\
+             n             = ({:.16e}, {:.16e})\n\
+             center index  = ({}, {})\n\
+             search radius = {}\n\
+             (corrupt fluid mask, wrong boundary ownership, incorrect \
+              normal convention, or invalid polygon geometry)",
+            idx,
+            pg.x,
+            pg.y,
+            project.point.x,
+            project.point.y,
+            project.normal.x,
+            project.normal.y,
+            ic,
+            jc,
+            REFLECTIVE_CORNER_SEARCH_RADIUS,
+        )
+    });
 
-    let pi = geometry::Point {
-        x: 2.0 * project.point.x - pg.x,
-        y: 2.0 * project.point.y - pg.y,
-    };
-
-    // Nearest Cartesian grid point to the reflected position.
-    let (ic, jc) =
-        field.grid.coord2idx(pi);
-
-    // Search a small neighborhood in case coord2idx lands on a
-    // non-fluid point near an oblique polygon boundary.
-    let candidates = [
-        (ic, jc),
-        (ic - 1, jc),
-        (ic + 1, jc),
-        (ic, jc - 1),
-        (ic, jc + 1),
-        (ic - 1, jc - 1),
-        (ic - 1, jc + 1),
-        (ic + 1, jc - 1),
-        (ic + 1, jc + 1),
-    ];
-
-    let mut best = None;
-    let mut best_d2 = f64::INFINITY;
-
-    for q in candidates {
-        if !field.is_in_domain(q) {
-            continue;
-        }
-
-        let xq = field.grid.x(q.0);
-        let yq = field.grid.y(q.1);
-
-        let d2 =
-            (xq - pi.x).powi(2)
-            + (yq - pi.y).powi(2);
-
-        if d2 < best_d2 {
-            best_d2 = d2;
-            best = Some(q);
-        }
-    }
-
-    let interior_idx =
-        best.unwrap_or_else(|| {
-            panic!(
-                "cannot find reflected interior point for ghost {:?}",
-                idx
-            )
-        });
-
-    // IMPORTANT:
-    // interior_idx has already been checked as fluid.
-    let s =
-        field.value[
-            field.linear_index(interior_idx)
-        ];
+    let s = field.value[field.linear_index(source)];
 
     // ------------------------------------------------------------
-    // Reflect momentum relative to arbitrary polygon normal.
+    // Reflect only the normal momentum.
     // ------------------------------------------------------------
 
-    let mom_n =
-        s.mom_x * n.x
-        + s.mom_y * n.y;
+    let mom_n = s.mom_x * n.x + s.mom_y * n.y;
 
-    // m_g = m_i - 2 (m_i . n) n
-    let mom_x =
-        s.mom_x
-        - 2.0 * mom_n * n.x;
+    let mom_x = s.mom_x - 2.0 * mom_n * n.x;
 
-    let mom_y =
-        s.mom_y
-        - 2.0 * mom_n * n.y;
+    let mom_y = s.mom_y - 2.0 * mom_n * n.y;
 
     state::State {
         rho: s.rho,
@@ -1558,16 +2048,18 @@ fn reflective_wall_value(
     }
 }
 
-fn poly_regression(project: geometry::Projection,
+fn poly_regression(
+    project: geometry::Projection,
     stencil: &Vec<(f64, f64, f64)>,
-    k:usize,r: usize, 
-    field: &field1::Field) 
--> (f64, f64) {
-    let h  = (field.grid.dx*field.grid.dy).sqrt();
-    let poly  = fit_polynomial_surface(&stencil, r);
+    k: usize,
+    r: usize,
+    field: &field1::Field,
+) -> (f64, f64) {
+    let h = (field.grid.dx * field.grid.dy).sqrt();
+    let poly = fit_polynomial_surface(&stencil, r);
     let smooth_indicator = smooth_indicator(&poly, r, h);
     let v_kp = x_derivative_at_origin(&poly, r, k);
-    (smooth_indicator,v_kp)
+    (smooth_indicator, v_kp)
 }
 
 /// Coefficient ordering:
@@ -1589,11 +2081,7 @@ fn poly_regression(project: geometry::Projection,
 /// [a00, a10, a01, a20, a11, a02,
 ///  a30, a21, a12, a03,
 ///  a40, a31, a22, a13, a04]
-pub fn smooth_indicator(
-    coef: &DVector<f64>,
-    r: usize,
-    h: f64,
-) -> f64 {
+pub fn smooth_indicator(coef: &DVector<f64>, r: usize, h: f64) -> f64 {
     assert!(r <= 4, "Only r = 0..4 is supported.");
 
     let expected_len = (r + 1) * (r + 2) / 2;
@@ -1671,21 +2159,14 @@ fn derivative_coeffs(
                 factor *= (j - m) as f64;
             }
 
-            result.push((
-                (i - ax, j - ay),
-                aij * factor,
-            ));
+            result.push(((i - ax, j - ay), aij * factor));
         }
     }
 
     result
 }
 
-fn integrate_square(
-    poly: &[((usize, usize), f64)],
-    _degree: usize,
-    h: f64,
-) -> f64 {
+fn integrate_square(poly: &[((usize, usize), f64)], _degree: usize, h: f64) -> f64 {
     let mut result = 0.0;
 
     for &((i1, j1), c1) in poly {
@@ -1713,8 +2194,7 @@ fn integrate_1d_monomial(power: usize, h: f64) -> f64 {
 
     let half = 0.5 * h;
 
-    2.0 * half.powi((power + 1) as i32)
-        / (power + 1) as f64
+    2.0 * half.powi((power + 1) as i32) / (power + 1) as f64
 }
 
 /// Fit
@@ -1734,10 +2214,7 @@ fn integrate_1d_monomial(power: usize, h: f64) -> f64 {
 ///
 /// degree 3:
 ///     1, y, x, y^2, xy, x^2, y^3, xy^2, x^2y, x^3
-pub fn fit_polynomial_surface(
-    data: &[(f64, f64, f64)],
-    degree: usize,
-) -> DVector<f64> {
+pub fn fit_polynomial_surface(data: &[(f64, f64, f64)], degree: usize) -> DVector<f64> {
     let n_points = data.len();
 
     let n_terms = (degree + 1) * (degree + 2) / 2;
@@ -1758,8 +2235,7 @@ pub fn fit_polynomial_surface(
             for i in 0..=total_degree {
                 let j = total_degree - i;
 
-                a[(row, col)] =
-                    x.powi(i as i32) * y.powi(j as i32);
+                a[(row, col)] = x.powi(i as i32) * y.powi(j as i32);
 
                 col += 1;
             }
@@ -1777,9 +2253,7 @@ pub fn fit_polynomial_surface(
 
 /// Compute factorial(n) as f64.
 fn factorial(n: usize) -> f64 {
-    (1..=n)
-        .map(|k| k as f64)
-        .product()
+    (1..=n).map(|k| k as f64).product()
 }
 
 /// Returns the k-th derivative with respect to x at (0, 0):
@@ -1787,11 +2261,7 @@ fn factorial(n: usize) -> f64 {
 ///     d^k p / dx^k (0,0)
 ///
 /// If k > degree, returns 0.0.
-pub fn x_derivative_at_origin(
-    coeffs: &DVector<f64>,
-    degree: usize,
-    k: usize,
-) -> f64 {
+pub fn x_derivative_at_origin(coeffs: &DVector<f64>, degree: usize, k: usize) -> f64 {
     // A polynomial of degree `degree` has zero
     // derivatives of order greater than `degree`.
     if k > degree {
@@ -1825,13 +2295,8 @@ pub fn x_derivative_at_origin(
     0.0
 }
 
-fn first_interior_j(
-    project: geometry::Projection,
-    field: &field1::Field,
-) -> isize {
-    let q =
-        (project.point.y - field.grid.y0)
-        / field.grid.dy;
+fn first_interior_j(project: geometry::Projection, field: &field1::Field) -> isize {
+    let q = (project.point.y - field.grid.y0) / field.grid.dy;
 
     let mut j = if project.normal.y > 0.0 {
         q.ceil() as isize - 1
@@ -1839,21 +2304,13 @@ fn first_interior_j(
         q.floor() as isize + 1
     };
 
-    j = j.clamp(
-        0,
-        field.grid.ny as isize - 1,
-    );
+    j = j.clamp(0, field.grid.ny as isize - 1);
 
     j
 }
 
-fn first_interior_i(
-    project: geometry::Projection,
-    field: &field1::Field,
-) -> isize {
-    let q =
-        (project.point.x - field.grid.x0)
-        / field.grid.dx;
+fn first_interior_i(project: geometry::Projection, field: &field1::Field) -> isize {
+    let q = (project.point.x - field.grid.x0) / field.grid.dx;
 
     let mut i = if project.normal.x > 0.0 {
         // outward → +x, interior → -x
@@ -1863,10 +2320,7 @@ fn first_interior_i(
         q.floor() as isize + 1
     };
 
-    i = i.clamp(
-        0,
-        field.grid.nx as isize - 1,
-    );
+    i = i.clamp(0, field.grid.nx as isize - 1);
 
     i
 }
@@ -1898,6 +2352,26 @@ pub fn weno_stencil_extractor_indices(
     field: &field1::Field,
     r: usize,
 ) -> Vec<(isize, isize)> {
+    try_weno_stencil_extractor_indices(project, field, r).unwrap_or_else(|| {
+        panic!(
+            "cannot fit paper WENO substencil (r={}) inside the fluid domain",
+            r
+        )
+    })
+}
+
+/// Fallible variant of `weno_stencil_extractor_indices`.
+///
+/// Returns `None` when any required paper substencil S_l cannot be placed
+/// fully inside the fluid domain. Near corners, thin embedded-boundary
+/// geometries or strong shock/solid interactions this is an EXPECTED
+/// numerical failure mode: the caller (high-order Wall reconstruction)
+/// must degrade locally instead of aborting the simulation.
+pub fn try_weno_stencil_extractor_indices(
+    project: geometry::Projection,
+    field: &field1::Field,
+    r: usize,
+) -> Option<Vec<(isize, isize)>> {
     assert!(r <= 4, "paper WENO extrapolation only uses r=0..4");
 
     let n = project.normal;
@@ -1925,12 +2399,7 @@ pub fn weno_stencil_extractor_indices(
             // Vertical grid lines x=x_i, ordered from the boundary into Omega.
             let i0 = first_interior_i(project, field);
 
-            let step_i =
-                if project.normal.x > 0.0 {
-                    -1
-                } else {
-                    1
-                };
+            let step_i = if project.normal.x > 0.0 { -1 } else { 1 };
 
             for l in 0..=r {
                 let i_line = i0 + l as isize * step_i;
@@ -1946,14 +2415,7 @@ pub fn weno_stencil_extractor_indices(
                 let m = ((y_star - y0) / dy).floor() as isize;
                 let base_start = m - (r as isize / 2);
 
-                let s_l = shifted_vertical_substencil_indices(
-                    field, i_line, base_start, width,
-                ).unwrap_or_else(|| {
-                    panic!(
-                        "cannot fit paper substencil S_{} (r={}) on vertical grid line i={} inside fluid domain",
-                        l, r, i_line
-                    )
-                });
+                let s_l = shifted_vertical_substencil_indices(field, i_line, base_start, width)?;
 
                 e_r.extend(s_l);
             }
@@ -1966,13 +2428,8 @@ pub fn weno_stencil_extractor_indices(
             let q = (p0.y - y0) / dy;
             let j0 = first_interior_j(project, field);
 
-            let interior_step_j =
-                if project.normal.y > 0.0 {
-                    -1
-                } else {
-                     1
-                };
-            
+            let interior_step_j = if project.normal.y > 0.0 { -1 } else { 1 };
+
             for l in 0..=r {
                 let j_line = j0 + (l as isize) * interior_step_j;
                 let y_line = field.grid.y(j_line);
@@ -1983,27 +2440,27 @@ pub fn weno_stencil_extractor_indices(
                 let m = ((x_star - x0) / dx).floor() as isize;
                 let base_start = m - (r as isize / 2);
 
-                let s_l = shifted_horizontal_substencil_indices(
-                    field, j_line, base_start, width,
-                ).unwrap_or_else(|| {
-                    panic!(
-                        "cannot fit paper substencil S_{} (r={}) on horizontal grid line j={} inside fluid domain",
-                        l, r, j_line
-                    )
-                });
+                let s_l = shifted_horizontal_substencil_indices(field, j_line, base_start, width)?;
 
                 e_r.extend(s_l);
             }
         }
     }
 
-    assert_eq!(
+    debug_assert_eq!(
         e_r.len(),
         (r + 1) * (r + 1),
         "paper stencil E_r must contain exactly (r+1)^2 points"
     );
 
-    e_r
+    Some(e_r)
+}
+
+/// True when every paper stencil E_r (r = 0..4) required by the boundary
+/// WENO extrapolation can be formed for this projection.
+#[inline]
+fn weno_stencil_available(project: geometry::Projection, field: &field1::Field) -> bool {
+    (0..=4).all(|r| try_weno_stencil_extractor_indices(project, field, r).is_some())
 }
 
 /// Shift a vertical S_l as a whole along y until all `width` consecutive
@@ -2071,9 +2528,13 @@ fn shifted_horizontal_substencil_indices(
 }
 
 fn rotate_state_to_local(s: state::State, n: geometry::Vec2) -> state::State {
-    let mom_n =  s.mom_x * n.x + s.mom_y * n.y;
+    let mom_n = s.mom_x * n.x + s.mom_y * n.y;
     let mom_t = -s.mom_x * n.y + s.mom_y * n.x;
-    state::State { mom_x: mom_n, mom_y: mom_t, ..s }
+    state::State {
+        mom_x: mom_n,
+        mom_y: mom_t,
+        ..s
+    }
 }
 
 fn weno_data_preprocess(
@@ -2100,21 +2561,6 @@ fn weno_data_preprocess(
     }
     result
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ============================================================================
 // Verification tests for bc1.rs
@@ -2160,21 +2606,8 @@ mod tests {
         .fold(0.0_f64, f64::max)
     }
 
-    fn make_rect_field(
-        nx: usize,
-        ny: usize,
-        lx: f64,
-        ly: f64,
-        value: State,
-    ) -> field1::Field {
-        let grid = GridInfo::new(
-            nx,
-            ny,
-            lx / nx as f64,
-            ly / ny as f64,
-            0.0,
-            0.0,
-        );
+    fn make_rect_field(nx: usize, ny: usize, lx: f64, ly: f64, value: State) -> field1::Field {
+        let grid = GridInfo::new(nx, ny, lx / nx as f64, ly / ny as f64, 0.0, 0.0);
 
         // CCW: bottom -> right -> top -> left.
         let outer = Polygon::new(
@@ -2190,79 +2623,65 @@ mod tests {
         // Dummy obstacle outside the computational domain.
         let inner = Polygon::new(
             vec![
-                Point { x: -1002.0, y: -1002.0 },
-                Point { x: -1001.0, y: -1002.0 },
-                Point { x: -1001.0, y: -1001.0 },
-                Point { x: -1002.0, y: -1001.0 },
+                Point {
+                    x: -1002.0,
+                    y: -1002.0,
+                },
+                Point {
+                    x: -1001.0,
+                    y: -1002.0,
+                },
+                Point {
+                    x: -1001.0,
+                    y: -1001.0,
+                },
+                Point {
+                    x: -1002.0,
+                    y: -1001.0,
+                },
             ],
             FluidSide::Outside,
         );
 
-        let outer_bc = vec![
-            BCType::Wall,
-            BCType::Wall,
-            BCType::Wall,
-            BCType::Wall,
-        ];
+        let outer_bc = vec![BCType::Wall, BCType::Wall, BCType::Wall, BCType::Wall];
 
-        let inner_bc = vec![
-            BCType::Wall,
-            BCType::Wall,
-            BCType::Wall,
-            BCType::Wall,
-        ];
+        let inner_bc = vec![BCType::Wall, BCType::Wall, BCType::Wall, BCType::Wall];
 
-        let mut field = field1::Field::new(
-            grid,
-            inner_bc,
-            outer_bc,
-            value,
-            outer,
-            inner,
-            0.0,
-        );
+        let mut field = field1::Field::new(grid, inner_bc, outer_bc, value, outer, inner, 0.0);
 
         // Analytic physical boundary: four Wall line segments.
         // CCW polygon with fluid inside => outward normal = (dy, -dx)/len.
         field.outer_boundary = vec![
             BoundaryElement {
-                geometry: geometry::BoundaryGeometry::Line(
-                    geometry::LineSegment::new(
-                        Point { x: 0.0, y: 0.0 },
-                        Point { x: lx, y: 0.0 },
-                        geometry::Vec2 { x: 0.0, y: -1.0 },
-                    ),
-                ),
+                geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
+                    Point { x: 0.0, y: 0.0 },
+                    Point { x: lx, y: 0.0 },
+                    geometry::Vec2 { x: 0.0, y: -1.0 },
+                )),
                 bc: BCType::Wall,
             },
             BoundaryElement {
-                geometry: geometry::BoundaryGeometry::Line(
-                    geometry::LineSegment::new(
-                        Point { x: lx, y: 0.0 },
-                        Point { x: lx, y: ly },
-                        geometry::Vec2 { x: 1.0, y: 0.0 },
-                    ),
-                ),
+                geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
+                    Point { x: lx, y: 0.0 },
+                    Point { x: lx, y: ly },
+                    geometry::Vec2 { x: 1.0, y: 0.0 },
+                )),
                 bc: BCType::Wall,
             },
             BoundaryElement {
-                geometry: geometry::BoundaryGeometry::Line(
-                    geometry::LineSegment::new(
-                        Point { x: lx, y: ly },
-                        Point { x: 0.0, y: ly },
-                        geometry::Vec2 { x: 0.0, y: 1.0 },
-                    ),
-                ),
+                geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
+                    Point { x: lx, y: ly },
+                    Point { x: 0.0, y: ly },
+                    geometry::Vec2 { x: 0.0, y: 1.0 },
+                )),
                 bc: BCType::Wall,
             },
             BoundaryElement {
-                geometry: geometry::BoundaryGeometry::Line(
-                    geometry::LineSegment::new(
-                        Point { x: 0.0, y: ly },
-                        Point { x: 0.0, y: 0.0 },
-                        geometry::Vec2 { x: -1.0, y: 0.0 },
-                    ),
-                ),
+                geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
+                    Point { x: 0.0, y: ly },
+                    Point { x: 0.0, y: 0.0 },
+                    geometry::Vec2 { x: -1.0, y: 0.0 },
+                )),
                 bc: BCType::Wall,
             },
         ];
@@ -2282,8 +2701,7 @@ mod tests {
     #[test]
     fn polynomial_least_squares_reproduces_degree4() {
         fn f(x: f64, y: f64) -> f64 {
-            1.0
-                + 2.0 * x
+            1.0 + 2.0 * x
                 + 3.0 * y
                 + 4.0 * x * x
                 + 5.0 * x * y
@@ -2323,9 +2741,7 @@ mod tests {
             for total in 0..=4 {
                 for i in 0..=total {
                     let j = total - i;
-                    reconstructed += c[col]
-                        * x.powi(i as i32)
-                        * y.powi(j as i32);
+                    reconstructed += c[col] * x.powi(i as i32) * y.powi(j as i32);
                     col += 1;
                 }
             }
@@ -2362,11 +2778,7 @@ mod tests {
         // total 3: y^3, xy^2, x^2y, x^3
         // total 4: y^4, xy^3, x^2y^2, x^3y, x^4
         let c = DVector::from_vec(vec![
-            1.0,
-            3.0, 2.0,
-            6.0, 5.0, 4.0,
-            10.0, 9.0, 8.0, 7.0,
-            15.0, 14.0, 13.0, 12.0, 11.0,
+            1.0, 3.0, 2.0, 6.0, 5.0, 4.0, 10.0, 9.0, 8.0, 7.0, 15.0, 14.0, 13.0, 12.0, 11.0,
         ]);
 
         let expected = [1.0, 2.0, 8.0, 42.0, 264.0];
@@ -2395,10 +2807,7 @@ mod tests {
     // ------------------------------------------------------------------------
     #[test]
     fn paper_stencil_cardinality_and_structure_vertical_wall() {
-        let value = State::primi2con(
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 1.0,
-        );
+        let value = State::primi2con(1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
 
         let field = make_rect_field(80, 80, 1.0, 1.0, value);
 
@@ -2412,17 +2821,15 @@ mod tests {
 
         println!(
             "P0=({:.8e},{:.8e}), n=({:.8e},{:.8e})",
-            project.point.x,
-            project.point.y,
-            project.normal.x,
-            project.normal.y
+            project.point.x, project.point.y, project.normal.x, project.normal.y
         );
 
         for r in 0..=4usize {
             let e = weno_stencil_extractor(project, &field, r);
             let width = r + 1;
 
-            println!("r={}, |E_r|={}, points={:?}",
+            println!(
+                "r={}, |E_r|={}, points={:?}",
                 r,
                 e.len(),
                 e.iter().map(|q| (q.0, q.1)).collect::<Vec<_>>()
@@ -2466,10 +2873,7 @@ mod tests {
     // ------------------------------------------------------------------------
     #[test]
     fn paper_stencil_cardinality_and_structure_horizontal_wall() {
-        let value = State::primi2con(
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 1.0,
-        );
+        let value = State::primi2con(1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
 
         let field = make_rect_field(80, 80, 1.0, 1.0, value);
 
@@ -2484,7 +2888,8 @@ mod tests {
             let e = weno_stencil_extractor(project, &field, r);
             let width = r + 1;
 
-            println!("r={}, |E_r|={}, points={:?}",
+            println!(
+                "r={}, |E_r|={}, points={:?}",
                 r,
                 e.len(),
                 e.iter().map(|q| (q.0, q.1)).collect::<Vec<_>>()
@@ -2532,10 +2937,7 @@ mod tests {
     // ------------------------------------------------------------------------
     #[test]
     fn characteristic_weno_constant_state_has_zero_higher_derivatives() {
-        let value = State::primi2con(
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 1.0,
-        );
+        let value = State::primi2con(1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
 
         // Square grid keeps this test within the paper's original mesh setting.
         let field = make_rect_field(80, 80, 1.0, 1.0, value);
@@ -2574,18 +2976,23 @@ mod tests {
     // ------------------------------------------------------------------------
     #[test]
     fn final_wall_ghost_preserves_stationary_constant_state() {
-        let exact = State::primi2con(
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 1.0,
-        );
+        let exact = State::primi2con(1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
 
         let field = make_rect_field(80, 80, 1.0, 1.0, exact);
 
         let indices = [
-            (-1, 40), (-2, 40), (-3, 40),
-            (80, 40), (81, 40), (82, 40),
-            (40, -1), (40, -2), (40, -3),
-            (40, 80), (40, 81), (40, 82),
+            (-1, 40),
+            (-2, 40),
+            (-3, 40),
+            (80, 40),
+            (81, 40),
+            (82, 40),
+            (40, -1),
+            (40, -2),
+            (40, -3),
+            (40, 80),
+            (40, 81),
+            (40, 82),
         ];
 
         let mut worst = 0.0_f64;
@@ -2620,17 +3027,9 @@ mod tests {
     fn oblique_boundary_paper_stencil_is_valid() {
         let nx = 100usize;
         let ny = 100usize;
-        let grid = GridInfo::new(
-            nx, ny,
-            1.0 / nx as f64,
-            1.0 / ny as f64,
-            0.0, 0.0,
-        );
+        let grid = GridInfo::new(nx, ny, 1.0 / nx as f64, 1.0 / ny as f64, 0.0, 0.0);
 
-        let value = State::primi2con(
-            1.0, 0.0, 0.0,
-            1.0, 1.0, 1.0,
-        );
+        let value = State::primi2con(1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
 
         let outer = Polygon::new(
             vec![
@@ -2643,10 +3042,22 @@ mod tests {
 
         let inner = Polygon::new(
             vec![
-                Point { x: -1002.0, y: -1002.0 },
-                Point { x: -1001.0, y: -1002.0 },
-                Point { x: -1001.0, y: -1001.0 },
-                Point { x: -1002.0, y: -1001.0 },
+                Point {
+                    x: -1002.0,
+                    y: -1002.0,
+                },
+                Point {
+                    x: -1001.0,
+                    y: -1002.0,
+                },
+                Point {
+                    x: -1001.0,
+                    y: -1001.0,
+                },
+                Point {
+                    x: -1002.0,
+                    y: -1001.0,
+                },
             ],
             FluidSide::Outside,
         );
@@ -2658,7 +3069,7 @@ mod tests {
             value,
             outer,
             inner,
-            0.0
+            0.0,
         );
 
         // Point outside the hypotenuse x+y=1, away from vertices.
@@ -2669,9 +3080,7 @@ mod tests {
 
         println!(
             "oblique P=({:.6},{:.6}), P0=({:.6},{:.6}), n=({:.6},{:.6})",
-            p.x, p.y,
-            project.point.x, project.point.y,
-            project.normal.x, project.normal.y
+            p.x, p.y, project.point.x, project.point.y, project.normal.x, project.normal.y
         );
 
         for r in 0..=4usize {
@@ -2718,32 +3127,32 @@ mod tests {
     }
 
     #[test]
-fn constant_polynomial_fit_has_zero_high_order_coefficients() {
-    let h = 0.0125;
+    fn constant_polynomial_fit_has_zero_high_order_coefficients() {
+        let h = 0.0125;
 
-    let mut data = Vec::new();
+        let mut data = Vec::new();
 
-    for i in -2..=2 {
-        for j in -2..=2 {
-            let x = i as f64 * h;
-            let y = j as f64 * h;
+        for i in -2..=2 {
+            for j in -2..=2 {
+                let x = i as f64 * h;
+                let y = j as f64 * h;
 
-            data.push((x, y, 1.0));
+                data.push((x, y, 1.0));
+            }
         }
+
+        let c = fit_polynomial_surface(&data, 4);
+
+        println!("coefficients = {:?}", c);
+
+        println!("constant = {:.16e}", c[0]);
+
+        for i in 1..c.len() {
+            println!("c[{}] = {:.16e}", i, c[i]);
+        }
+
+        assert!((c[0] - 1.0).abs() < 1e-12);
     }
-
-    let c = fit_polynomial_surface(&data, 4);
-
-    println!("coefficients = {:?}", c);
-
-    println!("constant = {:.16e}", c[0]);
-
-    for i in 1..c.len() {
-        println!("c[{}] = {:.16e}", i, c[i]);
-    }
-
-    assert!((c[0] - 1.0).abs() < 1e-12);
-}
 
     // ------------------------------------------------------------------------
     // Analytic boundary lookup
@@ -2779,14 +3188,12 @@ fn constant_polynomial_fit_has_zero_high_order_coefficients() {
         ];
 
         // Middle of the line -> line element.
-        let (id, proj) =
-            find_boundary_element(Point { x: 0.2, y: 3.0 }, &elements);
+        let (id, proj) = find_boundary_element(Point { x: 0.2, y: 3.0 }, &elements);
         assert_eq!(id, 0);
         assert!((proj.point.y - 3.0).abs() < 1e-14);
 
         // Middle of the arc -> arc element.
-        let (id, proj) =
-            find_boundary_element(Point { x: -1.5, y: 0.0 }, &elements);
+        let (id, proj) = find_boundary_element(Point { x: -1.5, y: 0.0 }, &elements);
         assert_eq!(id, 1);
         assert!((proj.normal.x - 1.0).abs() < 1e-12);
         assert!(proj.normal.y.abs() < 1e-12);
@@ -2794,8 +3201,7 @@ fn constant_polynomial_fit_has_zero_high_order_coefficients() {
         // Shared endpoint (0,1): point equidistant from arc endpoint and
         // line (radial projection falls OUTSIDE the finite arc) -> exact
         // geometric tie -> Wall wins.
-        let (id, proj) =
-            find_boundary_element(Point { x: 0.1, y: 1.0 }, &elements);
+        let (id, proj) = find_boundary_element(Point { x: 0.1, y: 1.0 }, &elements);
         assert_eq!(id, 1, "Wall must beat FarField at the junction");
         assert!((proj.point.x - 0.0).abs() < 1e-12);
         assert!((proj.point.y - 1.0).abs() < 1e-12);
@@ -2873,12 +3279,7 @@ fn constant_polynomial_fit_has_zero_high_order_coefficients() {
             geometry::Vec2 { x: -0.8, y: 0.6 },
         ] {
             let w = state_to_local_euler_primitive(state, n);
-            assert!(
-                (w.p - 1.0).abs() < 1e-12,
-                "p = {} for normal {:?}",
-                w.p,
-                n
-            );
+            assert!((w.p - 1.0).abs() < 1e-12, "p = {} for normal {:?}", w.p, n);
         }
 
         // The three modal pressures of the Euler-equivalent freestream
@@ -2949,7 +3350,12 @@ fn constant_polynomial_fit_has_zero_high_order_coefficients() {
         assert!(ww[0] > 0.0 && ww[3] > 0.0);
 
         let ghost = local_euler_primitive_to_state(
-            EulerPrimitiveLocal { rho: ww[0], un: ww[1], ut: ww[2], p: ww[3] },
+            EulerPrimitiveLocal {
+                rho: ww[0],
+                un: ww[1],
+                ut: ww[2],
+                p: ww[3],
+            },
             geometry::Vec2 { x: 1.0, y: 0.0 },
         );
         let d = state::Derived::from_state(ghost);
@@ -2966,5 +3372,715 @@ fn constant_polynomial_fit_has_zero_high_order_coefficients() {
         assert!(pn > 0.0);
         // Flat wall: R = infinity -> no curved-wall contribution.
         assert!(primitive_curved_pressure_gradient(1.5, 2.0, f64::INFINITY).abs() < 1e-14);
+    }
+
+    // ------------------------------------------------------------------------
+    // Wall ILW hierarchy tests.
+    //
+    // BCType::Wall = try high-order ILW -> LOCAL ReflectiveWall fallback.
+    // ------------------------------------------------------------------------
+
+    /// Reference: the ORIGINAL (pre-refactor) inline Wall implementation,
+    /// truncated at `order`, for roundoff comparison against the
+    /// refactored fallible path.
+    fn ref_solve6(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+        a.solve(b).expect("reference ILW solve failed")
+    }
+
+    fn reference_wall_value_at_order(
+        project: geometry::Projection,
+        field: &field1::Field,
+        order: usize,
+    ) -> state::State {
+        let idx_near = find_nearest_grid_point(project, field);
+        let (left, right, _lambda) = build_local(project, idx_near, field);
+        let mut v = [[0.0; 6]; 5];
+        for k in 0..=order {
+            v[k] = weno_extrapolation(project, field, k);
+        }
+
+        let mut left0 = left.clone();
+        for c in 0..6 {
+            left0[[0, c]] = if c == 1 { 1.0 } else { 0.0 };
+        }
+        let mut rhs0 = Array1::from_vec(v[0].to_vec());
+        rhs0[0] = 0.0;
+        let u0 = ref_solve6(&left0, &rhs0);
+
+        let mut u_ghost = u0.clone();
+        let mut coef = 1.0;
+
+        if order >= 1 {
+            let mut left1 = left.clone();
+            let row1 = build_ilw_row1(&u0);
+            for c in 0..6 {
+                left1[[0, c]] = row1[c];
+            }
+            let mut rhs1 = Array1::from_vec(v[1].to_vec());
+            rhs1[0] = 0.0;
+            let u1 = ref_solve6(&left1, &rhs1);
+
+            coef *= project.distance;
+            u_ghost = u_ghost + coef * &u1;
+
+            for k in 2..=order {
+                let rhs_k = Array1::from_vec(v[k].to_vec());
+                let uk = right.dot(&rhs_k);
+                coef *= project.distance / (k as f64);
+                u_ghost = u_ghost + coef * &uk;
+            }
+        }
+
+        let n = project.normal;
+        let mom_n = u_ghost[1];
+        let mom_t = u_ghost[2];
+        let mom_x = mom_n * n.x - mom_t * n.y;
+        let mom_y = mom_n * n.y + mom_t * n.x;
+
+        state::State {
+            rho: u_ghost[0],
+            mom_x,
+            mom_y,
+            ee: u_ghost[3],
+            ei: u_ghost[4],
+            er: u_ghost[5],
+        }
+    }
+
+    /// Smooth, admissible, nonuniform state on the standard rect field.
+    fn make_smooth_rect_field() -> field1::Field {
+        let nx = 80usize;
+        let ny = 80usize;
+        let mut field = make_rect_field(nx, ny, 1.0, 1.0, State::new());
+        let h = field.grid.dx;
+        for i in 0..nx {
+            for j in 0..ny {
+                let x = i as f64 * h;
+                let y = j as f64 * h;
+                let rho = 1.0
+                    + 0.1
+                        * (2.0 * std::f64::consts::PI * x).sin()
+                        * (2.0 * std::f64::consts::PI * y).cos();
+                let ux = 0.05 * (2.0 * std::f64::consts::PI * y).sin();
+                let uy = 0.05 * (2.0 * std::f64::consts::PI * x).cos();
+                let p = 1.0 + 0.05 * (2.0 * std::f64::consts::PI * (x + y)).sin();
+                field.value[i * ny + j] = State::primi2con(rho, ux, uy, p / 3.0, p / 3.0, p / 3.0);
+            }
+        }
+        field
+    }
+
+    /// Fluid region is a single Cartesian column (width < 2h): the paper
+    /// WENO stencil E_r cannot be formed for r >= 1 near the right wall.
+    fn make_thin_strip_field() -> field1::Field {
+        let nx = 20usize;
+        let ny = 20usize;
+        let h = 0.05;
+        let grid = GridInfo::new(nx, ny, h, h, 0.0, 0.0);
+        let value = State::primi2con(1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+
+        let outer = Polygon::new(
+            vec![
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 0.05, y: 0.0 },
+                Point { x: 0.05, y: 1.0 },
+                Point { x: 0.0, y: 1.0 },
+            ],
+            FluidSide::Inside,
+        );
+
+        let inner = Polygon::new(
+            vec![
+                Point {
+                    x: -1002.0,
+                    y: -1002.0,
+                },
+                Point {
+                    x: -1001.0,
+                    y: -1002.0,
+                },
+                Point {
+                    x: -1001.0,
+                    y: -1001.0,
+                },
+                Point {
+                    x: -1002.0,
+                    y: -1001.0,
+                },
+            ],
+            FluidSide::Outside,
+        );
+
+        let mut field = field1::Field::new(
+            grid,
+            vec![BCType::Wall; 4],
+            vec![BCType::Wall; 4],
+            value,
+            outer,
+            inner,
+            0.0,
+        );
+
+        field.outer_boundary = vec![
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
+                    Point { x: 0.0, y: 0.0 },
+                    Point { x: 0.05, y: 0.0 },
+                    geometry::Vec2 { x: 0.0, y: -1.0 },
+                )),
+                bc: BCType::Wall,
+            },
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
+                    Point { x: 0.05, y: 0.0 },
+                    Point { x: 0.05, y: 1.0 },
+                    geometry::Vec2 { x: 1.0, y: 0.0 },
+                )),
+                bc: BCType::Wall,
+            },
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
+                    Point { x: 0.05, y: 1.0 },
+                    Point { x: 0.0, y: 1.0 },
+                    geometry::Vec2 { x: 0.0, y: 1.0 },
+                )),
+                bc: BCType::Wall,
+            },
+            BoundaryElement {
+                geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
+                    Point { x: 0.0, y: 1.0 },
+                    Point { x: 0.0, y: 0.0 },
+                    geometry::Vec2 { x: -1.0, y: 0.0 },
+                )),
+                bc: BCType::Wall,
+            },
+        ];
+
+        field
+    }
+
+    /// Test A (constant state, ILW success, zero fallback)
+    /// + Test C (deliberately insufficient stencil -> local fallback)
+    /// + Test D (deliberately invalid ILW intermediates -> local fallback)
+    /// + fallback statistics.
+    ///
+    /// A/C/D share the process-global fallback counters; they are kept in
+    /// ONE test so the counter assertions are deterministic.
+    #[test]
+    fn wall_ilw_hierarchy_fallback_and_statistics() {
+        use std::sync::atomic::Ordering;
+
+        reset_ilw_wall_statistics();
+
+        // ------------------------------------------------------------
+        // TEST A: flat Wall, stationary uniform state.
+        // ILW must succeed, fallback count must remain zero, and the
+        // ghost state must preserve the constant state to roundoff.
+        // ------------------------------------------------------------
+        let value = State::primi2con(1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+        let field = make_rect_field(80, 80, 1.0, 1.0, value);
+        let indices_a = [
+            (-1isize, 40isize),
+            (-2, 40),
+            (40, -1),
+            (40, -2),
+            (40, 80),
+            (80, 40),
+        ];
+        for idx in indices_a {
+            let got = field.get(idx);
+            let err = state_max_error(got, value);
+            assert!(
+                err < TOL_CONST,
+                "constant state not preserved at {:?}: {}",
+                idx,
+                err
+            );
+        }
+
+        let succ = ILW_WALL_SUCCESS.load(Ordering::Relaxed);
+        let fb = ILW_WALL_FALLBACK.load(Ordering::Relaxed);
+        assert!(succ >= indices_a.len());
+        assert_eq!(fb, 0, "constant-state Wall must not fall back");
+
+        // ------------------------------------------------------------
+        // TEST C: deliberately insufficient stencil.
+        // try_ilw_wall_value -> Err(InsufficientStencil); the Wall
+        // dispatch must return exactly the ReflectiveWall state.
+        // ------------------------------------------------------------
+        let thin = make_thin_strip_field();
+        let idx_c = (2isize, 10isize);
+        let p_c = Point {
+            x: thin.grid.x(idx_c.0),
+            y: thin.grid.y(idx_c.1),
+        };
+        assert!(
+            !thin.is_in_domain(idx_c),
+            "test ghost must be outside the fluid"
+        );
+        let (_bid, project_c) = find_boundary_element(p_c, &thin.outer_boundary);
+
+        let err_c = try_ilw_wall_value::<WALL_TAYLOR_ORDER>(idx_c, project_c, &thin, None);
+        assert!(
+            matches!(err_c, Err(WallReconstructionFailure::InsufficientStencil)),
+            "expected InsufficientStencil, got {:?}",
+            err_c.map(|_| ())
+        );
+
+        let via_dispatch = thin.get(idx_c);
+        let via_reflective = reflective_wall_value(idx_c, project_c, &thin);
+        assert_eq!(
+            state_max_error(via_dispatch, via_reflective),
+            0.0,
+            "Wall fallback must equal reflective_wall_value exactly"
+        );
+
+        assert!(ILW_FALLBACK_STENCIL.load(Ordering::Relaxed) >= 1);
+        assert!(ILW_WALL_FALLBACK.load(Ordering::Relaxed) >= 1);
+
+        // ------------------------------------------------------------
+        // TEST D: deliberately invalid ILW intermediates.
+        // (D1) nonphysical characteristic-matrix source state.
+        // (D2) NaN inside the WENO stencil -> NonFiniteWeno.
+        // No NaN may escape try_ilw_wall_value; the Wall dispatch must
+        // fall back to the finite ReflectiveWall state.
+        // ------------------------------------------------------------
+        let mut bad_field = make_rect_field(80, 80, 1.0, 1.0, value);
+        let idx_d = (-1isize, 40isize);
+
+        // D1: poison the interior point nearest to the boundary foot.
+        let proj_d = project_c_for(&bad_field, idx_d);
+        let near = find_nearest_grid_point(proj_d, &bad_field);
+        let lin = bad_field.linear_index(near);
+        bad_field.value[lin] = State {
+            rho: 1.0,
+            mom_x: 0.0,
+            mom_y: 0.0,
+            ee: f64::NAN,
+            ei: 1.0,
+            er: 1.0,
+        };
+        let err_d1 = try_ilw_wall_value::<WALL_TAYLOR_ORDER>(idx_d, proj_d, &bad_field, None);
+        assert!(
+            matches!(
+                err_d1,
+                Err(WallReconstructionFailure::NonPhysicalBoundaryState)
+            ),
+            "expected NonPhysicalBoundaryState, got {:?}",
+            err_d1.map(|_| ())
+        );
+
+        let got_d1 = bad_field.get(idx_d);
+        let want_d1 = reflective_wall_value(idx_d, proj_d, &bad_field);
+        assert!(state_is_finite(got_d1), "fallback must be finite");
+        assert_eq!(state_max_error(got_d1, want_d1), 0.0);
+        assert!(ILW_FALLBACK_U0.load(Ordering::Relaxed) >= 1);
+
+        // D2: NaN inside the WENO stencil (r >= 2 ring), source state valid.
+        let mut bad_field2 = make_rect_field(80, 80, 1.0, 1.0, value);
+        let lin2 = bad_field2.linear_index((3, 40));
+        bad_field2.value[lin2] = State {
+            rho: 1.0,
+            mom_x: 0.0,
+            mom_y: 0.0,
+            ee: f64::NAN,
+            ei: 1.0,
+            er: 1.0,
+        };
+        let proj_d2 = project_c_for(&bad_field2, idx_d);
+        let err_d2 = try_ilw_wall_value::<WALL_TAYLOR_ORDER>(idx_d, proj_d2, &bad_field2, None);
+        assert!(
+            matches!(err_d2, Err(WallReconstructionFailure::NonFiniteWeno)),
+            "expected NonFiniteWeno, got {:?}",
+            err_d2.map(|_| ())
+        );
+
+        let got_d2 = bad_field2.get(idx_d);
+        let want_d2 = reflective_wall_value(idx_d, proj_d2, &bad_field2);
+        assert!(state_is_finite(got_d2), "fallback must be finite");
+        assert_eq!(state_max_error(got_d2, want_d2), 0.0);
+        assert!(ILW_FALLBACK_WENO.load(Ordering::Relaxed) >= 1);
+        assert!(ILW_WALL_FALLBACK.load(Ordering::Relaxed) >= 3);
+    }
+
+    /// Shared analytic projection helper for the rect test fields.
+    fn project_c_for(field: &field1::Field, idx: (isize, isize)) -> geometry::Projection {
+        let p = Point {
+            x: field.grid.x(idx.0),
+            y: field.grid.y(idx.1),
+        };
+        geometry::project(&field.outer_bound, p)
+    }
+
+    /// TEST B: smooth nonuniform Wall state with a complete stencil.
+    /// The refactored ILW path must agree with the pre-refactor Wall
+    /// implementation to roundoff.
+    #[test]
+    fn wall_ilw_smooth_state_matches_pre_refactor() {
+        let field = make_smooth_rect_field();
+        let indices = [
+            (-1isize, 40isize),
+            (-2, 40),
+            (-3, 40),
+            (40, -1),
+            (40, -2),
+            (40, 80),
+            (40, 81),
+            (80, 40),
+            (81, 40),
+        ];
+
+        for idx in indices {
+            let project = project_c_for(&field, idx);
+
+            let got = try_ilw_wall_value::<WALL_TAYLOR_ORDER>(idx, project, &field, None)
+                .expect("smooth complete-stencil Wall must succeed");
+            let want = reference_wall_value_at_order(project, &field, WALL_TAYLOR_ORDER);
+
+            let err = state_max_error(got, want);
+            assert!(
+                err < 1e-12,
+                "ILW refactor changed the result at {:?}: err={:.3e}",
+                idx,
+                err
+            );
+        }
+    }
+
+    /// TEST E: WALL_TAYLOR_ORDER respect.
+    /// The const-generic instantiation at a given order must reproduce
+    /// exactly the same-order Taylor reconstruction; no higher-order
+    /// derivative solves may contribute.
+    #[test]
+    fn wall_ilw_respects_taylor_order() {
+        let field = make_smooth_rect_field();
+        let idx = (-1isize, 40isize);
+        let project = project_c_for(&field, idx);
+
+        for order in 0..=4usize {
+            let want = reference_wall_value_at_order(project, &field, order);
+            let got = match order {
+                0 => try_ilw_wall_value::<0>(idx, project, &field, None).unwrap(),
+                1 => try_ilw_wall_value::<1>(idx, project, &field, None).unwrap(),
+                2 => try_ilw_wall_value::<2>(idx, project, &field, None).unwrap(),
+                3 => try_ilw_wall_value::<3>(idx, project, &field, None).unwrap(),
+                _ => try_ilw_wall_value::<4>(idx, project, &field, None).unwrap(),
+            };
+
+            let err = state_max_error(got, want);
+            assert!(err < 1e-12, "order-{} ILW mismatch: err={:.3e}", order, err);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // ReflectiveWall source-selection hierarchy tests.
+    //
+    // normal search (preferred) -> local 2-D corner fallback -> panic.
+    // ------------------------------------------------------------------------
+
+    /// Rect field filled with a state carrying nonzero momentum, used to
+    /// verify arbitrary-normal momentum reflection.
+    fn make_reflective_momentum_rect() -> field1::Field {
+        make_rect_field(
+            80,
+            80,
+            1.0,
+            1.0,
+            State::primi2con(1.0, 0.3, -0.2, 1.0, 1.0, 1.0),
+        )
+    }
+
+    /// Oblique boundary: triangle (0,0) -- (1,0) -- (0,1), fluid inside,
+    /// ONE analytic LineSegment element for the hypotenuse x + y = 1.
+    fn make_oblique_reflective_field(value: State) -> field1::Field {
+        let grid = GridInfo::new(100, 100, 0.01, 0.01, 0.0, 0.0);
+
+        let outer = Polygon::new(
+            vec![
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 1.0, y: 0.0 },
+                Point { x: 0.0, y: 1.0 },
+            ],
+            FluidSide::Inside,
+        );
+
+        let inner = Polygon::new(
+            vec![
+                Point {
+                    x: -1002.0,
+                    y: -1002.0,
+                },
+                Point {
+                    x: -1001.0,
+                    y: -1002.0,
+                },
+                Point {
+                    x: -1001.0,
+                    y: -1001.0,
+                },
+                Point {
+                    x: -1002.0,
+                    y: -1001.0,
+                },
+            ],
+            FluidSide::Outside,
+        );
+
+        let mut field = field1::Field::new(
+            grid,
+            vec![BCType::ReflectiveWall; 4],
+            vec![BCType::ReflectiveWall; 3],
+            value,
+            outer,
+            inner,
+            0.0,
+        );
+
+        field.outer_boundary = vec![BoundaryElement {
+            geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
+                Point { x: 1.0, y: 0.0 },
+                Point { x: 0.0, y: 1.0 },
+                geometry::Vec2 {
+                    x: 1.0 / 2.0_f64.sqrt(),
+                    y: 1.0 / 2.0_f64.sqrt(),
+                },
+            )),
+            bc: BCType::ReflectiveWall,
+        }];
+
+        field
+    }
+
+    /// The observed failing corner: shock-cylinder box [-4,20] x [-5,5],
+    /// h = 0.025, where ghost (961, 0) projects to the corner
+    /// P0 = (20, -5) with bottom normal n = (0, -1) and the inward ray
+    /// lies on the adjacent x = 20 boundary.
+    fn make_corner_box_field() -> field1::Field {
+        crate::init::init_shock_cylinder_in_box(crate::init::CylinderWallMode::Reflective)
+    }
+
+    /// TEST A/B/C/E + counters. Kept in ONE test: the counters are
+    /// process-global atomics, and only delta-based (>=) assertions are
+    /// used so concurrent tests cannot corrupt them.
+    #[test]
+    fn reflective_wall_source_hierarchy() {
+        use std::sync::atomic::Ordering;
+
+        let normal0 = REFLECTIVE_NORMAL_SUCCESS.load(Ordering::Relaxed);
+        let corner0 = REFLECTIVE_CORNER_FALLBACK.load(Ordering::Relaxed);
+        let fail0 = REFLECTIVE_SOURCE_FAILURE.load(Ordering::Relaxed);
+
+        // ------------------------------------------------------------
+        // TEST A: smooth horizontal wall.
+        // Normal search must find the source directly above the ghost;
+        // no corner fallback is needed; only the normal momentum
+        // component changes sign.
+        // ------------------------------------------------------------
+        let field = make_reflective_momentum_rect();
+        let idx = (40isize, -1isize);
+        let p = Point {
+            x: field.grid.x(idx.0),
+            y: field.grid.y(idx.1),
+        };
+        let (_bid, proj) = find_boundary_element(p, &field.outer_boundary);
+
+        // Bottom element: P0 = (0.5, 0), n = (0, -1).
+        assert!((proj.point.x - 0.5).abs() < 1e-12);
+        assert!((proj.point.y - 0.0).abs() < 1e-12);
+        assert!(proj.normal.x.abs() < 1e-12);
+        assert!((proj.normal.y + 1.0).abs() < 1e-12);
+
+        // The ray P0 - s n, s = 0.5 h, lands at y = +0.00625 whose
+        // nearest cell is (40, 1): this MUST come from the normal path.
+        let source_a = find_reflective_wall_source(proj, &field);
+        assert_eq!(source_a, Some((40, 1)));
+
+        let got_a = reflective_wall_value(idx, proj, &field);
+        let want_a = field.value[field.linear_index((40, 1))];
+        assert!((got_a.rho - want_a.rho).abs() < 1e-12);
+        assert!(
+            (got_a.mom_x - 0.3).abs() < 1e-12,
+            "tangential momentum must be preserved"
+        );
+        assert!(
+            (got_a.mom_y + want_a.mom_y).abs() < 1e-12,
+            "normal momentum must flip sign"
+        );
+        assert!((got_a.ee - want_a.ee).abs() < 1e-12);
+        assert!((got_a.ei - want_a.ei).abs() < 1e-12);
+        assert!((got_a.er - want_a.er).abs() < 1e-12);
+
+        let normal_delta = REFLECTIVE_NORMAL_SUCCESS.load(Ordering::Relaxed) - normal0;
+        assert!(normal_delta >= 1, "normal search must have been used");
+
+        // ------------------------------------------------------------
+        // TEST B: smooth oblique wall away from endpoints.
+        // Normal search finds a fluid source; arbitrary-normal
+        // reflection preserves rho/energies and flips only m . n.
+        // ------------------------------------------------------------
+        let value = State::primi2con(1.0, 0.2, 0.1, 1.0, 1.0, 1.0);
+        let field_b = make_oblique_reflective_field(value);
+        let idx_b = (62isize, 42isize);
+        let p_b = Point {
+            x: field_b.grid.x(idx_b.0),
+            y: field_b.grid.y(idx_b.1),
+        };
+        assert!(
+            !field_b.is_in_domain(idx_b),
+            "test ghost must lie outside the triangle"
+        );
+        let (_bid_b, proj_b) = find_boundary_element(p_b, &field_b.outer_boundary);
+
+        // Hypotenuse projection, n = (1,1)/sqrt(2).
+        let inv2 = 1.0 / 2.0_f64.sqrt();
+        assert!((proj_b.normal.x - inv2).abs() < 1e-10 && (proj_b.normal.y - inv2).abs() < 1e-10);
+
+        let source_b = find_reflective_wall_source(proj_b, &field_b);
+        assert!(
+            source_b.is_some(),
+            "oblique wall must find a normal-search source"
+        );
+        let (si, sj) = source_b.unwrap();
+        assert!(field_b.is_in_domain((si, sj)));
+
+        let got_b = reflective_wall_value(idx_b, proj_b, &field_b);
+        let want_b = field_b.value[field_b.linear_index((si, sj))];
+        let mn = want_b.mom_x * proj_b.normal.x + want_b.mom_y * proj_b.normal.y;
+        let exp_x = want_b.mom_x - 2.0 * mn * proj_b.normal.x;
+        let exp_y = want_b.mom_y - 2.0 * mn * proj_b.normal.y;
+        assert!((got_b.rho - want_b.rho).abs() < 1e-12);
+        assert!((got_b.mom_x - exp_x).abs() < 1e-12);
+        assert!((got_b.mom_y - exp_y).abs() < 1e-12);
+        assert!((got_b.ee - want_b.ee).abs() < 1e-12);
+        assert!((got_b.ei - want_b.ei).abs() < 1e-12);
+        assert!((got_b.er - want_b.er).abs() < 1e-12);
+
+        // ------------------------------------------------------------
+        // TEST C: rectangular corner, the observed (20, -5) failure.
+        // The inward ray stays on the adjacent x = 20 boundary, the
+        // normal search fails, and the 2-D corner search must find the
+        // diagonal interior cell (959, 0).
+        // ------------------------------------------------------------
+        let field_c = make_corner_box_field();
+        let idx_c = (961isize, 0isize);
+        let p_c = Point {
+            x: field_c.grid.x(idx_c.0),
+            y: field_c.grid.y(idx_c.1),
+        };
+        assert!(!field_c.is_in_domain(idx_c));
+        let (_bid_c, proj_c) = find_boundary_element(p_c, &field_c.outer_boundary);
+
+        // Corner tie: bottom ReflectiveWall beats right ZerothOrder.
+        assert!(
+            (proj_c.point.x - 20.0).abs() < 1e-12,
+            "P0.x = {}",
+            proj_c.point.x
+        );
+        assert!((proj_c.point.y + 5.0).abs() < 1e-12);
+        assert!(proj_c.normal.x.abs() < 1e-12);
+        assert!((proj_c.normal.y + 1.0).abs() < 1e-12);
+
+        let source_c = find_reflective_wall_source(proj_c, &field_c);
+        assert_eq!(
+            source_c,
+            Some((959, 0)),
+            "2-D corner fallback must find the diagonal interior cell"
+        );
+
+        let got_c = reflective_wall_value(idx_c, proj_c, &field_c);
+        assert!(got_c.rho.is_finite() && got_c.mom_x.is_finite() && got_c.mom_y.is_finite());
+        assert!(got_c.ee.is_finite() && got_c.ei.is_finite() && got_c.er.is_finite());
+        assert!(got_c.rho > 0.0);
+
+        let corner_delta = REFLECTIVE_CORNER_FALLBACK.load(Ordering::Relaxed) - corner0;
+        assert!(corner_delta >= 1, "corner fallback must have been used");
+
+        // ------------------------------------------------------------
+        // TEST E: Wall hierarchy at the same corner endpoint.
+        // ILW must fail (poisoned stencil) -> ReflectiveWall -> corner
+        // 2-D fallback -> valid ghost.
+        // ------------------------------------------------------------
+        let mut field_e = make_corner_box_field();
+        field_e.outer_boundary[0].bc = BCType::Wall;
+
+        // Poison a cell of the WENO stencil (shifted to i = 955..959,
+        // j = 1..5) so the ILW extrapolation returns NaN.
+        let poison = (957isize, 3isize);
+        let pl = field_e.linear_index(poison);
+        field_e.value[pl] = State {
+            rho: 1.0,
+            mom_x: 0.0,
+            mom_y: 0.0,
+            ee: f64::NAN,
+            ei: 1.0,
+            er: 1.0,
+        };
+
+        let p_e = Point {
+            x: field_e.grid.x(idx_c.0),
+            y: field_e.grid.y(idx_c.1),
+        };
+        let (_bid_e, proj_e) = find_boundary_element(p_e, &field_e.outer_boundary);
+
+        let ilw = try_ilw_wall_value::<WALL_TAYLOR_ORDER>(idx_c, proj_e, &field_e, None);
+        assert!(
+            matches!(ilw, Err(WallReconstructionFailure::NonFiniteWeno)),
+            "expected NonFiniteWeno, got {:?}",
+            ilw.map(|_| ())
+        );
+
+        let got_e = field_e.get(idx_c);
+        assert!(got_e.rho.is_finite() && got_e.rho > 0.0);
+        assert!(got_e.mom_x.is_finite() && got_e.mom_y.is_finite());
+        let want_e = reflective_wall_value(idx_c, proj_e, &field_e);
+        assert_eq!(
+            state_max_error(got_e, want_e),
+            0.0,
+            "Wall fallback must equal reflective_wall_value exactly"
+        );
+
+        let corner_delta_e = REFLECTIVE_CORNER_FALLBACK.load(Ordering::Relaxed) - corner0;
+        assert!(
+            corner_delta_e >= 2,
+            "Wall fallback must use the corner search"
+        );
+
+        // ------------------------------------------------------------
+        // Source search that exhausts BOTH paths returns None (never a
+        // fabricated state) and counts a failure.
+        // ------------------------------------------------------------
+        let empty = make_rect_field(20, 20, 1.0, 1.0, value);
+        let far = geometry::Projection {
+            point: Point { x: 100.0, y: 100.0 },
+            normal: geometry::Vec2 { x: 0.0, y: -1.0 },
+            distance: 1.0,
+        };
+        let none = find_reflective_wall_source(far, &empty);
+        assert!(none.is_none(), "impossible geometry must yield None");
+        let fail_delta = REFLECTIVE_SOURCE_FAILURE.load(Ordering::Relaxed) - fail0;
+        assert!(fail_delta >= 1);
+
+        print_reflective_wall_statistics();
+    }
+
+    /// TEST D: neither search path finds a fluid point -> explicit,
+    /// detailed panic (never a fabricated source state).
+    #[test]
+    #[should_panic(expected = "cannot find reflective-wall interior source")]
+    fn reflective_wall_impossible_source_panics() {
+        let empty = make_rect_field(
+            20,
+            20,
+            1.0,
+            1.0,
+            State::primi2con(1.0, 0.0, 0.0, 1.0, 1.0, 1.0),
+        );
+        let far = geometry::Projection {
+            point: Point { x: 100.0, y: 100.0 },
+            normal: geometry::Vec2 { x: 0.0, y: -1.0 },
+            distance: 1.0,
+        };
+
+        let _ = reflective_wall_value((10, 10), far, &empty);
     }
 }

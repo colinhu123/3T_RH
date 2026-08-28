@@ -343,40 +343,22 @@ fn project_equal_energies(mut s: State) -> State {
     s
 }
 #[inline]
-fn stage_update_rhs(
-    base: &Field,
-    dst: &mut Field,
-    rhs: &[State],
-    coef: f64,
-    label: &str,
-) {
+fn stage_update_rhs(base: &Field, dst: &mut Field, rhs: &[State], coef: f64, label: &str) {
     let ny = base.grid.ny;
 
-    dst.value
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(l, o)| {
-            if !base.fluid[l] {
-                return;
-            }
+    dst.value.par_iter_mut().enumerate().for_each(|(l, o)| {
+        if !base.fluid[l] {
+            return;
+        }
 
-            let value = base.value[l]
-                .add(rhs[l].scalar_prod(coef));
+        let value = base.value[l].add(rhs[l].scalar_prod(coef));
 
-            let value = project_equal_energies(value);
-            assert_admissible(
-                value,
-                (
-                    (l / ny) as isize,
-                    (l % ny) as isize,
-                ),
-                label,
-            );
+        let value = project_equal_energies(value);
+        assert_admissible(value, ((l / ny) as isize, (l % ny) as isize), label);
 
-            *o = value;
-        });
+        *o = value;
+    });
 }
-
 
 #[inline]
 fn stage_update_comb(
@@ -391,38 +373,22 @@ fn stage_update_comb(
 ) {
     let ny = base.grid.ny;
 
-    dst.value
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(l, o)| {
-            if !base.fluid[l] {
-                return;
-            }
+    dst.value.par_iter_mut().enumerate().for_each(|(l, o)| {
+        if !base.fluid[l] {
+            return;
+        }
 
-            let value = base.value[l]
-                .scalar_prod(w_base)
-                .add(
-                    add.value[l]
-                        .scalar_prod(w_add)
-                )
-                .add(
-                    rhs[l]
-                        .scalar_prod(coef)
-                );
+        let value = base.value[l]
+            .scalar_prod(w_base)
+            .add(add.value[l].scalar_prod(w_add))
+            .add(rhs[l].scalar_prod(coef));
 
-            let value = project_equal_energies(value);
+        let value = project_equal_energies(value);
 
-            assert_admissible(
-                value,
-                (
-                    (l / ny) as isize,
-                    (l % ny) as isize,
-                ),
-                label,
-            );
+        assert_admissible(value, ((l / ny) as isize, (l % ny) as isize), label);
 
-            *o = value;
-        });
+        *o = value;
+    });
 }
 
 fn rk3_ssp(
@@ -494,8 +460,8 @@ fn main() {
         io::clear_data_folder();
     }
 
-    let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::Reflective);
-    //let mut u = init::init_planar_shock_channel();
+    //let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::Reflective);
+    let mut u = init::init_forward_facing_step_rotated();
     let t_store_interval = 0.01_f64;
 
     // ---------------------------------------------------------
@@ -566,6 +532,10 @@ fn main() {
             "step={}, t={:.8e}, dt={:.8e}, dt_cfl={:.8e}",
             n, t, dt, dt_cfl
         );
+        if n % 100 == 0 {
+            bc1::print_ilw_wall_statistics();
+            bc1::print_reflective_wall_statistics();
+        }
 
         if next_store_time <= t_final && t >= next_store_time - 1e-12 {
             store_id += 1;
@@ -587,6 +557,8 @@ fn main() {
         "Finished: t={:.8e}, restart-local steps={}, last id={}",
         t, n, store_id
     );
+    bc1::print_ilw_wall_statistics();
+    bc1::print_reflective_wall_statistics();
 }
 
 #[cfg(test)]

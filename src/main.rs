@@ -461,8 +461,8 @@ fn main() {
         io::clear_data_folder();
     }
 
-    //let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::Reflective);
-    let mut u = init::init_forward_facing_step_rotated();
+    let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::HighOrder);
+    //let mut u = init::init_forward_facing_step_rotated();
     let t_store_interval = 0.01_f64;
 
     // ---------------------------------------------------------

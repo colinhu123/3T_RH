@@ -1,21 +1,22 @@
+import sys
+from pathlib import Path
+
 import numpy as np
 import matplotlib.pyplot as plt
-import glob
-import os
-import struct
+
+# Make the shared reader importable when run from any directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from py_utils import solution_io  # noqa: E402
 
 # ============================================================
-# Binary solution format
+# Only completed *.bin files are visible. Rust writes
+# *.bin.tmp first and atomically renames it after flush/close.
 # ============================================================
 
-MAGIC = b"RH3TBIN1"
-HEADER = struct.Struct("<8sIIQQd")
-NVAR = 8
-
-# Only completed *.bin files are visible. Rust writes *.bin.tmp first
-# and atomically renames it after flush/close.
 def refresh_files():
-    return sorted(glob.glob("data/solution_*.bin"))
+    return solution_io.refresh_solution_files("data")
+
 
 files = refresh_files()
 if len(files) == 0:
@@ -31,57 +32,12 @@ fig, ax = plt.subplots(figsize=(10, 5))
 colorbar = None
 
 # ============================================================
-# Fast binary reader
+# Fast binary reader (shared with scripts/live_monitor.py)
 # ============================================================
 
 def read_file(filename):
-    with open(filename, "rb") as f:
-        raw = f.read(HEADER.size)
-
-    if len(raw) != HEADER.size:
-        raise RuntimeError(f"Incomplete binary header in {filename}")
-
-    magic, version, nvar, nx, ny, time = HEADER.unpack(raw)
-
-    if magic != MAGIC:
-        raise RuntimeError(
-            f"Wrong file magic in {filename}: {magic!r}; expected {MAGIC!r}"
-        )
-    if version != 1:
-        raise RuntimeError(f"Unsupported binary version {version} in {filename}")
-    if nvar != NVAR:
-        raise RuntimeError(
-            f"Unexpected variable count {nvar} in {filename}; expected {NVAR}"
-        )
-
-    expected_bytes = HEADER.size + nx * ny * nvar * 8
-    actual_bytes = os.path.getsize(filename)
-
-    if actual_bytes != expected_bytes:
-        raise RuntimeError(
-            f"Binary size mismatch in {filename}: "
-            f"expected={expected_bytes} bytes, actual={actual_bytes} bytes"
-        )
-
-    # np.memmap avoids parsing text and avoids copying the entire file.
-    data = np.memmap(
-        filename,
-        dtype="<f8",
-        mode="r",
-        offset=HEADER.size,
-        shape=(ny, nx, nvar),
-        order="C",
-    )
-
-    # Payload columns:
-    # 0=x, 1=y, 2=rho, 3=mom_x, 4=mom_y, 5=ee, 6=ei, 7=er
-    x = np.asarray(data[0, :, 0])
-    y = np.asarray(data[:, 0, 1])
-
-    # Mask outside-polygon cells written as NaN by Rust.
-    rho = np.ma.masked_invalid(data[:, :, 2])
-
-    return x, y, rho, time
+    x, y, time, field = solution_io.read_solution_file(filename)
+    return x, y, field["rho"], time
 
 
 # ============================================================
@@ -117,7 +73,7 @@ def update():
         f"Density\n"
         f"Frame {step}/{len(files)-1}  "
         f"t={time:.8e}  "
-        f"{os.path.basename(files[step])}"
+        f"{Path(files[step]).name}"
     )
     ax.set_aspect("equal")
 

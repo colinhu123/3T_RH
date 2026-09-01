@@ -1,62 +1,92 @@
 #!/usr/bin/env python3
 """
-scripts/live_monitor.py
+scripts/live_monitor.py — 3T-RH Simulation Dashboard
 
-Standalone Python live monitor for the Rust CFD solver's diagnostics file
-data/monitor.csv.
+Single-window dashboard that combines the Rust CFD solver's
 
-Architecture (Python and Rust are fully decoupled):
+  * solution snapshots  (data/solution_*.bin, binary format from src/io.rs)
+  * live diagnostics    (data/monitor.csv, written by src/monitor.rs)
 
-    Rust solver
-        |
-        | continuously appends rows
-        v
-    data/monitor.csv
-        ^
-        |
-        | periodically reads (polling)
-        |
-    scripts/live_monitor.py
-        |
-        v
-    matplotlib live figures (+ optional PNG snapshots)
+into ONE matplotlib window with page switching:
 
-The monitor is a *pure reader*:
-  * it never locks / truncates / renames / rewrites / deletes the CSV
-  * it never touches the Rust process or its memory (no FFI, no bindings)
-  * if the monitor crashes, the Rust simulation is completely unaffected
+  1 Solution | 2 Health | 3 Activity | 4 Oscillation | 5 Global
 
-Robustness handled here (this is the main design point):
-  * CSV not created yet               -> print "Waiting for ...", keep waiting
-  * CSV mid-write / partial row       -> the trailing incomplete line is dropped;
-                                          previously plotted data/figures are kept
-  * header-only CSV                   -> wait for data rows, no crash
-  * NaN / +/-Inf values               -> sanitized to NaN before plotting
-  * missing columns                   -> the column is skipped with a one-time
-                                          warning; the rest of the figures keep
-                                          working (future-proof against schema changes)
-  * CSV truncate / fresh run          -> detected as a reset; figures are rebuilt
-                                          from the new data (old/new are never mixed)
+Pages are switched with the keys 1..5 (the active page is shown in the
+compact header title; there are no large Button widgets). Solution snapshot
+navigation (Left/Right/Up/Down/Home/End), live-follow (Space) and the
+current-snapshot time marker on the monitor pages are all handled here.
 
-Plotted quantities (same names as the CSV columns):
+Architecture (Python and Rust remain fully decoupled):
+  - pure readers only: never locks/truncates/renames the CSV or the *.bin
+  - binary reading reuses py_utils/solution_io.py (same reader as the
+    standalone visualize_sol.py)
+  - a single figure; page axes are created on page entry and removed on
+    switch, so no unbounded growth of axes/colorbars/artists
 
-  time stepping : dt, dt_cfl, dt_over_dt_cfl
-  physical      : rho_min, p_min, ee_int_min, ei_int_min, er_int_min, mach_max
-  temporal      : drho_dt_l2, dmom_x_dt_l2, dmom_y_dt_l2, dee_dt_l2, dei_dt_l2, der_dt_l2
-                  || (U^{n+1} - U^n) / dt ||_RMS  -> a *temporal activity* measure,
-                  NOT a steady-state residual
-  oscillation   : tv_rho, tv_p, s2_rho, s2_p
-  global        : mass, mom_x, mom_y, total_energy (+ relative change vs first value)
+Keys:
+  1-5     switch page
+  Left/Right  previous/next snapshot
+  Up/Down     +/-10 snapshots
+  Home        first snapshot          (disables live follow)
+  End         latest snapshot         (re-enables live follow)
+  Space       toggle LIVE FOLLOW
+  R           force refresh
+  Q           quit
 """
 
 import argparse
 import io
 import math
 import os
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Reliable repo-root based defaults (see "working directory" notes): the
+# dashboard lives in scripts/ but the data lives in the repository root.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from py_utils import solution_io  # noqa: E402
+
+# EOS constants (must match src/constant.rs) used to derive pressure and Mach.
+GAMMA_E = 1.4
+GAMMA_I = 1.4
+GAMMA_R = 1.4
+
+PAGE_TITLES = [
+    "Solution",
+    "Physical Health",
+    "Temporal Activity",
+    "Oscillation",
+    "Global Quantities",
+]
+
+SOLUTION_VARIABLES = [
+    "rho",
+    "u",
+    "v",
+    "speed",
+    "mom_x",
+    "mom_y",
+    "ee",
+    "ei",
+    "er",
+    "pressure",
+    "mach",
+    "vorticity",
+]
+
+# Display labels for the solution page title / colorbar.
+VARIABLE_TITLES = {
+    "vorticity": r"Vorticity $\omega_z$",
+}
+VARIABLE_COLORBAR = {
+    "vorticity": r"$\omega_z$",
+}
 
 
 def _log(msg):
@@ -71,14 +101,19 @@ def _log(msg):
 def parse_args():
     p = argparse.ArgumentParser(
         description=(
-            "Live diagnostic monitor for data/monitor.csv written by the "
-            "Rust CFD solver (read-only, does not touch the solver)."
+            "3T-RH Simulation Dashboard: single-window solution + diagnostics "
+            "monitor (read-only, does not touch the solver)."
         )
     )
     p.add_argument(
+        "--solution-dir",
+        default=str(REPO_ROOT / "data"),
+        help=f"directory with solution_*.bin files (default: {REPO_ROOT / 'data'})",
+    )
+    p.add_argument(
         "--file",
-        default="data/monitor.csv",
-        help="path to the solver diagnostics CSV (default: data/monitor.csv)",
+        default=str(REPO_ROOT / "data" / "monitor.csv"),
+        help="path to the solver diagnostics CSV (default: <repo>/data/monitor.csv)",
     )
     p.add_argument(
         "--interval",
@@ -90,21 +125,27 @@ def parse_args():
         "--max-points",
         type=int,
         default=5000,
-        help="maximum number of points plotted per line after stride downsampling "
+        help="maximum points per monitor line after stride downsampling "
              "(default: 5000)",
     )
     p.add_argument(
         "--save-dir",
         default=None,
-        help="directory to periodically write PNG snapshots (files are overwritten "
-             "on every refresh, no unbounded file growth)",
+        help="directory to periodically write a dashboard.png snapshot "
+             "(overwritten each refresh)",
     )
     p.add_argument(
         "--no-gui",
         action="store_true",
-        help="headless mode: no GUI window; PNG snapshots are written to --save-dir "
-             "(auto-provided as data/monitor_plots if --save-dir is omitted)",
+        help="headless mode: no GUI window; uses the Agg backend and writes "
+             "dashboard.png to --save-dir (auto-provided if omitted)",
     )
+    p.add_argument("--gamma-e", type=float, default=GAMMA_E,
+                   help="electron gamma, matches src/constant.rs (default 1.4)")
+    p.add_argument("--gamma-i", type=float, default=GAMMA_I,
+                   help="ion gamma, matches src/constant.rs (default 1.4)")
+    p.add_argument("--gamma-r", type=float, default=GAMMA_R,
+                   help="radiation gamma, matches src/constant.rs (default 1.4)")
     args = p.parse_args()
 
     if args.interval <= 0.0:
@@ -113,26 +154,19 @@ def parse_args():
         p.error("--max-points must be at least 100")
 
     if args.no_gui and args.save_dir is None:
-        args.save_dir = "data/monitor_plots"
-        _log(
-            "--no-gui without --save-dir: snapshots will be written to "
-            "data/monitor_plots"
-        )
+        args.save_dir = str(REPO_ROOT / "data" / "monitor_plots")
+        _log("--no-gui without --save-dir: snapshots go to "
+             f"{REPO_ROOT / 'data' / 'monitor_plots'}")
 
     return args
 
 
 # ============================================================
-# Robust CSV reading
+# Robust CSV reading (same robustness as the previous live_monitor.py)
 # ============================================================
 
 def _row_fully_numeric(row):
-    """True if every comma-separated field of `row` parses as a float.
-
-    Used to detect a trailing row the Rust solver is still writing: a
-    partially-written number (e.g. "1.23e" or "1.2e-") fails float().
-    Plain 'nan' / 'inf' / '-inf' parse fine and are intentionally accepted.
-    """
+    """True if every comma-separated field of ``row`` parses as a float."""
     for tok in row.split(","):
         try:
             float(tok)
@@ -144,14 +178,8 @@ def _row_fully_numeric(row):
 def _clean_lines(lines):
     """Tolerate a CSV file that is being written right now.
 
-    Returns a cleaned CSV text, or None when nothing usable is there yet.
-
-    * blank lines are removed
-    * rows whose field count differs from the header are dropped (this is
-      typically the incomplete trailing row)
-    * if the final remaining row does not parse as pure floats it is dropped
-      too (a number can have the right field count yet still be truncated)
-    * a header-only file yields just the header (an empty DataFrame later)
+    Returns cleaned CSV text or None. Incomplete trailing rows (mid-write by
+    the Rust solver) are dropped; a header-only file yields just the header.
     """
     rows = [ln.rstrip("\r\n") for ln in lines]
     rows = [ln for ln in rows if ln.strip()]
@@ -162,14 +190,10 @@ def _clean_lines(lines):
     header = rows[0]
     nfields = header.count(",") + 1
     if nfields < 2:
-        # malformed header (possibly mid-write): treat as not ready yet
         return None
 
     body = [ln for ln in rows[1:] if ln.count(",") + 1 == nfields]
 
-    # A trailing row that is mid-write can still have the right field count
-    # (only its last number is truncated). Only the last row is examined,
-    # because the solver writes one row at a time.
     if body and not _row_fully_numeric(body[-1]):
         body = body[:-1]
 
@@ -180,11 +204,10 @@ def _clean_lines(lines):
 
 
 def safe_read_csv(path):
-    """Read the CSV into a pandas DataFrame.
+    """Read the CSV into a pandas DataFrame (None when not ready yet).
 
-    Returns None when the file is missing / empty / mid-write, and an empty
-    DataFrame (columns only) when only a header is present. This function
-    never raises for malformed, incomplete or changing input.
+    Returns None for missing/empty/mid-write files, an empty DataFrame when
+    only a header is present. Never raises for malformed/incomplete input.
     """
     try:
         st = os.stat(path)
@@ -194,8 +217,6 @@ def safe_read_csv(path):
         return None
 
     lines = None
-    # A very short read (file being appended/truncated at the same moment)
-    # is retried briefly before giving up for this cycle.
     for _ in range(3):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -214,20 +235,11 @@ def safe_read_csv(path):
     try:
         return pd.read_csv(io.StringIO(cleaned))
     except Exception:
-        # e.g. the header was captured mid-write; retry next cycle
         return None
 
 
-# ============================================================
-# Plotting helpers
-# ============================================================
-
 def sanitize_series(values):
-    """Return a float array where +Inf / -Inf are replaced by NaN.
-
-    NaN is simply not drawn by matplotlib and does not corrupt autoscaling,
-    while +Inf / -Inf would. The original CSV is never modified.
-    """
+    """Return a float array where +Inf / -Inf are replaced by NaN."""
     try:
         arr = np.asarray(values, dtype=float)
     except (ValueError, TypeError):
@@ -236,12 +248,7 @@ def sanitize_series(values):
 
 
 def downsample_dataframe(df, max_points):
-    """Stride-downsample so the whole history stays visible.
-
-    With N <= max_points all points are drawn. Otherwise ~max_points points
-    are kept using a uniform stride over the *entire* history (not just the
-    tail), and the very last (latest) point is always included.
-    """
+    """Stride-downsample the whole history; the latest point is always kept."""
     n = len(df)
     if n <= max_points:
         return df
@@ -252,15 +259,376 @@ def downsample_dataframe(df, max_points):
     return df.iloc[idx]
 
 
-class Panel:
-    """One axes with a set of lines, per-refresh autoscaling and a y=0 line.
+# ============================================================
+# Vorticity (embedded-boundary safe derivatives)
+# ============================================================
 
-    Columns that are absent from the CSV are skipped (one-time warning) so a
-    schema change in monitor.csv never crashes the monitor.
+def _masked_gradient(f, valid, coord, axis):
+    """Masked first derivative of ``f`` along ``axis`` using physical coords.
+
+    Parameters
+    ----------
+    f : (ny, nx) float array
+        Field values; non-fluid entries may be anything (they are masked out
+        by ``valid`` and never used in the stencil).
+    valid : (ny, nx) bool array
+        True for fluid points whose value is usable.
+    coord : 1-D float array
+        Physical coordinate vector along ``axis`` (x for axis=1, y for axis=0).
+    axis : int
+        0 -> d/dy, 1 -> d/dx.
+
+    Strategy (conservative, embedded-geometry safe):
+      * centered 2nd-order difference where both neighbours are valid fluid;
+      * one-sided 1st-order difference where exactly one adjacent neighbour
+        is valid and the centre point is valid;
+      * NaN where no derivative can be formed from valid fluid data.
+
+    Solid / NaN cells are never replaced by 0, so an embedded obstacle never
+    manufactures a fake vortex layer at its boundary.
     """
+    n = f.shape[axis]          # number of points along the derivative axis
+    m = f.shape[1 - axis]      # number of points along the other axis
+    out = np.full(f.shape, np.nan)
+
+    for k in range(n):
+        # slice views of the centre point and its two neighbours
+        if axis == 0:                       # d/dy along rows
+            cur, cvalid = f[k, :], valid[k, :]
+            km1 = f[k - 1, :] if k - 1 >= 0 else None
+            vkm1 = valid[k - 1, :] if k - 1 >= 0 else None
+            kp1 = f[k + 1, :] if k + 1 < n else None
+            vkp1 = valid[k + 1, :] if k + 1 < n else None
+        else:                               # d/dx along columns
+            cur, cvalid = f[:, k], valid[:, k]
+            km1 = f[:, k - 1] if k - 1 >= 0 else None
+            vkm1 = valid[:, k - 1] if k - 1 >= 0 else None
+            kp1 = f[:, k + 1] if k + 1 < n else None
+            vkp1 = valid[:, k + 1] if k + 1 < n else None
+
+        outk = np.full(m, np.nan)
+
+        if km1 is not None and kp1 is not None:
+            cent = vkm1 & vkp1
+            outk[cent] = (kp1[cent] - km1[cent]) / (coord[k + 1] - coord[k - 1])
+            # one-sided fallback where centred is impossible
+            if not cent.all():
+                back = vkm1 & cvalid & ~cent
+                outk[back] = (cur[back] - km1[back]) / (coord[k] - coord[k - 1])
+                fwd = vkp1 & cvalid & ~cent
+                outk[fwd] = (kp1[fwd] - cur[fwd]) / (coord[k + 1] - coord[k])
+        elif km1 is not None:
+            back = vkm1 & cvalid
+            outk[back] = (cur[back] - km1[back]) / (coord[k] - coord[k - 1])
+        elif kp1 is not None:
+            fwd = vkp1 & cvalid
+            outk[fwd] = (kp1[fwd] - cur[fwd]) / (coord[k + 1] - coord[k])
+
+        if axis == 0:
+            out[k, :] = outk
+        else:
+            out[:, k] = outk
+
+    return out
+
+
+def compute_vorticity(x, y, rho, mom_x, mom_y):
+    """2D out-of-plane vorticity omega_z = dv/dx - du/dy.
+
+    Inputs are the raw masked solution fields (masked outside the fluid). Only
+    fluid points with a valid derivative stencil contribute; solid / NaN cells
+    are never treated as zero. The result is a masked array with the same
+    shape as the input fields.
+    """
+    rho_a = np.ma.getdata(rho)
+    mx_a = np.ma.getdata(mom_x)
+    my_a = np.ma.getdata(mom_y)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = mx_a / rho_a
+        v = my_a / rho_a
+
+    valid = (
+        (~np.ma.getmaskarray(rho))
+        & (~np.ma.getmaskarray(mom_x))
+        & (~np.ma.getmaskarray(mom_y))
+        & np.isfinite(u)
+        & np.isfinite(v)
+        & (rho_a > 0.0)
+    )
+    u = np.where(valid, u, np.nan)
+    v = np.where(valid, v, np.nan)
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    dv_dx = _masked_gradient(v, valid, x, axis=1)
+    du_dy = _masked_gradient(u, valid, y, axis=0)
+
+    return np.ma.masked_invalid(dv_dx - du_dy)
+
+
+def _symmetric_vorticity_limits(vals):
+    """Symmetric color limits (-L, +L) centered on 0 for signed vorticity.
+
+    Uses the 99th percentile of |omega| over valid fluid values so a few
+    extreme numerical spikes do not destroy the contrast; falls back to the
+    max |value| when the percentile is unusable. Returns None when there is no
+    usable data.
+    """
+    data = np.ma.getdata(vals)
+    mask = np.ma.getmaskarray(vals)
+    finite = data[(~mask) & np.isfinite(data)]
+    if finite.size == 0:
+        return None
+    lim = float(np.nanpercentile(np.abs(finite), 99.0))
+    if not np.isfinite(lim) or lim <= 0.0:
+        lim = float(np.nanmax(np.abs(finite)))
+    if not np.isfinite(lim) or lim <= 0.0:
+        return None
+    return (-lim, lim)
+
+
+# ============================================================
+# Simulation data (I/O, no plotting)
+# ============================================================
+
+class SimulationData:
+    """Owns solution-file discovery/reading and monitor.csv reading."""
+
+    def __init__(self, solution_dir, monitor_path, max_points, gammas):
+        self.solution_dir = Path(solution_dir)
+        self.monitor_path = Path(monitor_path)
+        self.max_points = max_points
+        self.gamma_e, self.gamma_i, self.gamma_r = gammas
+
+        # solution state
+        self.solution_files = []
+        self.current_frame = 0
+        self.read_frame = None       # index of the last successfully read snapshot
+        self.sol_time = None
+        self.x_grid = None
+        self.y_grid = None
+        self.field = None            # raw conservative field (masked arrays)
+        self.variables = {}          # name -> 2D masked array (incl. derived)
+        self.sol_read_error = False
+
+        # monitor state
+        self.monitor_df = None
+        self.plot_df = None
+        self.xcol = None
+        self.csv_columns = None
+        self.csv_state = "NONE"      # NONE / HEADER / OK / RETRY
+        self.csv_reset_detected = False
+        self.prev_row_count = 0
+        self.prev_max_x = None
+        self._last_csv_stat = None
+        self.warned_cols = set()
+
+    # ---------------- solution ----------------
+
+    def refresh_solution_files(self):
+        self.solution_files = solution_io.refresh_solution_files(self.solution_dir)
+
+    def clamp_frame(self):
+        n = len(self.solution_files)
+        if n == 0:
+            self.current_frame = 0
+            return
+        self.current_frame = max(0, min(self.current_frame, n - 1))
+
+    def read_solution(self, index):
+        """Read snapshot ``index``; returns True on success, False on error."""
+        try:
+            x, y, time, field = solution_io.read_solution_file(
+                self.solution_files[index]
+            )
+        except Exception as exc:
+            if not self.sol_read_error:
+                _log(f"warning: cannot read {self.solution_files[index].name}: {exc}")
+                self.sol_read_error = True
+            return False
+
+        self.sol_read_error = False
+        self.read_frame = index
+        self.sol_time = time
+        self.x_grid = x
+        self.y_grid = y
+        self.field = field
+        self.variables = self._build_variables(field, x, y)
+        return True
+
+    def _build_variables(self, field, x, y):
+        """Derived solution fields.
+
+        u = mom_x/rho, v = mom_y/rho, |u| = sqrt(u^2+v^2).
+        pressure and Mach follow the solver EOS exactly (src/state.rs):
+          e_k = ee/rho - (u^2+v^2)/6, ...
+          p   = (GAMMA_E-1)*(ee - rho*(u^2+v^2)/6) + ... + ...
+          cs  = sqrt(GAMMA_E*(GAMMA_E-1)*e_e + GAMMA_I*(GAMMA_I-1)*e_i
+                     + GAMMA_R*(GAMMA_R-1)*e_r)
+        Zero/NaN/outside-domain cells are masked and never displayed.
+        """
+        ge, gi, gr = self.gamma_e, self.gamma_i, self.gamma_r
+        rho = field["rho"]
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u = np.ma.masked_invalid(field["mom_x"] / rho)
+            v = np.ma.masked_invalid(field["mom_y"] / rho)
+            w2 = u ** 2 + v ** 2
+            speed = np.ma.masked_invalid(np.sqrt(w2))
+
+            e_e = field["ee"] / rho - w2 / 6.0
+            e_i = field["ei"] / rho - w2 / 6.0
+            e_r = field["er"] / rho - w2 / 6.0
+
+            pe = (ge - 1.0) * (field["ee"] - rho * w2 / 6.0)
+            pi = (gi - 1.0) * (field["ei"] - rho * w2 / 6.0)
+            pr = (gr - 1.0) * (field["er"] - rho * w2 / 6.0)
+            p = np.ma.masked_invalid(pe + pi + pr)
+
+            cs = np.sqrt(ge * (ge - 1.0) * e_e
+                         + gi * (gi - 1.0) * e_i
+                         + gr * (gr - 1.0) * e_r)
+            mach = np.ma.masked_invalid(speed / cs)
+
+        return {
+            "rho": rho,
+            "mom_x": field["mom_x"],
+            "mom_y": field["mom_y"],
+            "ee": field["ee"],
+            "ei": field["ei"],
+            "er": field["er"],
+            "u": u,
+            "v": v,
+            "speed": speed,
+            "pressure": p,
+            "mach": mach,
+            # omega_z = dv/dx - du/dy, recomputed per snapshot (read_solution
+            # only runs when the frame changes, so monitor-only updates never
+            # re-trigger this O(Nx*Ny) calculation).
+            "vorticity": compute_vorticity(
+                x, y, field["rho"], field["mom_x"], field["mom_y"],
+            ),
+        }
+
+    # ---------------- monitor ----------------
+
+    def _read_csv(self):
+        """Return ``(df, changed)``.
+
+        ``df`` is None when there is no usable data this cycle. When the file
+        is unchanged since the last successful read, the cached DataFrame is
+        returned with ``changed=False`` (state must not be degraded just
+        because nothing new arrived).
+        """
+        try:
+            st = os.stat(self.monitor_path)
+        except OSError:
+            return None, True
+        key = (st.st_size, st.st_mtime_ns)
+        if self._last_csv_stat == key:
+            return self.monitor_df, False
+        df = safe_read_csv(self.monitor_path)
+        if df is not None:
+            self._last_csv_stat = key
+            return df, True
+        return None, True
+
+    def _choose_xcol(self, df):
+        if "time" in df.columns:
+            return "time"
+        if "step" in df.columns:
+            return "step"
+        return df.columns[0]
+
+    def _detect_reset(self, df, cols_changed):
+        if self.csv_columns is None:
+            return False
+        if cols_changed:
+            return True
+        n = len(df)
+        if self.prev_row_count and n < self.prev_row_count * 0.5:
+            return True
+        if self.prev_max_x is not None and self.xcol is not None and self.xcol in df.columns:
+            xs = pd.to_numeric(df[self.xcol], errors="coerce")
+            if not xs.dropna().empty:
+                mx = float(xs.max())
+                if mx < self.prev_max_x * 0.5:
+                    return True
+        return False
+
+    def _derived_frame(self, df):
+        """Add *_rel relative-change columns with a guarded baseline Q0."""
+        out = df.copy()
+        for base in ("mass", "mom_x", "total_energy"):
+            if base not in out.columns:
+                continue
+            series = pd.to_numeric(out[base], errors="coerce")
+            finite = series.dropna()
+            if finite.empty:
+                continue
+            q0 = float(finite.iloc[0])
+            if not np.isfinite(q0):
+                continue
+            if abs(q0) > 1e-30:
+                out[base + "_rel"] = (series - q0) / abs(q0)
+            else:
+                out[base + "_rel"] = series - q0
+        return out
+
+    def refresh_monitor(self):
+        """Re-read monitor.csv if changed; update state. Returns changed flag."""
+        df, changed = self._read_csv()
+        if df is None:
+            if changed:
+                self.csv_state = (
+                    "RETRY" if os.path.exists(self.monitor_path) else "NONE"
+                )
+            return False
+
+        if len(df) == 0:
+            self.csv_state = "HEADER"
+            self.csv_columns = list(df.columns)
+            self.monitor_df = df
+            self.plot_df = None
+            return False
+
+        if not changed:
+            # identical to what we already processed; keep the current state
+            return False
+
+        cols_changed = self.csv_columns is not None and list(df.columns) != self.csv_columns
+        if self._detect_reset(df, cols_changed):
+            self.csv_reset_detected = True
+
+        self.csv_columns = list(df.columns)
+        self.csv_state = "OK"
+        self.monitor_df = df
+        if self.xcol is None:
+            self.xcol = self._choose_xcol(df)
+        self.prev_row_count = len(df)
+        if self.xcol in df.columns:
+            xs = pd.to_numeric(df[self.xcol], errors="coerce")
+            if not xs.dropna().empty:
+                self.prev_max_x = float(xs.max())
+        self.plot_df = downsample_dataframe(
+            self._derived_frame(df), self.max_points
+        )
+        return True
+
+
+# ============================================================
+# Plotting helpers
+# ============================================================
+
+class Panel:
+    """One axes with a set of lines, autoscaling, optional y=0 line and an
+    optional current-snapshot vertical marker. Columns absent from the CSV are
+    skipped (one-time warning)."""
 
     def __init__(self, ax, columns, present, warn, ylabel, xlabel,
-                 log_ok=False, ref_zero=False):
+                 log_ok=False, ref_zero=False, marker=False):
         self.ax = ax
         self.lines = []
         self.log_ok = log_ok
@@ -284,7 +652,19 @@ class Panel:
         ax.set_xlabel(xlabel)
         ax.grid(True, alpha=0.3)
 
-    def update(self, df, xcol):
+        self.marker = None
+        if marker:
+            self.marker = ax.axvline(0.0, color="tab:red", lw=1.2, ls="--",
+                                     alpha=0.85, zorder=5)
+
+    def update(self, df, xcol, marker_time=None):
+        if df is None or len(df) == 0:
+            for _, line in self.lines:
+                line.set_data([], [])
+            if self.marker is not None:
+                self.marker.set_visible(False)
+            return
+
         if xcol in df.columns:
             xs = sanitize_series(df[xcol])
         else:
@@ -296,14 +676,29 @@ class Panel:
             else:
                 line.set_data([], [])
 
-        self._autoscale(df, xs)
+        self._autoscale(df, xs, marker_time)
 
-    def _autoscale(self, df, xs):
+    def _autoscale(self, df, xs, marker_time):
         xs = np.asarray(xs, dtype=float)
         xf = xs[np.isfinite(xs)]
         if xf.size == 0:
             return
-        self.ax.set_xlim(float(xf[0]), float(xf[-1]))
+
+        xmin, xmax = float(xf[0]), float(xf[-1])
+        if self.marker is not None and marker_time is not None:
+            self.marker.set_xdata([marker_time, marker_time])
+            self.marker.set_visible(True)
+            xmin = min(xmin, marker_time)
+            xmax = max(xmax, marker_time)
+        elif self.marker is not None:
+            self.marker.set_visible(False)
+
+        if not (xmax > xmin):
+            # single data point (e.g. just after a CSV reset): matplotlib warns
+            # on identical x-limits, so give the panel a small extent.
+            xmin -= 0.5
+            xmax += 0.5
+        self.ax.set_xlim(xmin, xmax)
 
         yvals = [sanitize_series(df[col]) for col, _ in self.lines
                  if col in df.columns]
@@ -319,8 +714,6 @@ class Panel:
             return
 
         if self.log_ok and ymin > 0.0:
-            # log scale only on strictly-positive data; otherwise we switch
-            # back to linear so 0 / negative values never raise warnings.
             self.ax.set_yscale("log")
             if ymax > ymin:
                 self.ax.set_ylim(ymin * 0.8, ymax * 1.25)
@@ -340,419 +733,558 @@ class Panel:
 
 
 # ============================================================
-# Live monitor application
+# Dashboard (UI + rendering)
 # ============================================================
 
-class LiveMonitor:
-    """Owns the figures and the polling loop."""
-
-    FIG_NAMES = {
-        "time_stepping": "time_stepping.png",
-        "physical_health": "physical_health.png",
-        "temporal_activity": "temporal_activity.png",
-        "oscillation_indicators": "oscillation_indicators.png",
-        "global_quantities": "global_quantities.png",
-    }
+class Dashboard:
+    """One figure, page switching, live refresh, keyboard/button control."""
 
     def __init__(self, args, plt):
         self.args = args
         self.plt = plt
 
-        self.xcol = None
-        self.figs = {}
-        self.panels = []
-        self.header_cols = None
-        self.present_cols = set()
-        self.warned_cols = set()
+        # Imported after the backend is selected (matplotlib.widgets imports
+        # pyplot internally, which would otherwise pick the wrong backend).
+        from matplotlib.widgets import RadioButtons
+        self.RadioButtons = RadioButtons
 
-        self.last_stat = None
-        self.prev_row_count = 0
-        self.prev_max_x = None
+        self.data = SimulationData(
+            args.solution_dir, args.file, args.max_points,
+            (args.gamma_e, args.gamma_i, args.gamma_r),
+        )
 
-        self.last_saved_count = 0
-        self.last_status_time = 0.0
-        self.last_status_count = 0
-        self.header_only = False
+        self.current_page = 0
+        self.live_follow = True
+        self.selected_variable = "rho"
 
-    # --------------------------------------------------------
-    # main loop
-    # --------------------------------------------------------
+        self.fig = None
+        self.page_area = None
+        self.title_text = None
+        self.nav_text = None
+        self.status_text = None
 
-    def run(self):
-        waiting_printed = False
-        while True:
-            df = self._read_csv()
-            if df is None:
-                # Only keep the "Waiting" message while the file does not
-                # exist yet. If it exists but is mid-write / header-only /
-                # unchanged, stay quiet (we already reported that state).
-                if os.path.exists(self.args.file):
-                    waiting_printed = False
-                elif not waiting_printed:
-                    _log(f"Waiting for {self.args.file} ...")
-                    waiting_printed = True
-                self._sleep()
-                continue
-            waiting_printed = False
+        # per-page artists / widgets (cleared on page switch)
+        self._page_axes = []
+        self._panels = []
+        self._radio = None
+        self._cbar = None
+        self._mesh = None
+        self._sol_ax = None
+        self._drawn_sol_key = None
+        self._sol_failed = False
+        self._built_csv_schema = None
 
-            cols_changed = (
-                self.header_cols is None
-                or list(df.columns) != self.header_cols
-            )
-            reset = self._detect_reset(df, cols_changed)
+        self._timer = None
+        self._closed = False
+        self.last_save_key = None
 
-            if cols_changed or reset:
-                if reset:
-                    _log("CSV reset detected -- figures rebuilt from new simulation")
-                elif self.header_cols is not None:
-                    _log("CSV columns changed -- figures rebuilt")
-                self._build_figures(df)
-
-            if len(df) == 0:
-                if not self.header_only:
-                    _log(f"{self.args.file} present (header only) -- waiting for data rows")
-                    self.header_only = True
-                self._sleep()
-                continue
-            self.header_only = False
-
-            self._update(df)
-            self._maybe_save(df)
-            self._maybe_status(df)
-            self._sleep()
+        self._build_ui()
 
     # --------------------------------------------------------
-    # file access
+    # figure construction
     # --------------------------------------------------------
 
-    def _read_csv(self):
-        """Skip re-parsing when the file is unchanged since the last read."""
-        try:
-            st = os.stat(self.args.file)
-        except OSError:
-            return None
-        key = (st.st_size, st.st_mtime_ns)
-        if self.last_stat == key:
-            return None
-        df = safe_read_csv(self.args.file)
-        if df is not None:
-            self.last_stat = key
-        return df
+    def _build_ui(self):
+        plt = self.plt
+        # Larger default window; the page plotting area is the dominant part
+        # of the figure (no large Button widgets anymore).
+        fig = plt.figure(figsize=(13, 8))
 
-    def _sleep(self):
-        if self.args.no_gui:
-            time.sleep(self.args.interval)
-        else:
-            self.plt.pause(self.args.interval)
+        gs = fig.add_gridspec(
+            3, 1,
+            height_ratios=[0.16, 1.0, 0.17],
+            hspace=0.06,
+            left=0.045, right=0.995, top=0.985, bottom=0.015,
+        )
+
+        # top: compact title + page-navigation hint (plain text, no Buttons)
+        head_ax = fig.add_subplot(gs[0, 0])
+        head_ax.axis("off")
+        self.title_text = head_ax.text(
+            0.0, 0.72, "", va="center", ha="left", fontsize=13,
+            fontweight="bold", transform=head_ax.transAxes,
+        )
+        self.nav_text = head_ax.text(
+            0.0, 0.15,
+            "1 Solution  |  2 Health  |  3 Activity  |  4 Oscillation  |  5 Global",
+            va="center", ha="left", fontsize=10, transform=head_ax.transAxes,
+        )
+
+        # middle: page plotting area (dominates the window)
+        self.page_area = gs[1]
+
+        # bottom: status bar + keyboard help (kept thin)
+        sgs = gs[2].subgridspec(2, 1, hspace=0.0)
+        status_ax = fig.add_subplot(sgs[0, 0])
+        status_ax.axis("off")
+        self.status_text = status_ax.text(
+            0.01, 0.5, "", va="center", ha="left", fontsize=10,
+            transform=status_ax.transAxes,
+        )
+        help_ax = fig.add_subplot(sgs[1, 0])
+        help_ax.axis("off")
+        help_ax.text(
+            0.01, 0.5,
+            "1-5 page | \u2190\u2192 frame | \u2191\u2193 \u00b110 | End live | "
+            "Space pause/live | R refresh | Q quit",
+            va="center", ha="left", fontsize=9, transform=help_ax.transAxes,
+        )
+
+        self.fig = fig
+        fig.canvas.mpl_connect("key_press_event", self.on_key)
+        fig.canvas.mpl_connect("close_event", self._on_close)
+
+        self.show_page(0)
+        self._update_status()
+        fig.canvas.draw_idle()
 
     # --------------------------------------------------------
-    # reset detection
+    # page switching
     # --------------------------------------------------------
 
-    def _detect_reset(self, df, cols_changed):
-        if self.header_cols is None:
-            return False
-        if cols_changed:
-            return True  # a different header implies a fresh simulation
-
-        n = len(df)
-        if self.prev_row_count and n < self.prev_row_count * 0.5:
-            return True
-
-        if self.prev_max_x is not None and self.xcol is not None and self.xcol in df.columns:
-            xs = pd.to_numeric(df[self.xcol], errors="coerce")
-            if not xs.dropna().empty:
-                mx = float(xs.max())
-                if mx < self.prev_max_x * 0.5:
-                    return True
-        return False
-
-    # --------------------------------------------------------
-    # figure construction (called once, or again only on reset)
-    # --------------------------------------------------------
-
-    def _build_figures(self, df):
-        self._close_figures()
-        self.header_cols = list(df.columns)
-        self.present_cols = set(self.header_cols)
-        self.warned_cols = set()
-        # A rebuilt figure set belongs to a (new) simulation: forget the old
-        # snapshot/status counters so PNGs regenerate immediately.
-        self.last_saved_count = 0
-        self.last_status_count = 0
-        self.last_status_time = 0.0
-
-        self.xcol = self._choose_xcol(df)
-        xlabel = "Time" if self.xcol == "time" else "Step"
-
-        self.figs["time_stepping"] = self._build_time_stepping(xlabel)
-        self.figs["physical_health"] = self._build_physical_health(xlabel)
-        self.figs["temporal_activity"] = self._build_temporal_activity(xlabel)
-        self.figs["oscillation_indicators"] = self._build_oscillation(xlabel)
-        self.figs["global_quantities"] = self._build_global(xlabel)
-
-        if not self.args.no_gui:
-            self.plt.show(block=False)
-
-    def _close_figures(self):
-        self.panels = []
-        for fig in list(self.figs.values()):
+    def _clear_page(self):
+        for ax in self._page_axes:
             try:
-                self.plt.close(fig)
+                ax.remove()
             except Exception:
                 pass
-        self.figs = {}
+        self._page_axes = []
+        self._panels = []
 
-    def _choose_xcol(self, df):
-        if "time" in df.columns:
-            return "time"
-        if "step" in df.columns:
-            return "step"
-        return df.columns[0]
+        if self._radio is not None:
+            try:
+                self._radio.disconnect_events()
+            except Exception:
+                pass
+            self._radio = None
 
-    def _subplots(self, name, title, nrows, figsize=(9.0, 4.5), sharex=False):
-        fig, axes = self.plt.subplots(
-            nrows, 1, figsize=figsize, sharex=sharex, num=name
+        if self._cbar is not None:
+            try:
+                self._cbar.remove()
+            except Exception:
+                pass
+            self._cbar = None
+
+        self._mesh = None
+        self._sol_ax = None
+
+    def _set_title(self, title):
+        self.title_text.set_text(f"3T-RH Simulation Dashboard  \u2014  {title}")
+
+    def show_page(self, page):
+        if not (0 <= page < len(PAGE_TITLES)):
+            return
+        if page == self.current_page and self._page_axes:
+            return
+        self.current_page = page
+        self._build_page(page)
+        self._update_status()
+        self.fig.canvas.draw_idle()
+
+    def _build_page(self, page):
+        self._clear_page()
+        self._set_title(PAGE_TITLES[page])
+        if page == 0:
+            self._build_solution_page()
+        else:
+            self._build_monitor_page(page)
+        self._built_csv_schema = (
+            tuple(self.data.csv_columns) if self.data.csv_columns else None
         )
-        fig.suptitle(title, fontsize=12)
-        if nrows == 1:
-            axes = [axes]
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
-        return fig, axes
-
-    def _add_panel(self, ax, columns, ylabel, xlabel, log_ok=False, ref_zero=False,
-                   extra_present=()):
-        present = self.present_cols | set(extra_present)
-        panel = Panel(
-            ax,
-            columns,
-            present,
-            self._warn_missing,
-            ylabel,
-            xlabel,
-            log_ok=log_ok,
-            ref_zero=ref_zero,
-        )
-        self.panels.append(panel)
-        return panel
-
-    def _warn_missing(self, col):
-        if col not in self.warned_cols:
-            self.warned_cols.add(col)
-            _log(f"warning: column '{col}' missing from CSV -- skipping its plot")
 
     # --------------------------------------------------------
-    # individual figures
+    # solution page
     # --------------------------------------------------------
 
-    def _build_time_stepping(self, xlabel):
-        fig, axes = self._subplots(
-            "time_stepping", "Time Stepping", 2, figsize=(9.0, 6.0), sharex=True
+    def _build_solution_page(self):
+        fig = self.fig
+        # Main field dominates; compact variable selector on the right
+        # (roughly 12-15% of the page width).
+        sg = self.page_area.subgridspec(
+            1, 2, wspace=0.03, width_ratios=[0.87, 0.13]
         )
-        self._add_panel(
-            axes[0],
-            [("dt", "dt"), ("dt_cfl", "dt_cfl")],
-            "dt",
-            xlabel,
-            log_ok=True,
-        )
-        self._add_panel(
-            axes[1],
-            [("dt_over_dt_cfl", "dt / dt_cfl")],
-            "dt / dt_cfl",
-            xlabel,
-            log_ok=False,
-            ref_zero=True,
-        )
-        return fig
+        main_ax = fig.add_subplot(sg[0, 0])
+        radio_ax = fig.add_subplot(sg[0, 1])
 
-    def _build_physical_health(self, xlabel):
-        fig, axes = self._subplots(
-            "physical_health", "Physical Health", 2, figsize=(9.0, 6.0), sharex=True
-        )
-        self._add_panel(
-            axes[0],
-            [
-                ("rho_min", "rho_min"),
-                ("p_min", "p_min"),
-                ("ee_int_min", "ee_int_min"),
-                ("ei_int_min", "ei_int_min"),
-                ("er_int_min", "er_int_min"),
-            ],
-            "minimum quantity",
-            xlabel,
-            log_ok=False,   # may legitimately approach or cross zero
-            ref_zero=True,  # y=0 is the key numerical-health signal
-        )
-        self._add_panel(
-            axes[1],
-            [("mach_max", "mach_max")],
-            "Mach",
-            xlabel,
-            log_ok=False,
-        )
-        return fig
+        self._sol_ax = main_ax
+        self._page_axes.extend([main_ax, radio_ax])
 
-    def _build_temporal_activity(self, xlabel):
-        fig, axes = self._subplots(
-            "temporal_activity", "Temporal Activity (RMS time derivative, not a residual)",
-            1, figsize=(9.0, 4.5),
-        )
-        self._add_panel(
-            axes[0],
-            [
-                ("drho_dt_l2", "d(rho)/dt"),
-                ("dmom_x_dt_l2", "d(mom_x)/dt"),
-                ("dmom_y_dt_l2", "d(mom_y)/dt"),
-                ("dee_dt_l2", "d(ee)/dt"),
-                ("dei_dt_l2", "d(ei)/dt"),
-                ("der_dt_l2", "d(er)/dt"),
-            ],
-            "RMS ||(U^{n+1} - U^n)/dt||",
-            xlabel,
-            log_ok=True,  # positive; log keeps the dynamic range readable
-        )
-        return fig
+        names = list(SOLUTION_VARIABLES)
+        try:
+            active = names.index(self.selected_variable)
+        except ValueError:
+            active = 0
+        radio = self.RadioButtons(radio_ax, names, active=active)
+        # compact selector: the radio-button circles scale with the label
+        # fontsize, so a small label font keeps the whole widget compact.
+        radio.set_label_props({"fontsize": [7.5]})
+        radio_ax.set_title("Variable", fontsize=9, pad=2)
+        radio.on_clicked(self._on_variable_change)
+        self._radio = radio
 
-    def _build_oscillation(self, xlabel):
-        fig, axes = self._subplots(
-            "oscillation_indicators", "Oscillation Indicators", 2,
-            figsize=(9.0, 6.0), sharex=True,
-        )
-        self._add_panel(
-            axes[0],
-            [("tv_rho", "TV(rho)"), ("tv_p", "TV(p)")],
-            "Total Variation",
-            xlabel,
-            log_ok=True,
-        )
-        self._add_panel(
-            axes[1],
-            [("s2_rho", "S2(rho)"), ("s2_p", "S2(p)")],
-            "Second Difference",
-            xlabel,
-            log_ok=True,
-        )
-        return fig
+        main_ax.set_aspect("equal")
+        main_ax.set_xlabel("x")
+        main_ax.set_ylabel("y")
 
-    def _build_global(self, xlabel):
-        fig, axes = self._subplots(
-            "global_quantities", "Global Quantities", 5,
-            figsize=(9.0, 11.0), sharex=True,
-        )
-        self._add_panel(axes[0], [("mass", "mass")], "mass", xlabel, log_ok=False)
-        self._add_panel(
-            axes[1], [("total_energy", "total_energy")], "total energy",
-            xlabel, log_ok=False,
-        )
-        self._add_panel(axes[2], [("mom_x", "mom_x")], "mom_x", xlabel, log_ok=False)
-        self._add_panel(
-            axes[3], [("mom_y", "mom_y")], "mom_y", xlabel, log_ok=False, ref_zero=True
+        self._mesh = None
+        self._cbar = None
+        self._drawn_sol_key = None
+        self._sol_failed = False
+        self._draw_solution()
+
+    def _on_variable_change(self, label):
+        self.selected_variable = label
+        self._draw_solution()
+        self.fig.canvas.draw_idle()
+
+    def _redraw_mesh(self):
+        data = self.data
+        var = self.selected_variable
+        vals = data.variables[var]
+
+        if self._mesh is not None:
+            self._mesh.remove()
+            self._mesh = None
+
+        if var == "vorticity":
+            # signed out-of-plane vorticity: diverging colormap, color scale
+            # centred on 0 (robust 99th-percentile limit).
+            cmap = "RdBu_r"
+            limits = _symmetric_vorticity_limits(vals)
+            cmap_kw = dict(vmin=limits[0], vmax=limits[1]) if limits else {}
+            cbar_label = VARIABLE_COLORBAR[var]
+        else:
+            cmap = "viridis"
+            cmap_kw = {}
+            cbar_label = var
+
+        self._mesh = self._sol_ax.pcolormesh(
+            data.x_grid, data.y_grid, vals,
+            shading="auto", cmap=cmap, **cmap_kw,
         )
 
-        # Relative change vs the first valid value: (Q - Q0) / |Q0|.
-        #
-        # NOTE: for open / inflow-outflow / embedded-boundary simulations
-        # mass(t) - mass(0) must NOT be interpreted as a conservation error;
-        # this figure is intentionally called "Global Quantities" (relative
-        # change), never "Conservation Error".
+        label = VARIABLE_TITLES.get(var, var)
+        tstr = f"t = {data.sol_time:.4e}" if data.sol_time is not None else "t = ?"
+        self._sol_ax.set_title(
+            f"{label}   |   Frame {data.current_frame + 1}/{len(data.solution_files)}"
+            f"   |   {tstr}",
+            fontsize=10,
+        )
+
+        if self._cbar is None:
+            self._cbar = self.fig.colorbar(self._mesh, ax=self._sol_ax,
+                                           label=cbar_label)
+        else:
+            self._cbar.update_normal(self._mesh)
+            self._cbar.set_label(cbar_label)
+
+    def _draw_solution(self):
+        if self._sol_ax is None:
+            # Not on the Solution page: keep the variable selection and the
+            # current frame in state; the mesh is (re)built on page entry.
+            return
+        data = self.data
+        if not data.solution_files:
+            return
+
+        if data.read_frame != data.current_frame:
+            ok = data.read_solution(data.current_frame)
+        else:
+            ok = True
+
+        key = (data.current_frame, self.selected_variable)
+        if ok and key != self._drawn_sol_key:
+            self._redraw_mesh()
+            self._drawn_sol_key = key
+            self._sol_failed = False
+        elif not ok and not self._sol_failed:
+            self._sol_failed = True
+
+    # --------------------------------------------------------
+    # monitor pages
+    # --------------------------------------------------------
+
+    def _monitor_specs(self, page, present):
+        """Return per-page panel specs: (columns, ylabel, log_ok, ref_zero, extra)."""
+        if page == 1:      # Physical Health
+            return [
+                ([("rho_min", "rho_min"), ("p_min", "p_min"),
+                  ("ee_int_min", "ee_int_min"), ("ei_int_min", "ei_int_min"),
+                  ("er_int_min", "er_int_min")],
+                 "minimum quantity", False, True, []),
+                ([("mach_max", "mach_max")], "Mach", False, False, []),
+                ([("dt", "dt"), ("dt_cfl", "dt_cfl")], "dt", True, False, []),
+                ([("dt_over_dt_cfl", "dt / dt_cfl")], "dt / dt_cfl", False, True, []),
+            ]
+        if page == 2:      # Temporal Activity
+            return [
+                ([("drho_dt_l2", "d(rho)/dt"), ("dmom_x_dt_l2", "d(mom_x)/dt"),
+                  ("dmom_y_dt_l2", "d(mom_y)/dt"), ("dee_dt_l2", "d(ee)/dt"),
+                  ("dei_dt_l2", "d(ei)/dt"), ("der_dt_l2", "d(er)/dt")],
+                 "RMS ||(U^{n+1} - U^n)/dt||", True, False, []),
+            ]
+        if page == 3:      # Oscillation
+            return [
+                ([("tv_rho", "TV(rho)"), ("tv_p", "TV(p)")],
+                 "Total Variation", True, False, []),
+                ([("s2_rho", "S2(rho)"), ("s2_p", "S2(p)")],
+                 "Second Difference", True, False, []),
+            ]
+        # page == 4       # Global Quantities
         rel_cols = []
         for base in ("mass", "mom_x", "total_energy"):
-            if base in self.present_cols:
+            if base in present:
                 rel_cols.append((base + "_rel", base + " rel"))
-        self._add_panel(
-            axes[4],
-            rel_cols,
-            "relative change (Q-Q0)/|Q0|",
-            xlabel,
-            log_ok=False,
-            ref_zero=True,
-            extra_present=[c for c, _ in rel_cols],
-        )
-        return fig
+        return [
+            ([("mass", "mass")], "mass", False, False, []),
+            ([("total_energy", "total_energy")], "total energy", False, False, []),
+            ([("mom_x", "mom_x")], "mom_x", False, False, []),
+            ([("mom_y", "mom_y")], "mom_y", False, False, []),
+            (rel_cols, "relative change (Q-Q0)/|Q0|", False, True,
+             [c for c, _ in rel_cols]),
+        ]
+
+    def _build_monitor_page(self, page):
+        fig = self.fig
+        cols = self.data.csv_columns
+
+        if not cols:
+            ax = fig.add_subplot(self.page_area)
+            ax.axis("off")
+            ax.text(0.5, 0.5, "Waiting for monitor.csv ...",
+                    ha="center", va="center", fontsize=14,
+                    transform=ax.transAxes)
+            self._page_axes.append(ax)
+            return
+
+        xlabel = "Time" if self.data.xcol == "time" else "Step"
+        marker = (self.data.xcol == "time")
+        present = set(cols)
+        specs = self._monitor_specs(page, present)
+
+        sg = self.page_area.subgridspec(len(specs), 1, hspace=0.45)
+        axes = [fig.add_subplot(sg[k, 0]) for k in range(len(specs))]
+        self._page_axes.extend(axes)
+
+        self._panels = []
+        for ax, (columns, ylabel, log_ok, ref_zero, extra) in zip(axes, specs):
+            pan = Panel(
+                ax, columns, present | set(extra), self._warn_missing,
+                ylabel, xlabel, log_ok=log_ok, ref_zero=ref_zero, marker=marker,
+            )
+            self._panels.append(pan)
+
+        self._update_monitor_panels()
+
+    def _warn_missing(self, col):
+        if col not in self.data.warned_cols:
+            self.data.warned_cols.add(col)
+            _log(f"warning: column '{col}' missing from CSV -- skipping its plot")
+
+    def _update_monitor_panels(self):
+        data = self.data
+        plot_df = data.plot_df
+        if data.xcol is None:
+            for pan in self._panels:
+                pan.update(None, "time")
+            return
+        marker_time = data.sol_time if data.xcol == "time" else None
+        for pan in self._panels:
+            pan.update(plot_df, data.xcol, marker_time=marker_time)
 
     # --------------------------------------------------------
-    # derived columns + refresh
+    # navigation / live follow
     # --------------------------------------------------------
 
-    def _derived_frame(self, df):
-        """Add *_rel columns; guard against a near-zero baseline Q0."""
-        out = df.copy()
-        for base in ("mass", "mom_x", "total_energy"):
-            if base not in out.columns:
-                continue
-            series = pd.to_numeric(out[base], errors="coerce")
-            finite = series.dropna()
-            if finite.empty:
-                continue
-            q0 = float(finite.iloc[0])
-            if not np.isfinite(q0):
-                continue
-            if abs(q0) > 1e-30:
-                out[base + "_rel"] = (series - q0) / abs(q0)
-            else:
-                # Q0 essentially zero (e.g. mom_y): plot absolute change instead
-                out[base + "_rel"] = series - q0
-        return out
+    def _goto_frame(self, index, live=None):
+        data = self.data
+        if not data.solution_files:
+            return
+        if live is not None:
+            self.live_follow = live
+        data.current_frame = max(0, min(index, len(data.solution_files) - 1))
+        data.read_solution(data.current_frame)   # updates sol_time for markers
+        self._refresh_current()
 
-    def _update(self, df):
-        plot_df = downsample_dataframe(
-            self._derived_frame(df), self.args.max_points
-        )
+    def _refresh_current(self):
+        if self.current_page == 0:
+            self._draw_solution()
+        else:
+            self._update_monitor_panels()
+        self._update_status()
+        self.fig.canvas.draw_idle()
 
-        for panel in self.panels:
-            fig = panel.ax.figure
-            if not self.plt.fignum_exists(fig.number):
-                continue  # user closed this window; keep the rest running
-            panel.update(plot_df, self.xcol)
-
-        self.prev_row_count = len(df)
-        if self.xcol in df.columns:
-            xs = pd.to_numeric(df[self.xcol], errors="coerce")
-            if not xs.dropna().empty:
-                self.prev_max_x = float(xs.max())
-
-        try:
-            self.plt.draw()
-        except Exception:
-            pass
+    def on_key(self, event):
+        k = event.key
+        if k in ("1", "2", "3", "4", "5"):
+            self.show_page(int(k) - 1)
+        elif k == "right":
+            self._goto_frame(self.data.current_frame + 1, live=False)
+        elif k == "left":
+            self._goto_frame(self.data.current_frame - 1, live=False)
+        elif k == "up":
+            self._goto_frame(self.data.current_frame + 10, live=False)
+        elif k == "down":
+            self._goto_frame(self.data.current_frame - 10, live=False)
+        elif k == "home":
+            self._goto_frame(0, live=False)
+        elif k == "end":
+            self._goto_frame(len(self.data.solution_files) - 1, live=True)
+        elif k == " ":
+            self.live_follow = not self.live_follow
+            _log("LIVE FOLLOW " + ("ON" if self.live_follow else "OFF"))
+            self._update_status()
+            self.fig.canvas.draw_idle()
+        elif k == "r":
+            self._refresh_all()
+        elif k == "q":
+            self.plt.close(self.fig)
 
     # --------------------------------------------------------
-    # snapshots + status
+    # live refresh
     # --------------------------------------------------------
 
-    def _maybe_save(self, df):
+    def _refresh_all(self):
+        if self._closed:
+            return
+        data = self.data
+
+        monitor_changed = data.refresh_monitor()
+        data.refresh_solution_files()
+        data.clamp_frame()
+
+        if data.solution_files and self.live_follow:
+            data.current_frame = len(data.solution_files) - 1
+
+        # Keep the selected snapshot's physical time fresh for the monitor-page
+        # markers (live follow may have moved the frame index here without
+        # going through _goto_frame).
+        if data.solution_files and data.read_frame != data.current_frame:
+            data.read_solution(data.current_frame)
+
+        if data.csv_reset_detected:
+            _log("CSV reset detected -- new simulation data")
+            data.csv_reset_detected = False
+
+        # If the CSV schema changed (first data / reset / new columns) while a
+        # monitor page is shown, rebuild the page so lines stay consistent.
+        if self.current_page > 0:
+            schema = tuple(data.csv_columns) if data.csv_columns else None
+            if schema != self._built_csv_schema:
+                self._build_page(self.current_page)
+
+        if self.current_page == 0:
+            self._draw_solution()
+        else:
+            self._update_monitor_panels()
+
+        self._update_status()
+        self._maybe_save()
+
+    def _update_status(self):
+        data = self.data
+        parts = []
+        n = len(data.solution_files)
+        if n == 0:
+            parts.append("Waiting for solution...")
+        else:
+            parts.append(f"Frame {data.current_frame + 1}/{n}")
+            parts.append(f"t={data.sol_time:.6e}" if data.sol_time is not None else "t=?")
+
+        if data.csv_state == "OK":
+            parts.append(f"Monitor rows={len(data.monitor_df)}")
+        elif data.csv_state == "HEADER":
+            parts.append("Monitor: header only")
+        elif data.csv_state == "RETRY":
+            parts.append("CSV RETRY")
+        else:
+            parts.append("Waiting for monitor.csv...")
+
+        parts.append("LIVE" if self.live_follow else "PAUSED")
+        csv_tok = {"OK": "CSV OK", "RETRY": "CSV RETRY",
+                   "HEADER": "CSV WAIT", "NONE": "CSV WAIT"}[data.csv_state]
+        parts.append(csv_tok)
+        self.status_text.set_text(" | ".join(parts))
+
+    def _maybe_save(self):
         if not self.args.save_dir:
             return
-        if len(df) == 0 or len(df) <= self.last_saved_count:
-            return  # nothing new since the last snapshot
+        data = self.data
+        key = (
+            len(data.solution_files),
+            data.current_frame if data.solution_files else 0,
+            len(data.monitor_df) if data.monitor_df is not None else 0,
+            data.csv_state,
+        )
+        if key == self.last_save_key:
+            return
+        self.last_save_key = key
         try:
             os.makedirs(self.args.save_dir, exist_ok=True)
-            for name, fname in self.FIG_NAMES.items():
-                fig = self.figs.get(name)
-                if fig is not None and self.plt.fignum_exists(fig.number):
-                    fig.savefig(
-                        os.path.join(self.args.save_dir, fname), dpi=110
-                    )
-            self.last_saved_count = len(df)
+            self.fig.savefig(os.path.join(self.args.save_dir, "dashboard.png"),
+                             dpi=110)
         except Exception as exc:
-            _log(f"warning: failed to save snapshots: {exc}")
+            _log(f"warning: failed to save snapshot: {exc}")
 
-    def _maybe_status(self, df):
-        now = time.time()
-        n = len(df)
-        if n == self.last_status_count:
+    # --------------------------------------------------------
+    # event loop
+    # --------------------------------------------------------
+
+    def _on_timer(self):
+        if self._closed:
             return
-        if now - self.last_status_time < 60.0:
-            return
-        self.last_status_time = now
-        self.last_status_count = n
-        latest = "?"
-        if self.xcol in df.columns:
-            xs = pd.to_numeric(df[self.xcol], errors="coerce").dropna()
-            if not xs.empty:
-                latest = f"{float(xs.iloc[-1]):.6e}"
-        _log(f"Monitoring {n} steps, latest {self.xcol} = {latest}")
+        try:
+            self._refresh_all()
+            if not self._closed:
+                self.fig.canvas.draw_idle()
+        except Exception as exc:
+            _log(f"warning: refresh error: {exc}")
+            if not self.plt.fignum_exists(self.fig.number):
+                self._closed = True
+                if self._timer is not None:
+                    self._timer.stop()
+
+    def _on_close(self, _event):
+        self._closed = True
+        if self._timer is not None:
+            try:
+                self._timer.stop()
+            except Exception:
+                pass
+
+    def run_gui(self):
+        interval_ms = max(100, int(self.args.interval * 1000))
+        self._timer = self.fig.canvas.new_timer(interval=interval_ms)
+        self._timer.add_callback(self._on_timer)
+        self._timer.start()
+
+        # Ctrl+C: Tk's mainloop may otherwise swallow KeyboardInterrupt while
+        # blocked inside plt.show(). Stop the event loop so show() returns and
+        # main() can clean up without a traceback. (No plt.close here: widget
+        # teardown during close can race the closing canvas and print a benign
+        # matplotlib traceback; the process exit tears the window down anyway.)
+        def _sigint(_sig, _frame):
+            _log("\nStopping live monitor.")
+            try:
+                self.fig.canvas.stop_event_loop()
+            except Exception:
+                pass
+
+        import signal
+        signal.signal(signal.SIGINT, _sigint)
+
+        self.plt.show(block=True)
+
+    def run_headless(self):
+        try:
+            while not self._closed:
+                t0 = time.time()
+                self._on_timer()
+                remaining = self.args.interval - (time.time() - t0)
+                if remaining > 0:
+                    time.sleep(remaining)
+        except KeyboardInterrupt:
+            raise
 
 
 def main():
@@ -764,9 +1296,12 @@ def main():
         matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    monitor = LiveMonitor(args, plt)
+    dashboard = Dashboard(args, plt)
     try:
-        monitor.run()
+        if args.no_gui:
+            dashboard.run_headless()
+        else:
+            dashboard.run_gui()
     except KeyboardInterrupt:
         _log("\nStopping live monitor.")
         try:

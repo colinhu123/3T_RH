@@ -923,7 +923,7 @@ pub fn init_shock_cylinder_in_box_with(
 }
 
 pub fn init_rotated_shock_cylinder(wall: CylinderWallMode) -> Field {
-    init_rotated_shock_cylinder_with(wall, 1.0 / 40.0, 360, 3.0, -1.10, 30.0)
+    init_rotated_shock_cylinder_with(wall, 1.0 / 40.0, 360, 5.0, -1.10, 10.0)
 }
 
 pub fn init_rotated_shock_cylinder_with(
@@ -1212,6 +1212,7 @@ pub fn init_rotated_shock_cylinder_with(
             let state = if xi <= shock_xi0 { post } else { pre };
 
             u.set(idx, state);
+            u.set(idx,post);
         }
     }
 

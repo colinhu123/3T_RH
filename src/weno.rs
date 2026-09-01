@@ -1,27 +1,18 @@
 use crate::{constant, state};
-use ndarray::{Array1,Array2};
+use ndarray::{Array1, Array2};
 use ndarray_linalg::Inverse;
 
-#[derive(Clone,Copy,Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Stencil6 {
     pub points: [state::State; 6],
     pub dir: state::Direction,
-
 }
 
-
 impl Stencil6 {
-
     pub fn build_l(&self) -> Array2<f64> {
         let d3 = state::Derived::from_state(self.points[3]);
         let d2 = state::Derived::from_state(self.points[2]);
-        let m = Self::build_l_plain(
-            &self.points[3],
-            &self.points[2],
-            &d3,
-            &d2,
-            self.dir,
-        );
+        let m = Self::build_l_plain(&self.points[3], &self.points[2], &d3, &d2, self.dir);
         Array2::from_shape_fn((6, 6), |(i, j)| m[i][j])
     }
 
@@ -32,449 +23,213 @@ impl Stencil6 {
         d2: &state::Derived,
         dir: state::Direction,
     ) -> [[f64; 6]; 6] {
-    let u1 = d3.u;
-    let u2 = d2.u;
-    let v1 = d3.v;
-    let v2 = d2.v;
+        let u1 = d3.u;
+        let u2 = d2.u;
+        let v1 = d3.v;
+        let v2 = d2.v;
 
-    let ee1 = d3.e_e;
-    let ei1 = d3.e_i;
-    let er1 = d3.e_r;
-    let ee2 = d2.e_e;
-    let ei2 = d2.e_i;
-    let er2 = d2.e_r;
+        let ee1 = d3.e_e;
+        let ei1 = d3.e_i;
+        let er1 = d3.e_r;
+        let ee2 = d2.e_e;
+        let ei2 = d2.e_i;
+        let er2 = d2.e_r;
 
-    let rho1 = state1.rho.sqrt();
-    let rho2 = state2.rho.sqrt();
-    let rho_sum = rho1 + rho2;
+        let rho1 = state1.rho.sqrt();
+        let rho2 = state2.rho.sqrt();
+        let rho_sum = rho1 + rho2;
 
-    let u = (u1 * rho1 + u2 * rho2)/ rho_sum;
-    let v = (v1 * rho1 + v2 * rho2)/ rho_sum;
-    let w2 = u.powi(2) + v.powi(2);
-    let ee = (ee1 * rho1 + ee2 * rho2)/ rho_sum;
-    let ei = (ei1 * rho1 + ei2 * rho2)/ rho_sum;
-    let er =(er1 * rho1 + er2 * rho2)/ rho_sum;
+        let u = (u1 * rho1 + u2 * rho2) / rho_sum;
+        let v = (v1 * rho1 + v2 * rho2) / rho_sum;
+        let w2 = u.powi(2) + v.powi(2);
+        let ee = (ee1 * rho1 + ee2 * rho2) / rho_sum;
+        let ei = (ei1 * rho1 + ei2 * rho2) / rho_sum;
+        let er = (er1 * rho1 + er2 * rho2) / rho_sum;
 
+        let gi = constant::GAMMA_I - 1.0;
+        let ge = constant::GAMMA_E - 1.0;
+        let gr = constant::GAMMA_R - 1.0;
 
+        let gt = gi + ge + gr;
+        let cs2 =
+            constant::GAMMA_E * ge * ee + constant::GAMMA_I * gi * ei + constant::GAMMA_R * gr * er;
+        let cs = cs2.sqrt();
 
-    let gi = constant::GAMMA_I - 1.0;
-    let ge = constant::GAMMA_E - 1.0;
-    let gr = constant::GAMMA_R - 1.0;
+        let he = 6.0 * gi * gr * (constant::GAMMA_I * ei - constant::GAMMA_R * er)
+            + constant::GAMMA_E * gt * ee * w2;
 
-    let gt =gi + ge + gr;
-    let cs2 = constant::GAMMA_E * ge * ee+ constant::GAMMA_I * gi * ei+ constant::GAMMA_R * gr * er;
-    let cs = cs2.sqrt();
+        let hi = 6.0 * ge * gr * (constant::GAMMA_R * er - constant::GAMMA_E * ee)
+            + constant::GAMMA_I * gt * ei * w2;
 
+        let hr = 6.0 * ge * gi * (constant::GAMMA_E * ee - constant::GAMMA_I * ei)
+            + constant::GAMMA_R * gt * er * w2;
 
-    let he = 6.0 * gi * gr * (constant::GAMMA_I * ei- constant::GAMMA_R * er) + constant::GAMMA_E * gt * ee * w2;
+        let b = gt * (36.0 * ge * gi * gr + gt * w2.powi(2)) * cs2;
 
-    let hi = 6.0 * ge * gr * (constant::GAMMA_R * er - constant::GAMMA_E * ee) + constant::GAMMA_I * gt * ei * w2;
+        let acoustic_den = 12.0 * cs2;
 
-    let hr =6.0 * ge * gi* (constant::GAMMA_E * ee- constant::GAMMA_I * ei)+ constant::GAMMA_R* gt* er* w2;
-
-    let b = gt * (36.0 * ge * gi * gr+ gt * w2.powi(2))* cs2;
-
-    let acoustic_den = 12.0 * cs2;
-
-    match dir {
-        // ========================================================
-        // X direction
-        // ========================================================
-        state::Direction::X => {
-            [
-                // ------------------------------------------------
-                // L_A^(1)
-                // acoustic: u - cs
-                // ------------------------------------------------
+        match dir {
+            // ========================================================
+            // X direction
+            // ========================================================
+            state::Direction::X => {
                 [
-                    (gt*w2 + 6.0*u*cs)
-                        / acoustic_den,
+                    // ------------------------------------------------
+                    // L_A^(1)
+                    // acoustic: u - cs
+                    // ------------------------------------------------
+                    [
+                        (gt * w2 + 6.0 * u * cs) / acoustic_den,
+                        (-2.0 * gt * u - 6.0 * cs) / acoustic_den,
+                        (-2.0 * gt * v) / acoustic_den,
+                        6.0 * ge / acoustic_den,
+                        6.0 * gi / acoustic_den,
+                        6.0 * gr / acoustic_den,
+                    ],
+                    // ------------------------------------------------
+                    // L_A^(2)
+                    // transverse velocity mode
+                    // ------------------------------------------------
 
-                    (-2.0*gt*u - 6.0*cs)
-                        / acoustic_den,
+                    // ------------------------------------------------
+                    // L_A^(3)
+                    // electron-energy mode
+                    // ------------------------------------------------
+                    [
+                        ge / gt - ge * w2 / (6.0 * cs2) - ge * gt * w2 / b * (he - cs2 * w2),
+                        ge * u / (3.0 * cs2) + 2.0 * ge * gt * u / b * (he - cs2 * w2),
+                        // TYPO FIX:
+                        // this must use v in BOTH terms.
+                        ge * v / (3.0 * cs2) + 2.0 * ge * gt * v / b * (he - cs2 * w2),
+                        -ge.powi(2) / (gt * cs2) - 6.0 * ge / b * (ge * he - gt * cs2 * w2),
+                        -ge * gi / (gt * cs2) - 6.0 * ge * gi / b * (he - 6.0 * gr * cs2),
+                        -ge * gr / (gt * cs2) - 6.0 * ge * gr / b * (he + 6.0 * gi * cs2),
+                    ],
+                    // ------------------------------------------------
+                    // L_A^(4)
+                    // ion-energy mode
+                    // ------------------------------------------------
+                    [
+                        gi / gt - gi * w2 / (6.0 * cs2) - gi * gt * w2 / b * (hi - cs2 * w2),
+                        gi * u / (3.0 * cs2) + 2.0 * gi * gt * u / b * (hi - cs2 * w2),
+                        gi * v / (3.0 * cs2) + 2.0 * gi * gt * v / b * (hi - cs2 * w2),
+                        -gi * ge / (gt * cs2) - 6.0 * gi * ge / b * (hi + 6.0 * gr * cs2),
+                        -gi.powi(2) / (gt * cs2) - 6.0 * gi / b * (gi * hi - gt * cs2 * w2),
+                        -gi * gr / (gt * cs2) - 6.0 * gi * gr / b * (hi - 6.0 * ge * cs2),
+                    ],
+                    // ------------------------------------------------
+                    // L_A^(5)
+                    // radiation-energy mode
+                    // ------------------------------------------------
+                    [
+                        gr / gt - gr * w2 / (6.0 * cs2) - gr * gt * w2 / b * (hr - cs2 * w2),
+                        gr * u / (3.0 * cs2) + 2.0 * gr * gt * u / b * (hr - cs2 * w2),
+                        gr * v / (3.0 * cs2) + 2.0 * gr * gt * v / b * (hr - cs2 * w2),
+                        -gr * ge / (gt * cs2) - 6.0 * gr * ge / b * (hr - 6.0 * gi * cs2),
+                        -gr * gi / (gt * cs2) - 6.0 * gr * gi / b * (hr + 6.0 * ge * cs2),
+                        -gr.powi(2) / (gt * cs2) - 6.0 * gr / b * (gr * hr - gt * cs2 * w2),
+                    ],
+                    [-v, 0.0, 1.0, 0.0, 0.0, 0.0],
+                    // ------------------------------------------------
+                    // L_A^(6)
+                    // acoustic: u + cs
+                    // ------------------------------------------------
+                    [
+                        (gt * w2 - 6.0 * u * cs) / acoustic_den,
+                        (-2.0 * gt * u + 6.0 * cs) / acoustic_den,
+                        (-2.0 * gt * v) / acoustic_den,
+                        6.0 * ge / acoustic_den,
+                        6.0 * gi / acoustic_den,
+                        6.0 * gr / acoustic_den,
+                    ],
+                ]
+            }
 
-                    (-2.0*gt*v)
-                        / acoustic_den,
-
-                    6.0*ge
-                        / acoustic_den,
-
-                    6.0*gi
-                        / acoustic_den,
-
-                    6.0*gr
-                        / acoustic_den,
-                ],
-
-                // ------------------------------------------------
-                // L_A^(2)
-                // transverse velocity mode
-                // ------------------------------------------------
-                
-
-                // ------------------------------------------------
-                // L_A^(3)
-                // electron-energy mode
-                // ------------------------------------------------
+            // ========================================================
+            // Y direction
+            // ========================================================
+            state::Direction::Y => {
                 [
-                    ge/gt
-                        - ge*w2/(6.0*cs2)
-                        - ge*gt*w2/b
-                            * (he - cs2*w2),
-
-                    ge*u/(3.0*cs2)
-                        + 2.0*ge*gt*u/b
-                            * (he - cs2*w2),
-
-                    // TYPO FIX:
-                    // this must use v in BOTH terms.
-                    ge*v/(3.0*cs2)
-                        + 2.0*ge*gt*v/b
-                            * (he - cs2*w2),
-
-                    -ge.powi(2)/(gt*cs2)
-                        - 6.0*ge/b
-                            * (
-                                ge*he
-                                - gt*cs2*w2
-                            ),
-
-                    -ge*gi/(gt*cs2)
-                        - 6.0*ge*gi/b
-                            * (
-                                he
-                                - 6.0*gr*cs2
-                            ),
-
-                    -ge*gr/(gt*cs2)
-                        - 6.0*ge*gr/b
-                            * (
-                                he
-                                + 6.0*gi*cs2
-                            ),
-                ],
-
-                // ------------------------------------------------
-                // L_A^(4)
-                // ion-energy mode
-                // ------------------------------------------------
-                [
-                    gi/gt
-                        - gi*w2/(6.0*cs2)
-                        - gi*gt*w2/b
-                            * (hi - cs2*w2),
-
-                    gi*u/(3.0*cs2)
-                        + 2.0*gi*gt*u/b
-                            * (hi - cs2*w2),
-
-                    gi*v/(3.0*cs2)
-                        + 2.0*gi*gt*v/b
-                            * (hi - cs2*w2),
-
-                    -gi*ge/(gt*cs2)
-                        - 6.0*gi*ge/b
-                            * (
-                                hi
-                                + 6.0*gr*cs2
-                            ),
-
-                    -gi.powi(2)/(gt*cs2)
-                        - 6.0*gi/b
-                            * (
-                                gi*hi
-                                - gt*cs2*w2
-                            ),
-
-                    -gi*gr/(gt*cs2)
-                        - 6.0*gi*gr/b
-                            * (
-                                hi
-                                - 6.0*ge*cs2
-                            ),
-                ],
-
-                // ------------------------------------------------
-                // L_A^(5)
-                // radiation-energy mode
-                // ------------------------------------------------
-                [
-                    gr/gt
-                        - gr*w2/(6.0*cs2)
-                        - gr*gt*w2/b
-                            * (hr - cs2*w2),
-
-                    gr*u/(3.0*cs2)
-                        + 2.0*gr*gt*u/b
-                            * (hr - cs2*w2),
-
-                    gr*v/(3.0*cs2)
-                        + 2.0*gr*gt*v/b
-                            * (hr - cs2*w2),
-
-                    -gr*ge/(gt*cs2)
-                        - 6.0*gr*ge/b
-                            * (
-                                hr
-                                - 6.0*gi*cs2
-                            ),
-
-                    -gr*gi/(gt*cs2)
-                        - 6.0*gr*gi/b
-                            * (
-                                hr
-                                + 6.0*ge*cs2
-                            ),
-
-                    -gr.powi(2)/(gt*cs2)
-                        - 6.0*gr/b
-                            * (
-                                gr*hr
-                                - gt*cs2*w2
-                            ),
-                ],
-                [
-                    -v,
-                    0.0,
-                    1.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ],
-
-                // ------------------------------------------------
-                // L_A^(6)
-                // acoustic: u + cs
-                // ------------------------------------------------
-                [
-                    (gt*w2 - 6.0*u*cs)
-                        / acoustic_den,
-
-                    (-2.0*gt*u + 6.0*cs)
-                        / acoustic_den,
-
-                    (-2.0*gt*v)
-                        / acoustic_den,
-
-                    6.0*ge
-                        / acoustic_den,
-
-                    6.0*gi
-                        / acoustic_den,
-
-                    6.0*gr
-                        / acoustic_den,
-                ],
-            ]
-        }
-
-        // ========================================================
-        // Y direction
-        // ========================================================
-        state::Direction::Y => {
-            [
-                // ------------------------------------------------
-                // L_B^(1)
-                // acoustic: v - cs
-                // ------------------------------------------------
-                [
-                    (gt*w2 + 6.0*v*cs)
-                        / acoustic_den,
-
-                    (-2.0*gt*u)
-                        / acoustic_den,
-
-                    (-2.0*gt*v - 6.0*cs)
-                        / acoustic_den,
-
-                    6.0*ge
-                        / acoustic_den,
-
-                    6.0*gi
-                        / acoustic_den,
-
-                    6.0*gr
-                        / acoustic_den,
-                ],
-
-                // ------------------------------------------------
-                // L_B^(2)
-                // transverse velocity mode
-                // ------------------------------------------------
-                [
-                    -u,
-                    1.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ],
-
-                // ------------------------------------------------
-                // L_B^(3)
-                // electron-energy mode
-                // ------------------------------------------------
-                [
-                    ge/gt
-                        - ge*w2/(6.0*cs2)
-                        - ge*gt*w2/b
-                            * (he - cs2*w2),
-
-                    ge*u/(3.0*cs2)
-                        + 2.0*ge*gt*u/b
-                            * (he - cs2*w2),
-
-                    ge*v/(3.0*cs2)
-                        + 2.0*ge*gt*v/b
-                            * (he - cs2*w2),
-
-                    -ge.powi(2)/(gt*cs2)
-                        - 6.0*ge/b
-                            * (
-                                ge*he
-                                - gt*cs2*w2
-                            ),
-
-                    -ge*gi/(gt*cs2)
-                        - 6.0*ge*gi/b
-                            * (
-                                he
-                                - 6.0*gr*cs2
-                            ),
-
-                    -ge*gr/(gt*cs2)
-                        - 6.0*ge*gr/b
-                            * (
-                                he
-                                + 6.0*gi*cs2
-                            ),
-                ],
-
-                // ------------------------------------------------
-                // L_B^(4)
-                // ion-energy mode
-                // ------------------------------------------------
-                [
-                    gi/gt
-                        - gi*w2/(6.0*cs2)
-                        - gi*gt*w2/b
-                            * (hi - cs2*w2),
-
-                    gi*u/(3.0*cs2)
-                        + 2.0*gi*gt*u/b
-                            * (hi - cs2*w2),
-
-                    gi*v/(3.0*cs2)
-                        + 2.0*gi*gt*v/b
-                            * (hi - cs2*w2),
-
-                    -gi*ge/(gt*cs2)
-                        - 6.0*gi*ge/b
-                            * (
-                                hi
-                                + 6.0*gr*cs2
-                            ),
-
-                    -gi.powi(2)/(gt*cs2)
-                        - 6.0*gi/b
-                            * (
-                                gi*hi
-                                - gt*cs2*w2
-                            ),
-
-                    -gi*gr/(gt*cs2)
-                        - 6.0*gi*gr/b
-                            * (
-                                hi
-                                - 6.0*ge*cs2
-                            ),
-                ],
-
-                // ------------------------------------------------
-                // L_B^(5)
-                // radiation-energy mode
-                // ------------------------------------------------
-                [
-                    gr/gt
-                        - gr*w2/(6.0*cs2)
-                        - gr*gt*w2/b
-                            * (hr - cs2*w2),
-
-                    gr*u/(3.0*cs2)
-                        + 2.0*gr*gt*u/b
-                            * (hr - cs2*w2),
-
-                    gr*v/(3.0*cs2)
-                        + 2.0*gr*gt*v/b
-                            * (hr - cs2*w2),
-
-                    -gr*ge/(gt*cs2)
-                        - 6.0*gr*ge/b
-                            * (
-                                hr
-                                - 6.0*gi*cs2
-                            ),
-
-                    -gr*gi/(gt*cs2)
-                        - 6.0*gr*gi/b
-                            * (
-                                hr
-                                + 6.0*ge*cs2
-                            ),
-
-                    -gr.powi(2)/(gt*cs2)
-                        - 6.0*gr/b
-                            * (
-                                gr*hr
-                                - gt*cs2*w2
-                            ),
-                ],
-
-                // ------------------------------------------------
-                // L_B^(6)
-                // acoustic: v + cs
-                // ------------------------------------------------
-                [
-                    (gt*w2 - 6.0*v*cs)
-                        / acoustic_den,
-
-                    (-2.0*gt*u)
-                        / acoustic_den,
-
-                    (-2.0*gt*v + 6.0*cs)
-                        / acoustic_den,
-
-                    6.0*ge
-                        / acoustic_den,
-
-                    6.0*gi
-                        / acoustic_den,
-
-                    6.0*gr
-                        / acoustic_den,
-                ],
-            ]
+                    // ------------------------------------------------
+                    // L_B^(1)
+                    // acoustic: v - cs
+                    // ------------------------------------------------
+                    [
+                        (gt * w2 + 6.0 * v * cs) / acoustic_den,
+                        (-2.0 * gt * u) / acoustic_den,
+                        (-2.0 * gt * v - 6.0 * cs) / acoustic_den,
+                        6.0 * ge / acoustic_den,
+                        6.0 * gi / acoustic_den,
+                        6.0 * gr / acoustic_den,
+                    ],
+                    // ------------------------------------------------
+                    // L_B^(2)
+                    // transverse velocity mode
+                    // ------------------------------------------------
+                    [-u, 1.0, 0.0, 0.0, 0.0, 0.0],
+                    // ------------------------------------------------
+                    // L_B^(3)
+                    // electron-energy mode
+                    // ------------------------------------------------
+                    [
+                        ge / gt - ge * w2 / (6.0 * cs2) - ge * gt * w2 / b * (he - cs2 * w2),
+                        ge * u / (3.0 * cs2) + 2.0 * ge * gt * u / b * (he - cs2 * w2),
+                        ge * v / (3.0 * cs2) + 2.0 * ge * gt * v / b * (he - cs2 * w2),
+                        -ge.powi(2) / (gt * cs2) - 6.0 * ge / b * (ge * he - gt * cs2 * w2),
+                        -ge * gi / (gt * cs2) - 6.0 * ge * gi / b * (he - 6.0 * gr * cs2),
+                        -ge * gr / (gt * cs2) - 6.0 * ge * gr / b * (he + 6.0 * gi * cs2),
+                    ],
+                    // ------------------------------------------------
+                    // L_B^(4)
+                    // ion-energy mode
+                    // ------------------------------------------------
+                    [
+                        gi / gt - gi * w2 / (6.0 * cs2) - gi * gt * w2 / b * (hi - cs2 * w2),
+                        gi * u / (3.0 * cs2) + 2.0 * gi * gt * u / b * (hi - cs2 * w2),
+                        gi * v / (3.0 * cs2) + 2.0 * gi * gt * v / b * (hi - cs2 * w2),
+                        -gi * ge / (gt * cs2) - 6.0 * gi * ge / b * (hi + 6.0 * gr * cs2),
+                        -gi.powi(2) / (gt * cs2) - 6.0 * gi / b * (gi * hi - gt * cs2 * w2),
+                        -gi * gr / (gt * cs2) - 6.0 * gi * gr / b * (hi - 6.0 * ge * cs2),
+                    ],
+                    // ------------------------------------------------
+                    // L_B^(5)
+                    // radiation-energy mode
+                    // ------------------------------------------------
+                    [
+                        gr / gt - gr * w2 / (6.0 * cs2) - gr * gt * w2 / b * (hr - cs2 * w2),
+                        gr * u / (3.0 * cs2) + 2.0 * gr * gt * u / b * (hr - cs2 * w2),
+                        gr * v / (3.0 * cs2) + 2.0 * gr * gt * v / b * (hr - cs2 * w2),
+                        -gr * ge / (gt * cs2) - 6.0 * gr * ge / b * (hr - 6.0 * gi * cs2),
+                        -gr * gi / (gt * cs2) - 6.0 * gr * gi / b * (hr + 6.0 * ge * cs2),
+                        -gr.powi(2) / (gt * cs2) - 6.0 * gr / b * (gr * hr - gt * cs2 * w2),
+                    ],
+                    // ------------------------------------------------
+                    // L_B^(6)
+                    // acoustic: v + cs
+                    // ------------------------------------------------
+                    [
+                        (gt * w2 - 6.0 * v * cs) / acoustic_den,
+                        (-2.0 * gt * u) / acoustic_den,
+                        (-2.0 * gt * v + 6.0 * cs) / acoustic_den,
+                        6.0 * ge / acoustic_den,
+                        6.0 * gi / acoustic_den,
+                        6.0 * gr / acoustic_den,
+                    ],
+                ]
+            }
         }
     }
-}
-    
 
     pub fn _build_l_raw(&self) -> Array2<f64> {
-        let (_lambda,r) = self.build_r_roe_ave();
+        let (_lambda, r) = self.build_r_roe_ave();
         let l = r.inv().unwrap();
         l
     }
 
-    pub fn build_r_roe_ave(&self)-> (Array1<f64>,Array2<f64>) {
+    pub fn build_r_roe_ave(&self) -> (Array1<f64>, Array2<f64>) {
         let d3 = state::Derived::from_state(self.points[3]);
         let d2 = state::Derived::from_state(self.points[2]);
-        let (lambda, r) = Self::build_r_plain(
-            &self.points[3],
-            &self.points[2],
-            &d3,
-            &d2,
-            self.dir,
-        );
+        let (lambda, r) = Self::build_r_plain(&self.points[3], &self.points[2], &d3, &d2, self.dir);
         (
             Array1::from_vec(lambda.to_vec()),
             Array2::from_shape_fn((6, 6), |(i, j)| r[i][j]),
@@ -501,61 +256,100 @@ impl Stencil6 {
         let rho1 = state1.rho.sqrt();
         let rho2 = state2.rho.sqrt();
 
-        let u = (u1*rho1 + u2*rho2)/(rho1+rho2);
-        let v = (v1*rho1 + v2*rho2)/(rho1 + rho2);
+        let u = (u1 * rho1 + u2 * rho2) / (rho1 + rho2);
+        let v = (v1 * rho1 + v2 * rho2) / (rho1 + rho2);
         let w2 = u.powi(2) + v.powi(2);
-        let ee = (ee1*rho1 + ee2*rho2)/(rho1 + rho2);
-        let ei = (ei1*rho1 + ei2*rho2)/(rho1+rho2);
-        let er = (er1*rho1 + er2*rho2)/ (rho1+rho2);
+        let ee = (ee1 * rho1 + ee2 * rho2) / (rho1 + rho2);
+        let ei = (ei1 * rho1 + ei2 * rho2) / (rho1 + rho2);
+        let er = (er1 * rho1 + er2 * rho2) / (rho1 + rho2);
 
         let gi = constant::GAMMA_I - 1.0;
         let ge = constant::GAMMA_E - 1.0;
         let gr = constant::GAMMA_R - 1.0;
 
-        let cs = (constant::GAMMA_E*ge*ee + constant::GAMMA_I*gi*ei + constant::GAMMA_R*gr*er).sqrt();
+        let cs = (constant::GAMMA_E * ge * ee
+            + constant::GAMMA_I * gi * ei
+            + constant::GAMMA_R * gr * er)
+            .sqrt();
         let gt = gi + ge + gr;
 
         match dir {
-            state::Direction::X =>{
-                
+            state::Direction::X => {
                 let r = [
-                [1.0, 1.0, 1.0, 1.0, 0.0, 1.0],
-                [u-cs, u, u, u, 0.0, u+cs ],
-                [v, v, v, v, 1.0, v],
-                [constant::GAMMA_E*ee+w2/6.0-u*cs/3.0,gt*w2/(6.0*ge),-gr,gi,v/3.0, constant::GAMMA_E*ee+w2/6.0+u*cs/3.0],
-                [constant::GAMMA_I*ei+w2/6.0-u*cs/3.0,gr,gt*w2/(6.0*gi),-ge,v/3.0, constant::GAMMA_I*ei+w2/6.0+u*cs/3.0],
-                [constant::GAMMA_R*er+w2/6.0-u*cs/3.0,-gi,ge,gt*w2/(6.0*gr),v/3.0, constant::GAMMA_R*er+w2/6.0+u*cs/3.0],
+                    [1.0, 1.0, 1.0, 1.0, 0.0, 1.0],
+                    [u - cs, u, u, u, 0.0, u + cs],
+                    [v, v, v, v, 1.0, v],
+                    [
+                        constant::GAMMA_E * ee + w2 / 6.0 - u * cs / 3.0,
+                        gt * w2 / (6.0 * ge),
+                        -gr,
+                        gi,
+                        v / 3.0,
+                        constant::GAMMA_E * ee + w2 / 6.0 + u * cs / 3.0,
+                    ],
+                    [
+                        constant::GAMMA_I * ei + w2 / 6.0 - u * cs / 3.0,
+                        gr,
+                        gt * w2 / (6.0 * gi),
+                        -ge,
+                        v / 3.0,
+                        constant::GAMMA_I * ei + w2 / 6.0 + u * cs / 3.0,
+                    ],
+                    [
+                        constant::GAMMA_R * er + w2 / 6.0 - u * cs / 3.0,
+                        -gi,
+                        ge,
+                        gt * w2 / (6.0 * gr),
+                        v / 3.0,
+                        constant::GAMMA_R * er + w2 / 6.0 + u * cs / 3.0,
+                    ],
                 ];
-                let lambda = [u-cs,u,u,u,u,u+cs];
+                let lambda = [u - cs, u, u, u, u, u + cs];
 
-                return (lambda,r)
+                return (lambda, r);
             }
             state::Direction::Y => {
                 let r = [
                     [1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
                     [u, 1.0, u, u, u, u],
                     [v - cs, 0.0, v, v, v, v + cs],
-                    [constant::GAMMA_E*ee+w2/6.0-v*cs/3.0, u/3.0, gt*w2/(6.0*ge), -gr, gi, constant::GAMMA_E*ee+w2/6.0+v*cs/3.0],
-                    [constant::GAMMA_I*ei+w2/6.0-v*cs/3.0, u/3.0, gr, gt*w2/(6.0*gi), -ge, constant::GAMMA_I*ei+w2/6.0+v*cs/3.0],
-                    [constant::GAMMA_R*er+w2/6.0-v*cs/3.0, u/3.0, -gi, ge, gt*w2/(6.0*gr), constant::GAMMA_R*er+w2/6.0+v*cs/3.0],
+                    [
+                        constant::GAMMA_E * ee + w2 / 6.0 - v * cs / 3.0,
+                        u / 3.0,
+                        gt * w2 / (6.0 * ge),
+                        -gr,
+                        gi,
+                        constant::GAMMA_E * ee + w2 / 6.0 + v * cs / 3.0,
+                    ],
+                    [
+                        constant::GAMMA_I * ei + w2 / 6.0 - v * cs / 3.0,
+                        u / 3.0,
+                        gr,
+                        gt * w2 / (6.0 * gi),
+                        -ge,
+                        constant::GAMMA_I * ei + w2 / 6.0 + v * cs / 3.0,
+                    ],
+                    [
+                        constant::GAMMA_R * er + w2 / 6.0 - v * cs / 3.0,
+                        u / 3.0,
+                        -gi,
+                        ge,
+                        gt * w2 / (6.0 * gr),
+                        constant::GAMMA_R * er + w2 / 6.0 + v * cs / 3.0,
+                    ],
                 ];
-                let lambda = [v-cs,v,v,v,v,v+cs];
-                return (lambda, r)
+                let lambda = [v - cs, v, v, v, v, v + cs];
+                return (lambda, r);
             }
         }
-
-        
     }
 
-    pub fn con2char(&self,l:&Array2<f64>) -> Self {
+    pub fn con2char(&self, l: &Array2<f64>) -> Self {
         let mut new_stencil: [state::State; 6] = [state::State::new(); 6];
         for i in 0..6 {
-        let tmp_k: Array1<f64> = Array1::from_vec(
-            self.points[i].state2arr().to_vec()
-            );
-        
+            let tmp_k: Array1<f64> = Array1::from_vec(self.points[i].state2arr().to_vec());
 
-        new_stencil[i] = state::State::arr2state(l.dot(&tmp_k));
+            new_stencil[i] = state::State::arr2state(l.dot(&tmp_k));
         }
 
         Self {
@@ -564,9 +358,9 @@ impl Stencil6 {
         }
     }
 
-    pub fn state2flux(&self) ->Self {
+    pub fn state2flux(&self) -> Self {
         let mut new_stencil = [state::State::new(); 6];
-        for i in 0..6{
+        for i in 0..6 {
             new_stencil[i] = self.points[i].flux(self.dir);
         }
 
@@ -593,23 +387,25 @@ impl Stencil6 {
             er_list[i] = self.points[i].er;
         }
 
-        [rho_list, momx_list,momy_list,ee_list,ei_list,er_list]
+        [rho_list, momx_list, momy_list, ee_list, ei_list, er_list]
     }
 
-    pub fn reconstruction(&self,recon_type: bool) -> state::State {
+    pub fn reconstruction(&self, recon_type: bool) -> state::State {
         let l = self.build_l();
         let (flux_l, state_l): ([state::State; 6], [state::State; 6]) = if recon_type {
-        (self.state2flux().con2char(&l).points, self.con2char(&l).points)
-    } else {
-        (self.state2flux().points, self.points)
-    };
+            (
+                self.state2flux().con2char(&l).points,
+                self.con2char(&l).points,
+            )
+        } else {
+            (self.state2flux().points, self.points)
+        };
 
         //let flux_stencil = self.state2flux();
         let (lambda, r) = self.build_r_roe_ave();
 
         let mut f_plus_stencil = [state::State::new(); 6];
         let mut f_minus_stencil = [state::State::new(); 6];
-
 
         let a0 = lambda[0].abs();
         let a1 = lambda[1].abs();
@@ -620,62 +416,53 @@ impl Stencil6 {
 
         for i in 0..6 {
             f_plus_stencil[i] = state::State {
-                rho: 0.5*(flux_l[i].rho + a0*state_l[i].rho),
-                mom_x: 0.5*(flux_l[i].mom_x + a1*state_l[i].mom_x),
-                mom_y: 0.5*(flux_l[i].mom_y + a2*state_l[i].mom_y),
-                ee:  0.5*(flux_l[i].ee  + a3*state_l[i].ee),
-                ei:  0.5*(flux_l[i].ei  + a4*state_l[i].ei),
-                er:  0.5*(flux_l[i].er  + a5*state_l[i].er),
+                rho: 0.5 * (flux_l[i].rho + a0 * state_l[i].rho),
+                mom_x: 0.5 * (flux_l[i].mom_x + a1 * state_l[i].mom_x),
+                mom_y: 0.5 * (flux_l[i].mom_y + a2 * state_l[i].mom_y),
+                ee: 0.5 * (flux_l[i].ee + a3 * state_l[i].ee),
+                ei: 0.5 * (flux_l[i].ei + a4 * state_l[i].ei),
+                er: 0.5 * (flux_l[i].er + a5 * state_l[i].er),
             };
             f_minus_stencil[i] = state::State {
-                rho: 0.5*(flux_l[i].rho - a0*state_l[i].rho),
-                mom_x: 0.5*(flux_l[i].mom_x - a1*state_l[i].mom_x),
-                mom_y: 0.5*(flux_l[i].mom_y - a2*state_l[i].mom_y),
-                ee:  0.5*(flux_l[i].ee  - a3*state_l[i].ee),
-                ei:  0.5*(flux_l[i].ei  - a4*state_l[i].ei),
-                er:  0.5*(flux_l[i].er  - a5*state_l[i].er),
+                rho: 0.5 * (flux_l[i].rho - a0 * state_l[i].rho),
+                mom_x: 0.5 * (flux_l[i].mom_x - a1 * state_l[i].mom_x),
+                mom_y: 0.5 * (flux_l[i].mom_y - a2 * state_l[i].mom_y),
+                ee: 0.5 * (flux_l[i].ee - a3 * state_l[i].ee),
+                ei: 0.5 * (flux_l[i].ei - a4 * state_l[i].ei),
+                er: 0.5 * (flux_l[i].er - a5 * state_l[i].er),
             };
         }
 
-        
-        let f_plus_stencil = Self {points: f_plus_stencil, dir: self.dir};
-        let f_minus_stencil = Self {points: f_minus_stencil, dir: self.dir};
+        let f_plus_stencil = Self {
+            points: f_plus_stencil,
+            dir: self.dir,
+        };
+        let f_minus_stencil = Self {
+            points: f_minus_stencil,
+            dir: self.dir,
+        };
         let tmp = f_plus_stencil.stencil2arr();
         let tmp1 = f_minus_stencil.stencil2arr();
         let mut flux_plus = [0.0; 6];
         let mut flux_minus = [0.0; 6];
-        for i in  0..6 {
-            let stencil = [
-                tmp[i][0],
-                tmp[i][1],
-                tmp[i][2],
-                tmp[i][3],
-                tmp[i][4],
-            ];
+        for i in 0..6 {
+            let stencil = [tmp[i][0], tmp[i][1], tmp[i][2], tmp[i][3], tmp[i][4]];
             flux_plus[i] = weno5(&stencil);
-            let stencil = [
-                tmp1[i][5],
-                tmp1[i][4],
-                tmp1[i][3],
-                tmp1[i][2],
-                tmp1[i][1]
-            ];
+            let stencil = [tmp1[i][5], tmp1[i][4], tmp1[i][3], tmp1[i][2], tmp1[i][1]];
             flux_minus[i] = weno5(&stencil);
         }
 
-        let flux = state::State {rho: flux_plus[0]+flux_minus[0], 
-                                        mom_x: flux_plus[1]+flux_minus[1], 
-                                        mom_y: flux_plus[2]+flux_minus[2], 
-                                        ee: flux_plus[3]+flux_minus[3], 
-                                        ei: flux_plus[4]+flux_minus[4],
-                                        er: flux_plus[5]+flux_minus[5]};
-        let tmp_k: Array1<f64> = Array1::from_vec(
-            flux.state2arr().to_vec()
-            );
-        
+        let flux = state::State {
+            rho: flux_plus[0] + flux_minus[0],
+            mom_x: flux_plus[1] + flux_minus[1],
+            mom_y: flux_plus[2] + flux_minus[2],
+            ee: flux_plus[3] + flux_minus[3],
+            ei: flux_plus[4] + flux_minus[4],
+            er: flux_plus[5] + flux_minus[5],
+        };
+        let tmp_k: Array1<f64> = Array1::from_vec(flux.state2arr().to_vec());
 
         state::State::arr2state(r.dot(&tmp_k))
-
     }
 
     /// Allocation-free reconstruction for the hot path.
@@ -697,10 +484,7 @@ impl Stencil6 {
         for i in 0..6 {
             let fl = points[i].flux_from_derived(&d[i], dir);
             if recon_type {
-                let c = l_dot(
-                    &l,
-                    &[fl.rho, fl.mom_x, fl.mom_y, fl.ee, fl.ei, fl.er],
-                );
+                let c = l_dot(&l, &[fl.rho, fl.mom_x, fl.mom_y, fl.ee, fl.ei, fl.er]);
                 char_flux[i] = state::State {
                     rho: c[0],
                     mom_x: c[1],
@@ -710,10 +494,7 @@ impl Stencil6 {
                     er: c[5],
                 };
                 let p = &points[i];
-                let c = l_dot(
-                    &l,
-                    &[p.rho, p.mom_x, p.mom_y, p.ee, p.ei, p.er],
-                );
+                let c = l_dot(&l, &[p.rho, p.mom_x, p.mom_y, p.ee, p.ei, p.er]);
                 char_state[i] = state::State {
                     rho: c[0],
                     mom_x: c[1],
@@ -732,28 +513,28 @@ impl Stencil6 {
         1 define cs value
         2 modify wave speed of each component
         */
-        
+
         let u1 = match dir {
-            state::Direction::X => points[2].mom_x/points[2].rho,
-            state::Direction::Y => points[2].mom_y/points[2].rho,
+            state::Direction::X => points[2].mom_x / points[2].rho,
+            state::Direction::Y => points[2].mom_y / points[2].rho,
         };
         let u2 = match dir {
-            state::Direction::X => points[3].mom_x/points[3].rho,
-            state::Direction::Y => points[3].mom_y/points[3].rho,
+            state::Direction::X => points[3].mom_x / points[3].rho,
+            state::Direction::Y => points[3].mom_y / points[3].rho,
         };
 
         let cs1 = points[2].cs();
-        let cs1= (constant::PHI*u1.abs()).min(cs1);
+        let cs1 = (constant::PHI * u1.abs()).min(cs1);
         let cs2 = points[3].cs();
-        let cs2 = (constant::PHI*u2.abs()).min(cs2);
+        let cs2 = (constant::PHI * u2.abs()).min(cs2);
 
-        let a0 = ((u1-cs1).abs()).max((u2-cs2).abs());
+        let a0 = ((u1 - cs1).abs()).max((u2 - cs2).abs());
         let a1 = (u1.abs()).max(u2.abs());
         let a2 = (u1.abs()).max(u2.abs());
         let a3 = (u1.abs()).max(u2.abs());
         let a4 = (u1.abs()).max(u2.abs());
-        let a5 = ((u1+cs1).abs()).max((u2+cs2).abs());
-        /* 
+        let a5 = ((u1 + cs1).abs()).max((u2 + cs2).abs());
+        /*
         let a0 = lambda[0].abs();
         let a1 = lambda[1].abs();
         let a2 = lambda[2].abs();
@@ -766,20 +547,20 @@ impl Stencil6 {
 
         for i in 0..6 {
             f_plus_stencil[i] = state::State {
-                rho: 0.5*(char_flux[i].rho + a0*char_state[i].rho),
-                mom_x: 0.5*(char_flux[i].mom_x + a1*char_state[i].mom_x),
-                mom_y: 0.5*(char_flux[i].mom_y + a2*char_state[i].mom_y),
-                ee:  0.5*(char_flux[i].ee  + a3*char_state[i].ee),
-                ei:  0.5*(char_flux[i].ei  + a4*char_state[i].ei),
-                er:  0.5*(char_flux[i].er  + a5*char_state[i].er),
+                rho: 0.5 * (char_flux[i].rho + a0 * char_state[i].rho),
+                mom_x: 0.5 * (char_flux[i].mom_x + a1 * char_state[i].mom_x),
+                mom_y: 0.5 * (char_flux[i].mom_y + a2 * char_state[i].mom_y),
+                ee: 0.5 * (char_flux[i].ee + a3 * char_state[i].ee),
+                ei: 0.5 * (char_flux[i].ei + a4 * char_state[i].ei),
+                er: 0.5 * (char_flux[i].er + a5 * char_state[i].er),
             };
             f_minus_stencil[i] = state::State {
-                rho: 0.5*(char_flux[i].rho - a0*char_state[i].rho),
-                mom_x: 0.5*(char_flux[i].mom_x - a1*char_state[i].mom_x),
-                mom_y: 0.5*(char_flux[i].mom_y - a2*char_state[i].mom_y),
-                ee:  0.5*(char_flux[i].ee  - a3*char_state[i].ee),
-                ei:  0.5*(char_flux[i].ei  - a4*char_state[i].ei),
-                er:  0.5*(char_flux[i].er  - a5*char_state[i].er),
+                rho: 0.5 * (char_flux[i].rho - a0 * char_state[i].rho),
+                mom_x: 0.5 * (char_flux[i].mom_x - a1 * char_state[i].mom_x),
+                mom_y: 0.5 * (char_flux[i].mom_y - a2 * char_state[i].mom_y),
+                ee: 0.5 * (char_flux[i].ee - a3 * char_state[i].ee),
+                ei: 0.5 * (char_flux[i].ei - a4 * char_state[i].ei),
+                er: 0.5 * (char_flux[i].er - a5 * char_state[i].er),
             };
         }
 
@@ -789,34 +570,25 @@ impl Stencil6 {
         let mut flux_plus = [0.0; 6];
         let mut flux_minus = [0.0; 6];
         for i in 0..6 {
-            let stencil = [
-                tmp[i][0],
-                tmp[i][1],
-                tmp[i][2],
-                tmp[i][3],
-                tmp[i][4],
-            ];
+            let stencil = [tmp[i][0], tmp[i][1], tmp[i][2], tmp[i][3], tmp[i][4]];
             flux_plus[i] = weno5(&stencil);
-            let stencil = [
-                tmp1[i][5],
-                tmp1[i][4],
-                tmp1[i][3],
-                tmp1[i][2],
-                tmp1[i][1],
-            ];
+            let stencil = [tmp1[i][5], tmp1[i][4], tmp1[i][3], tmp1[i][2], tmp1[i][1]];
             flux_minus[i] = weno5(&stencil);
         }
 
         let flux = state::State {
-            rho: flux_plus[0]+flux_minus[0],
-            mom_x: flux_plus[1]+flux_minus[1],
-            mom_y: flux_plus[2]+flux_minus[2],
-            ee: flux_plus[3]+flux_minus[3],
-            ei: flux_plus[4]+flux_minus[4],
-            er: flux_plus[5]+flux_minus[5],
+            rho: flux_plus[0] + flux_minus[0],
+            mom_x: flux_plus[1] + flux_minus[1],
+            mom_y: flux_plus[2] + flux_minus[2],
+            ee: flux_plus[3] + flux_minus[3],
+            ei: flux_plus[4] + flux_minus[4],
+            er: flux_plus[5] + flux_minus[5],
         };
 
-        let c = r_dot(&r, &[flux.rho, flux.mom_x, flux.mom_y, flux.ee, flux.ei, flux.er]);
+        let c = r_dot(
+            &r,
+            &[flux.rho, flux.mom_x, flux.mom_y, flux.ee, flux.ei, flux.er],
+        );
         state::State {
             rho: c[0],
             mom_x: c[1],
@@ -826,8 +598,6 @@ impl Stencil6 {
             er: c[5],
         }
     }
-
-
 }
 
 /// component-major: arr[component][point] for a 6-point stencil
@@ -851,8 +621,12 @@ fn l_dot(l: &[[f64; 6]; 6], u: &[f64; 6]) -> [f64; 6] {
     let mut out = [0.0; 6];
     for i in 0..6 {
         let row = &l[i];
-        out[i] = row[0]*u[0] + row[1]*u[1] + row[2]*u[2]
-               + row[3]*u[3] + row[4]*u[4] + row[5]*u[5];
+        out[i] = row[0] * u[0]
+            + row[1] * u[1]
+            + row[2] * u[2]
+            + row[3] * u[3]
+            + row[4] * u[4]
+            + row[5] * u[5];
     }
     out
 }
@@ -862,35 +636,36 @@ fn r_dot(r: &[[f64; 6]; 6], u: &[f64; 6]) -> [f64; 6] {
     let mut out = [0.0; 6];
     for i in 0..6 {
         let row = &r[i];
-        out[i] = row[0]*u[0] + row[1]*u[1] + row[2]*u[2]
-               + row[3]*u[3] + row[4]*u[4] + row[5]*u[5];
+        out[i] = row[0] * u[0]
+            + row[1] * u[1]
+            + row[2] * u[2]
+            + row[3] * u[3]
+            + row[4] * u[4]
+            + row[5] * u[5];
     }
     out
 }
 
-
 #[inline]
 pub fn weno5(stencil: &[f64; 5]) -> f64 {
-
     let u0 = stencil[0];
     let u1 = stencil[1];
     let u2 = stencil[2];
     let u3 = stencil[3];
     let u4 = stencil[4];
 
-    let beta2 = 13.0/12.0 * (u2 - 2.0*u3 + u4).powi(2)
-                                + 0.25*(3.0*u2 - 4.0*u3 + u4).powi(2);
-    let beta1 = 13.0/12.0*(u1 - 2.0*u2 + u3).powi(2)
-                    + 0.25*(u1 - u3).powi(2);
-    let beta0 = 13.0/12.0*(u0 - 2.0*u1 + u2).powi(2)
-                    + 0.25*(u0 - 4.0*u1 + 3.0*u2).powi(2);
+    let beta2 =
+        13.0 / 12.0 * (u2 - 2.0 * u3 + u4).powi(2) + 0.25 * (3.0 * u2 - 4.0 * u3 + u4).powi(2);
+    let beta1 = 13.0 / 12.0 * (u1 - 2.0 * u2 + u3).powi(2) + 0.25 * (u1 - u3).powi(2);
+    let beta0 =
+        13.0 / 12.0 * (u0 - 2.0 * u1 + u2).powi(2) + 0.25 * (u0 - 4.0 * u1 + 3.0 * u2).powi(2);
     let d0 = 0.1;
     let d1 = 0.6;
     let d2 = 0.3;
 
-    let a0 = d0/(constant::DEFAULT_EPS + beta0).powi(2);
-    let a1 = d1/(constant::DEFAULT_EPS + beta1).powi(2);
-    let a2 = d2/(constant::DEFAULT_EPS + beta2).powi(2);
+    let a0 = d0 / (constant::DEFAULT_EPS + beta0).powi(2);
+    let a1 = d1 / (constant::DEFAULT_EPS + beta1).powi(2);
+    let a2 = d2 / (constant::DEFAULT_EPS + beta2).powi(2);
 
     //let tau5 = (beta0-beta2).abs();
 
@@ -900,18 +675,16 @@ pub fn weno5(stencil: &[f64; 5]) -> f64 {
 
     let sum_o = a0 + a1 + a2;
 
-    let w0 = a0/sum_o;
-    let w1 = a1/sum_o;
-    let w2 = a2/sum_o;
+    let w0 = a0 / sum_o;
+    let w1 = a1 / sum_o;
+    let w2 = a2 / sum_o;
 
-    let p0 = u0/3.0 - 7.0/6.0*u1 + 11.0/6.0*u2;
-    let p1 = - u1/6.0 + 5.0/6.0*u2 + u3/3.0;
-    let p2 = u2/3.0 + 5.0/6.0*u3 - u4/6.0;
+    let p0 = u0 / 3.0 - 7.0 / 6.0 * u1 + 11.0 / 6.0 * u2;
+    let p1 = -u1 / 6.0 + 5.0 / 6.0 * u2 + u3 / 3.0;
+    let p2 = u2 / 3.0 + 5.0 / 6.0 * u3 - u4 / 6.0;
 
-    w0*p0 + w1*p1 + w2*p2
+    w0 * p0 + w1 * p1 + w2 * p2
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -920,14 +693,7 @@ mod tests {
 
     const TOL: f64 = 1e-10;
 
-    fn make_state(
-        rho: f64,
-        mom_x: f64,
-        mom_y: f64,
-        ee: f64,
-        ei: f64,
-        er: f64,
-    ) -> State {
+    fn make_state(rho: f64, mom_x: f64, mom_y: f64, ee: f64, ei: f64, er: f64) -> State {
         State {
             rho,
             mom_x,
@@ -939,37 +705,18 @@ mod tests {
     }
 
     fn test_state() -> State {
-        make_state(
-            1.0,
-            0.5,
-            0.3,
-            3.0,
-            2.0,
-            1.0,
-        )
+        make_state(1.0, 0.5, 0.3, 3.0, 2.0, 1.0)
     }
 
-    fn constant_stencil(
-        state: State,
-        dir: Direction,
-    ) -> Stencil6 {
+    fn constant_stencil(state: State, dir: Direction) -> Stencil6 {
         Stencil6 {
             points: [state; 6],
             dir,
         }
     }
 
-    fn assert_state_close(
-        a: &State,
-        b: &State,
-        tol: f64,
-    ) {
-        assert!(
-            (a.rho - b.rho).abs() < tol,
-            "rho: {} != {}",
-            a.rho,
-            b.rho
-        );
+    fn assert_state_close(a: &State, b: &State, tol: f64) {
+        assert!((a.rho - b.rho).abs() < tol, "rho: {} != {}", a.rho, b.rho);
 
         assert!(
             (a.mom_x - b.mom_x).abs() < tol,
@@ -985,26 +732,11 @@ mod tests {
             b.mom_y
         );
 
-        assert!(
-            (a.ee - b.ee).abs() < tol,
-            "ee: {} != {}",
-            a.ee,
-            b.ee
-        );
+        assert!((a.ee - b.ee).abs() < tol, "ee: {} != {}", a.ee, b.ee);
 
-        assert!(
-            (a.ei - b.ei).abs() < tol,
-            "ei: {} != {}",
-            a.ei,
-            b.ei
-        );
+        assert!((a.ei - b.ei).abs() < tol, "ei: {} != {}", a.ei, b.ei);
 
-        assert!(
-            (a.er - b.er).abs() < tol,
-            "er: {} != {}",
-            a.er,
-            b.er
-        );
+        assert!((a.er - b.er).abs() < tol, "er: {} != {}", a.er, b.er);
     }
 
     // ============================================================
@@ -1013,13 +745,7 @@ mod tests {
 
     #[test]
     fn test_weno_constant() {
-        let stencil = [
-            5.0,
-            5.0,
-            5.0,
-            5.0,
-            5.0,
-        ];
+        let stencil = [5.0, 5.0, 5.0, 5.0, 5.0];
 
         let result = weno5(&stencil);
 
@@ -1028,19 +754,12 @@ mod tests {
 
     #[test]
     fn test_weno5_accuracy() {
-        let grids = [
-            40usize,
-            80usize,
-            160usize,
-            320usize,
-        ];
+        let grids = [40usize, 80usize, 160usize, 320usize];
 
         let mut errors = Vec::new();
 
         for &nx in &grids {
-            let dx =
-                2.0 * std::f64::consts::PI
-                / nx as f64;
+            let dx = 2.0 * std::f64::consts::PI / nx as f64;
 
             let mut error = 0.0;
             let mut count = 0;
@@ -1069,8 +788,7 @@ mod tests {
                 let h_iphalf = weno5(&stencil_r);
                 let h_imhalf = weno5(&stencil_l);
 
-                let numerical =
-                    (h_iphalf - h_imhalf) / dx;
+                let numerical = (h_iphalf - h_imhalf) / dx;
 
                 let exact = x.cos();
 
@@ -1084,20 +802,14 @@ mod tests {
         let mut orders = Vec::new();
 
         for i in 1..errors.len() {
-            orders.push(
-                (errors[i - 1] / errors[i]).log2()
-            );
+            orders.push((errors[i - 1] / errors[i]).log2());
         }
 
         println!("errors = {:?}", errors);
         println!("orders = {:?}", orders);
 
         for order in orders.iter().skip(1) {
-            assert!(
-                *order > 4.5,
-                "WENO order too low: {}",
-                order
-            );
+            assert!(*order > 4.5, "WENO order too low: {}", order);
         }
     }
 
@@ -1107,22 +819,18 @@ mod tests {
 
     #[test]
     fn test_x_has_six_eigenvalues() {
-        let stencil =
-            constant_stencil(test_state(), Direction::X);
+        let stencil = constant_stencil(test_state(), Direction::X);
 
-        let (lambda, _) =
-            stencil.build_r_roe_ave();
+        let (lambda, _) = stencil.build_r_roe_ave();
 
         assert_eq!(lambda.len(), 6);
     }
 
     #[test]
     fn test_y_has_six_eigenvalues() {
-        let stencil =
-            constant_stencil(test_state(), Direction::Y);
+        let stencil = constant_stencil(test_state(), Direction::Y);
 
-        let (lambda, _) =
-            stencil.build_r_roe_ave();
+        let (lambda, _) = stencil.build_r_roe_ave();
 
         assert_eq!(lambda.len(), 6);
     }
@@ -1132,8 +840,7 @@ mod tests {
     // ============================================================
 
     fn check_eigen_inverse(dir: Direction) {
-        let stencil =
-            constant_stencil(test_state(), dir);
+        let stencil = constant_stencil(test_state(), dir);
 
         let l = stencil.build_l();
         let (_, r) = stencil.build_r_roe_ave();
@@ -1147,8 +854,7 @@ mod tests {
             for j in 0..6 {
                 if i == j {
                     assert!(
-                        (identity[[i, j]] - 1.0).abs()
-                            < TOL,
+                        (identity[[i, j]] - 1.0).abs() < TOL,
                         "dir={:?}, ({},{}): {}",
                         dir,
                         i,
@@ -1183,127 +889,85 @@ mod tests {
     // Characteristic transformation
     // ============================================================
 
-    fn check_characteristic_round_trip(
-        dir: Direction,
-    ) {
+    fn check_characteristic_round_trip(dir: Direction) {
         let state = test_state();
 
-        let stencil =
-            constant_stencil(state, dir);
+        let stencil = constant_stencil(state, dir);
 
         let l = stencil.build_l();
         let (_, r) = stencil.build_r_roe_ave();
 
-        let characteristic =
-            stencil.con2char(&l);
+        let characteristic = stencil.con2char(&l);
 
         for q in characteristic.points.iter() {
-            let q_char =
-                Array1::from_vec(
-                    q.state2arr().to_vec()
-                );
+            let q_char = Array1::from_vec(q.state2arr().to_vec());
 
-            let q_back =
-                State::arr2state(r.dot(&q_char));
+            let q_back = State::arr2state(r.dot(&q_char));
 
-            assert_state_close(
-                &q_back,
-                &state,
-                TOL,
-            );
+            assert_state_close(&q_back, &state, TOL);
         }
     }
 
     #[test]
     fn test_characteristic_round_trip_x() {
-        check_characteristic_round_trip(
-            Direction::X
-        );
+        check_characteristic_round_trip(Direction::X);
     }
 
     #[test]
     fn test_characteristic_round_trip_y() {
-        check_characteristic_round_trip(
-            Direction::Y
-        );
+        check_characteristic_round_trip(Direction::Y);
     }
 
     // ============================================================
     // Constant-state reconstruction
     // ============================================================
 
-    fn check_constant_flux_preserving(
-        dir: Direction,
-    ) {
+    fn check_constant_flux_preserving(dir: Direction) {
         let state = test_state();
 
-        let stencil =
-            constant_stencil(state, dir);
+        let stencil = constant_stencil(state, dir);
 
-        let reconstructed =
-            stencil.reconstruction(true);
+        let reconstructed = stencil.reconstruction(true);
 
-        let exact_flux =
-            state.flux(dir);
+        let exact_flux = state.flux(dir);
 
-        assert_state_close(
-            &reconstructed,
-            &exact_flux,
-            TOL,
-        );
+        assert_state_close(&reconstructed, &exact_flux, TOL);
     }
 
     #[test]
     fn test_constant_flux_preserving_x() {
-        check_constant_flux_preserving(
-            Direction::X
-        );
+        check_constant_flux_preserving(Direction::X);
     }
 
     #[test]
     fn test_constant_flux_preserving_y() {
-        check_constant_flux_preserving(
-            Direction::Y
-        );
+        check_constant_flux_preserving(Direction::Y);
     }
 
     // ============================================================
     // Conservative-space reconstruction
     // ============================================================
 
-    fn check_constant_flux_preserving_conservative(
-        dir: Direction,
-    ) {
+    fn check_constant_flux_preserving_conservative(dir: Direction) {
         let state = test_state();
 
-        let stencil =
-            constant_stencil(state, dir);
+        let stencil = constant_stencil(state, dir);
 
-        let reconstructed =
-            stencil.reconstruction(false);
+        let reconstructed = stencil.reconstruction(false);
 
-        let exact_flux =
-            state.flux(dir);
+        let exact_flux = state.flux(dir);
 
-        assert_state_close(
-            &reconstructed,
-            &exact_flux,
-            TOL,
-        );
+        assert_state_close(&reconstructed, &exact_flux, TOL);
     }
 
     #[test]
     fn test_constant_flux_preserving_conservative_x() {
-        check_constant_flux_preserving_conservative(
-            Direction::X
-        );
+        check_constant_flux_preserving_conservative(Direction::X);
     }
 
     #[test]
     fn test_constant_flux_preserving_conservative_y() {
-        check_constant_flux_preserving_conservative(
-            Direction::Y
-        );
+        check_constant_flux_preserving_conservative(Direction::Y);
     }
 
     // ============================================================
@@ -1317,29 +981,15 @@ mod tests {
         cannot pass unnoticed.
         */
 
-        let state = make_state(
-            1.0,
-            0.7,
-            0.2,
-            3.0,
-            2.0,
-            1.0,
-        );
+        let state = make_state(1.0, 0.7, 0.2, 3.0, 2.0, 1.0);
 
         let flux_x = state.flux(Direction::X);
         let flux_y = state.flux(Direction::Y);
 
-        assert!(
-            (flux_x.rho - flux_y.rho).abs() > 1e-12
-        );
+        assert!((flux_x.rho - flux_y.rho).abs() > 1e-12);
 
-        assert!(
-            (flux_x.rho - state.mom_x).abs() < TOL
-        );
+        assert!((flux_x.rho - state.mom_x).abs() < TOL);
 
-        assert!(
-            (flux_y.rho - state.mom_y).abs() < TOL
-        );
+        assert!((flux_y.rho - state.mom_y).abs() < TOL);
     }
-
 }

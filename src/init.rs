@@ -89,11 +89,7 @@ pub fn init_double_mach() -> Field {
     let top_bc = BCType::TimeDependent(Arc::new(move |p: Point, _n, t: f64| {
         // Upstream sound speed is 1, so Mach 10 shock speed is 10.
         let x_shock = 10.0 * t;
-        if p.x <= x_shock {
-            top_post
-        } else {
-            top_pre
-        }
+        if p.x <= x_shock { top_post } else { top_pre }
     }));
 
     let bc_outer = vec![
@@ -714,11 +710,7 @@ pub fn init_shock_cylinder_in_box_with(
         BCType::TimeDependent(Arc::new(move |p: Point, _normal: Vec2, t: f64| -> State {
             let x_shock = shock_x0 + shock_speed * t;
 
-            if p.x <= x_shock {
-                post
-            } else {
-                pre
-            }
+            if p.x <= x_shock { post } else { pre }
         }));
 
     // ============================================================

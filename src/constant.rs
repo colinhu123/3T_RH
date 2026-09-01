@@ -6,7 +6,7 @@ pub const KAPPA_R: f64 = 0.0;
 
 pub const CVE: f64 = 1.0;
 pub const CVI: f64 = 1.0;
-pub const A  : f64 = 1.0;
+pub const A: f64 = 1.0;
 
 pub const GAMMA_I: f64 = 1.4;
 pub const GAMMA_E: f64 = 1.4;
@@ -19,9 +19,8 @@ pub const LAMBDA: f64 = 0.5;
 
 pub const WENO_Q: f64 = 10.0;
 
-pub const DIFFUSION_ACTIVE: bool =
-    KAPPA_E != 0.0 || KAPPA_I != 0.0 || KAPPA_R != 0.0;
+pub const DIFFUSION_ACTIVE: bool = KAPPA_E != 0.0 || KAPPA_I != 0.0 || KAPPA_R != 0.0;
 
 pub const SOURCE_ACTIVE: bool = OMEGA_EI != 0.0 || OMEGA_ER != 0.0;
 
-pub const PHI: f64 = 5.0;//this is used in modified LF to reduce carbuncle effect
+pub const PHI: f64 = 5.0; //this is used in modified LF to reduce carbuncle effect

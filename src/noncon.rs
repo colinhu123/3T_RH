@@ -17,9 +17,9 @@ fn n_vector_from_pressures(pe: f64, pi: f64, pr: f64) -> state::State {
         rho: 0.0,
         mom_x: 0.0,
         mom_y: 0.0,
-        ee: 2.0*pe - pi - pr,
-        ei: 2.0*pi - pe - pr,
-        er: 2.0*pr - pe - pi,
+        ee: 2.0 * pe - pi - pr,
+        ei: 2.0 * pi - pe - pr,
+        er: 2.0 * pr - pe - pi,
     }
 }
 
@@ -32,28 +32,18 @@ fn sixth_order_derivative(
     qp3: f64,
     dx: f64,
 ) -> f64 {
-    (
-        qp3
-        - 9.0*qp2
-        + 45.0*qp1
-        - 45.0*qm1
-        + 9.0*qm2
-        - qm3
-    )
-    / (60.0*dx)
+    (qp3 - 9.0 * qp2 + 45.0 * qp1 - 45.0 * qm1 + 9.0 * qm2 - qm3) / (60.0 * dx)
 }
 
 /// Fixed-coefficient 7-point interpolation used to reconstruct a cell-edge
 /// value from 7 point values centered on the interpolating cell.
 /// Matches q_pulse() in the reference C++ implementation exactly.
 fn q_pulse(b: &[f64; 7]) -> f64 {
-    -0.00714285714285723*b[0]
-    + 0.0595238095238118*b[1]
-    - 0.240476190476197*b[2]
-    + 0.759523809523819*b[3]
-    + 0.509523809523803*b[4]
-    - 0.0904761904761891*b[5]
-    + 0.00952380952380977*b[6]
+    -0.00714285714285723 * b[0] + 0.0595238095238118 * b[1] - 0.240476190476197 * b[2]
+        + 0.759523809523819 * b[3]
+        + 0.509523809523803 * b[4]
+        - 0.0904761904761891 * b[5]
+        + 0.00952380952380977 * b[6]
 }
 
 /// (∂N/∂x)_i : the sixth-order central-difference derivative of the
@@ -79,9 +69,9 @@ pub fn dN(stencil: &[state::State; 7], dx: f64) -> state::State {
         rho: 0.0,
         mom_x: 0.0,
         mom_y: 0.0,
-        ee: 2.0*dpe - dpi - dpr,
-        ei: 2.0*dpi - dpe - dpr,
-        er: 2.0*dpr - dpe - dpi,
+        ee: 2.0 * dpe - dpi - dpr,
+        ei: 2.0 * dpi - dpe - dpr,
+        er: 2.0 * dpr - dpe - dpi,
     }
 }
 
@@ -143,36 +133,18 @@ pub fn nonconservative_direction(
     let v = dir.velocity(center);
 
     let deriv_stencil: [state::State; 7] = [
-        stencil[1],
-        stencil[2],
-        stencil[3],
-        stencil[4],
-        stencil[5],
-        stencil[6],
-        stencil[7],
+        stencil[1], stencil[2], stencil[3], stencil[4], stencil[5], stencil[6], stencil[7],
     ];
 
     let derivative = dN(&deriv_stencil, ds);
 
     let stencil_m: [state::State; 8] = [
-        stencil[0],
-        stencil[1],
-        stencil[2],
-        stencil[3],
-        stencil[4],
-        stencil[5],
-        stencil[6],
+        stencil[0], stencil[1], stencil[2], stencil[3], stencil[4], stencil[5], stencil[6],
         stencil[7],
     ];
 
     let stencil_p: [state::State; 8] = [
-        stencil[1],
-        stencil[2],
-        stencil[3],
-        stencil[4],
-        stencil[5],
-        stencil[6],
-        stencil[7],
+        stencil[1], stencil[2], stencil[3], stencil[4], stencil[5], stencil[6], stencil[7],
         stencil[8],
     ];
 
@@ -190,45 +162,30 @@ pub fn nonconservative_direction(
         mom_x: 0.0,
         mom_y: 0.0,
 
-        ee: v/3.0 * derivative.ee
-            + (coef_left*jump_m.ee + coef_right*jump_p.ee) / ds,
+        ee: v / 3.0 * derivative.ee + (coef_left * jump_m.ee + coef_right * jump_p.ee) / ds,
 
-        ei: v/3.0 * derivative.ei
-            + (coef_left*jump_m.ei + coef_right*jump_p.ei) / ds,
+        ei: v / 3.0 * derivative.ei + (coef_left * jump_m.ei + coef_right * jump_p.ei) / ds,
 
-        er: v/3.0 * derivative.er
-            + (coef_left*jump_m.er + coef_right*jump_p.er) / ds,
+        er: v / 3.0 * derivative.er + (coef_left * jump_m.er + coef_right * jump_p.er) / ds,
     }
 }
 
-pub fn nonconservative_x(
-    stencil: &[state::State; 9],
-    dx: f64,
-) -> state::State {
+pub fn nonconservative_x(stencil: &[state::State; 9], dx: f64) -> state::State {
     nonconservative_direction(stencil, dx, state::Direction::X)
 }
 
-pub fn nonconservative_y(
-    stencil: &[state::State; 9],
-    dy: f64,
-) -> state::State {
+pub fn nonconservative_y(stencil: &[state::State; 9], dy: f64) -> state::State {
     nonconservative_direction(stencil, dy, state::Direction::Y)
 }
 
 /// Hot-path variant: identical numerics, but reads pressures/velocities
 /// from per-stage precomputed `Derived` quantities instead of recomputing
 /// `pressure_spilit` / momentum divisions pointwise.
-pub fn nonconservative_x_pre(
-    d: &[state::Derived; 9],
-    dx: f64,
-) -> state::State {
+pub fn nonconservative_x_pre(d: &[state::Derived; 9], dx: f64) -> state::State {
     nonconservative_direction_pre(d, dx, state::Direction::X)
 }
 
-pub fn nonconservative_y_pre(
-    d: &[state::Derived; 9],
-    dy: f64,
-) -> state::State {
+pub fn nonconservative_y_pre(d: &[state::Derived; 9], dy: f64) -> state::State {
     nonconservative_direction_pre(d, dy, state::Direction::Y)
 }
 
@@ -250,9 +207,9 @@ fn dN_pre(stencil: &[state::Derived; 7], dx: f64) -> state::State {
         rho: 0.0,
         mom_x: 0.0,
         mom_y: 0.0,
-        ee: 2.0*dpe - dpi - dpr,
-        ei: 2.0*dpi - dpe - dpr,
-        er: 2.0*dpr - dpe - dpi,
+        ee: 2.0 * dpe - dpi - dpr,
+        ei: 2.0 * dpi - dpe - dpr,
+        er: 2.0 * dpr - dpe - dpi,
     }
 }
 
@@ -290,27 +247,33 @@ pub fn nonconservative_direction_pre(
     ds: f64,
     dir: state::Direction,
 ) -> state::State {
-    let v = if matches!(dir, state::Direction::X) { d[4].u } else { d[4].v };
+    let v = if matches!(dir, state::Direction::X) {
+        d[4].u
+    } else {
+        d[4].v
+    };
 
-    let deriv_stencil: [state::Derived; 7] = [
-        d[1], d[2], d[3], d[4], d[5], d[6], d[7],
-    ];
+    let deriv_stencil: [state::Derived; 7] = [d[1], d[2], d[3], d[4], d[5], d[6], d[7]];
 
     let derivative = dN_pre(&deriv_stencil, ds);
 
-    let stencil_m: [state::Derived; 8] = [
-        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
-    ];
+    let stencil_m: [state::Derived; 8] = [d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]];
 
-    let stencil_p: [state::Derived; 8] = [
-        d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8],
-    ];
+    let stencil_p: [state::Derived; 8] = [d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8]];
 
     let jump_m = n_jump_pre(&stencil_m);
     let jump_p = n_jump_pre(&stencil_p);
 
-    let vm = if matches!(dir, state::Direction::X) { d[3].u } else { d[3].v };
-    let vp = if matches!(dir, state::Direction::X) { d[5].u } else { d[5].v };
+    let vm = if matches!(dir, state::Direction::X) {
+        d[3].u
+    } else {
+        d[3].v
+    };
+    let vp = if matches!(dir, state::Direction::X) {
+        d[5].u
+    } else {
+        d[5].v
+    };
 
     let coef_left = v.max(vm).max(0.0) / 3.0;
     let coef_right = v.min(vp).min(0.0) / 3.0;
@@ -320,14 +283,11 @@ pub fn nonconservative_direction_pre(
         mom_x: 0.0,
         mom_y: 0.0,
 
-        ee: v/3.0 * derivative.ee
-            + (coef_left*jump_m.ee + coef_right*jump_p.ee) / ds,
+        ee: v / 3.0 * derivative.ee + (coef_left * jump_m.ee + coef_right * jump_p.ee) / ds,
 
-        ei: v/3.0 * derivative.ei
-            + (coef_left*jump_m.ei + coef_right*jump_p.ei) / ds,
+        ei: v / 3.0 * derivative.ei + (coef_left * jump_m.ei + coef_right * jump_p.ei) / ds,
 
-        er: v/3.0 * derivative.er
-            + (coef_left*jump_m.er + coef_right*jump_p.er) / ds,
+        er: v / 3.0 * derivative.er + (coef_left * jump_m.er + coef_right * jump_p.er) / ds,
     }
 }
 
@@ -336,14 +296,7 @@ mod tests {
     use super::*;
     use crate::state::State;
 
-    fn make_state(
-        rho: f64,
-        mom_x: f64,
-        mom_y: f64,
-        ee: f64,
-        ei: f64,
-        er: f64,
-    ) -> State {
+    fn make_state(rho: f64, mom_x: f64, mom_y: f64, ee: f64, ei: f64, er: f64) -> State {
         State {
             rho,
             mom_x,
@@ -372,14 +325,7 @@ mod tests {
 
     #[test]
     fn test_n_vector_zero_pressure() {
-        let s = make_state(
-            1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        );
+        let s = make_state(1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
 
         let n = n_vector(&s);
 
@@ -401,14 +347,7 @@ mod tests {
         Nr = 2Pr - Pe - Pi
         */
 
-        let s = make_state(
-            1.0,
-            0.0,
-            0.0,
-            5.0,
-            5.0,
-            5.0,
-        );
+        let s = make_state(1.0, 0.0, 0.0, 5.0, 5.0, 5.0);
 
         let n = n_vector(&s);
 
@@ -423,15 +362,7 @@ mod tests {
 
     #[test]
     fn test_sixth_order_derivative_constant_function() {
-        let result = sixth_order_derivative(
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            1.0,
-            0.1,
-        );
+        let result = sixth_order_derivative(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.1);
 
         assert!(result.abs() < 1e-14);
     }
@@ -451,15 +382,7 @@ mod tests {
         derivative should be 1.
         */
 
-        let result = sixth_order_derivative(
-            -3.0,
-            -2.0,
-            -1.0,
-            1.0,
-            2.0,
-            3.0,
-            1.0,
-        );
+        let result = sixth_order_derivative(-3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 1.0);
 
         assert!((result - 1.0).abs() < 1e-12);
     }
@@ -470,14 +393,7 @@ mod tests {
 
     #[test]
     fn test_dN_constant_state() {
-        let s = make_state(
-            1.0,
-            0.0,
-            0.0,
-            3.0,
-            3.0,
-            3.0,
-        );
+        let s = make_state(1.0, 0.0, 0.0, 3.0, 3.0, 3.0);
 
         let stencil = constant_stencil7(s);
 
@@ -498,14 +414,7 @@ mod tests {
 
     #[test]
     fn test_n_jump_constant_state() {
-        let s = make_state(
-            1.0,
-            0.5,
-            0.7,
-            2.0,
-            2.0,
-            2.0,
-        );
+        let s = make_state(1.0, 0.5, 0.7, 2.0, 2.0, 2.0);
 
         let stencil = constant_stencil8(s);
 
@@ -526,14 +435,7 @@ mod tests {
 
     #[test]
     fn test_direction_velocity_x() {
-        let s = make_state(
-            2.0,
-            6.0,
-            10.0,
-            1.0,
-            1.0,
-            1.0,
-        );
+        let s = make_state(2.0, 6.0, 10.0, 1.0, 1.0, 1.0);
 
         let velocity = state::Direction::X.velocity(&s);
 
@@ -542,14 +444,7 @@ mod tests {
 
     #[test]
     fn test_direction_velocity_y() {
-        let s = make_state(
-            2.0,
-            6.0,
-            10.0,
-            1.0,
-            1.0,
-            1.0,
-        );
+        let s = make_state(2.0, 6.0, 10.0, 1.0, 1.0, 1.0);
 
         let velocity = state::Direction::Y.velocity(&s);
 
@@ -562,14 +457,7 @@ mod tests {
 
     #[test]
     fn test_nonconservative_x_constant_state() {
-        let s = make_state(
-            1.0,
-            0.5,
-            0.8,
-            2.0,
-            2.0,
-            2.0,
-        );
+        let s = make_state(1.0, 0.5, 0.8, 2.0, 2.0, 2.0);
 
         let stencil = constant_stencil9(s);
 
@@ -596,14 +484,7 @@ mod tests {
 
     #[test]
     fn test_nonconservative_y_constant_state() {
-        let s = make_state(
-            1.0,
-            0.5,
-            0.8,
-            2.0,
-            2.0,
-            2.0,
-        );
+        let s = make_state(1.0, 0.5, 0.8, 2.0, 2.0, 2.0);
 
         let stencil = constant_stencil9(s);
 
@@ -719,11 +600,7 @@ mod tests {
         ];
 
         let a = nonconservative_x(&stencil, 0.5);
-        let b = nonconservative_direction(
-            &stencil,
-            0.5,
-            state::Direction::X,
-        );
+        let b = nonconservative_direction(&stencil, 0.5, state::Direction::X);
 
         assert!((a.ee - b.ee).abs() < 1e-14);
         assert!((a.ei - b.ei).abs() < 1e-14);
@@ -745,11 +622,7 @@ mod tests {
         ];
 
         let a = nonconservative_y(&stencil, 0.25);
-        let b = nonconservative_direction(
-            &stencil,
-            0.25,
-            state::Direction::Y,
-        );
+        let b = nonconservative_direction(&stencil, 0.25, state::Direction::Y);
 
         assert!((a.ee - b.ee).abs() < 1e-14);
         assert!((a.ei - b.ei).abs() < 1e-14);

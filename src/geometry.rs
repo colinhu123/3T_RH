@@ -686,11 +686,7 @@ impl CircularArc {
         let d2s = (p.x - start.x).powi(2) + (p.y - start.y).powi(2);
         let d2e = (p.x - end.x).powi(2) + (p.y - end.y).powi(2);
 
-        if d2s <= d2e {
-            start
-        } else {
-            end
-        }
+        if d2s <= d2e { start } else { end }
     }
 
     /// FLUID-DOMAIN outward normal at a point on the arc.
@@ -1056,9 +1052,11 @@ mod arc_tests {
             Point { x: 1.0, y: 0.0 },
             Vec2 { x: 0.0, y: -1.0 },
         );
-        assert!(BoundaryGeometry::Line(line)
-            .radius_of_curvature(Point { x: 0.5, y: 0.0 })
-            .is_infinite());
+        assert!(
+            BoundaryGeometry::Line(line)
+                .radius_of_curvature(Point { x: 0.5, y: 0.0 })
+                .is_infinite()
+        );
     }
 }
 

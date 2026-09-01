@@ -4,10 +4,10 @@ use crate::geometry::Geometry;
 use crate::state::{self, State};
 use crate::{geometry, weno};
 use nalgebra::{DMatrix, DVector};
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 use ndarray_linalg::Solve;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const WALL_TAYLOR_ORDER: usize = 4;
 const OUTFLOW_TAYLOR_ORDER: usize = 4;

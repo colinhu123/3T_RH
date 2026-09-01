@@ -1,4 +1,4 @@
-use std::fs::{create_dir_all, remove_dir_all, File, rename};
+use std::fs::{File, create_dir_all, remove_dir_all, rename};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
@@ -22,12 +22,7 @@ const NVAR: u32 = 8;
 ///
 /// The file is first written as *.tmp and atomically renamed to the requested
 /// final name, so a live Python visualizer never sees a partially-written file.
-pub fn save_data(
-    u: &crate::field1::Field,
-    filename: &str,
-    _lx: f64,
-    _ly: f64,
-) {
+pub fn save_data(u: &crate::field1::Field, filename: &str, _lx: f64, _ly: f64) {
     create_dir_all("data").expect("Cannot create data directory");
 
     let final_path = format!("data/{}", filename);
@@ -55,14 +50,13 @@ pub fn save_data(
             // Do NOT call Field::get for non-fluid Cartesian points:
             // for polygon/disk cases that would trigger an expensive BC solve.
             // Store NaNs outside the physical domain so Python can mask them.
-            let (rho, mom_x, mom_y, ee, ei, er) =
-                if u.is_in_domain((ii, jj)) {
-                    let s = u.value[u.linear_index((ii, jj))];
-                    (s.rho, s.mom_x, s.mom_y, s.ee, s.ei, s.er)
-                } else {
-                    let z = f64::NAN;
-                    (z, z, z, z, z, z)
-                };
+            let (rho, mom_x, mom_y, ee, ei, er) = if u.is_in_domain((ii, jj)) {
+                let s = u.value[u.linear_index((ii, jj))];
+                (s.rho, s.mom_x, s.mom_y, s.ee, s.ei, s.er)
+            } else {
+                let z = f64::NAN;
+                (z, z, z, z, z, z)
+            };
 
             // Use GridInfo's actual coordinates. This is important for domains
             // whose x0/y0 are not zero (e.g. DMR and disk benchmarks).
@@ -98,27 +92,57 @@ pub fn clear_data_folder() {
 
 pub fn load_data(u: &mut crate::field1::Field, path: &str) {
     use std::io::{BufReader, Read};
-    let file = File::open(path).unwrap_or_else(|e| panic!("Cannot open restart file {}: {}", path, e));
+    let file =
+        File::open(path).unwrap_or_else(|e| panic!("Cannot open restart file {}: {}", path, e));
     let mut r = BufReader::with_capacity(16 * 1024 * 1024, file);
-    let mut magic=[0u8;8]; r.read_exact(&mut magic).unwrap(); assert_eq!(magic, MAGIC);
-    let mut b4=[0u8;4]; let mut b8=[0u8;8];
-    r.read_exact(&mut b4).unwrap(); assert_eq!(u32::from_le_bytes(b4), VERSION);
-    r.read_exact(&mut b4).unwrap(); assert_eq!(u32::from_le_bytes(b4), NVAR);
-    r.read_exact(&mut b8).unwrap(); let nx=u64::from_le_bytes(b8) as usize;
-    r.read_exact(&mut b8).unwrap(); let ny=u64::from_le_bytes(b8) as usize;
-    r.read_exact(&mut b8).unwrap(); let time=f64::from_le_bytes(b8);
-    assert_eq!((nx,ny),(u.grid.nx,u.grid.ny),"restart grid mismatch");
-    for j in 0..ny { for i in 0..nx {
-        let mut a=[0.0f64;8];
-        for q in 0..8 { r.read_exact(&mut b8).unwrap(); a[q]=f64::from_le_bytes(b8); }
-        let idx=(i as isize,j as isize);
-        if u.is_in_domain(idx) {
-            let s=crate::state::State{rho:a[2],mom_x:a[3],mom_y:a[4],ee:a[5],ei:a[6],er:a[7]};
-            assert!(s.rho.is_finite()&&s.mom_x.is_finite()&&s.mom_y.is_finite()&&s.ee.is_finite()&&s.ei.is_finite()&&s.er.is_finite(),
-                    "non-finite restart state at {:?}",idx);
-            let k=u.linear_index(idx); u.value[k]=s;
+    let mut magic = [0u8; 8];
+    r.read_exact(&mut magic).unwrap();
+    assert_eq!(magic, MAGIC);
+    let mut b4 = [0u8; 4];
+    let mut b8 = [0u8; 8];
+    r.read_exact(&mut b4).unwrap();
+    assert_eq!(u32::from_le_bytes(b4), VERSION);
+    r.read_exact(&mut b4).unwrap();
+    assert_eq!(u32::from_le_bytes(b4), NVAR);
+    r.read_exact(&mut b8).unwrap();
+    let nx = u64::from_le_bytes(b8) as usize;
+    r.read_exact(&mut b8).unwrap();
+    let ny = u64::from_le_bytes(b8) as usize;
+    r.read_exact(&mut b8).unwrap();
+    let time = f64::from_le_bytes(b8);
+    assert_eq!((nx, ny), (u.grid.nx, u.grid.ny), "restart grid mismatch");
+    for j in 0..ny {
+        for i in 0..nx {
+            let mut a = [0.0f64; 8];
+            for q in 0..8 {
+                r.read_exact(&mut b8).unwrap();
+                a[q] = f64::from_le_bytes(b8);
+            }
+            let idx = (i as isize, j as isize);
+            if u.is_in_domain(idx) {
+                let s = crate::state::State {
+                    rho: a[2],
+                    mom_x: a[3],
+                    mom_y: a[4],
+                    ee: a[5],
+                    ei: a[6],
+                    er: a[7],
+                };
+                assert!(
+                    s.rho.is_finite()
+                        && s.mom_x.is_finite()
+                        && s.mom_y.is_finite()
+                        && s.ee.is_finite()
+                        && s.ei.is_finite()
+                        && s.er.is_finite(),
+                    "non-finite restart state at {:?}",
+                    idx
+                );
+                let k = u.linear_index(idx);
+                u.value[k] = s;
+            }
         }
-    }}
-    u.time=time;
-    println!("Restart loaded: {} at t={:.16e}",path,time);
+    }
+    u.time = time;
+    println!("Restart loaded: {} at t={:.16e}", path, time);
 }

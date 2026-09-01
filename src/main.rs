@@ -7,6 +7,7 @@ mod geometry;
 mod ghost;
 mod init;
 mod io;
+mod monitor;
 mod noncon;
 mod source;
 mod state;
@@ -491,6 +492,11 @@ fn main() {
     let mut u2 = u.empty_like();
     let mut u3 = u.empty_like();
 
+    // Per-step numerical-health diagnostics.
+    // Fresh runs truncate data/monitor.csv and write a new header;
+    // restarts append to the existing file.
+    let mut monitor = monitor::Monitor::new("data/monitor.csv", restart_id.is_some());
+
     let mut t = u.time;
     let t_final = 10.0_f64;
     let mut next_store_time = (store_id + 1) as f64 * t_store_interval;
@@ -532,6 +538,11 @@ fn main() {
             "step={}, t={:.8e}, dt={:.8e}, dt_cfl={:.8e}",
             n, t, dt, dt_cfl
         );
+
+        // After rk3_ssp the mem::swap left U^{n+1} in `u` and the
+        // pre-step U^n in `u3`, so the temporal norm reuses the existing
+        // buffer without cloning the solution.
+        monitor.write_step(n, &u, Some(&u3), dt, dt_cfl);
         if n % 100 == 0 {
             bc1::print_ilw_wall_statistics();
             bc1::print_reflective_wall_statistics();

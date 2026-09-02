@@ -2,7 +2,7 @@
 
 A Rust implementation of a two-dimensional, high-order finite-difference solver for the three-temperature radiation hydrodynamics (3-T RH) system on Cartesian grids with arbitrary polygon-embedded geometries.
 
-The implementation follows the 2D algorithm described by Cheng and Shu in *High order conservative finite difference WENO scheme for three-temperature radiation hydrodynamics* (Journal of Computational Physics, 2024). The boundary treatment follows the high-order inverse Lax–Wendroff (ILW) / WENO extrapolation approach of Tan, Wang and Shu (*Accurate numerical boundary conditions for computational fluid dynamics*, 2012).
+The implementation follows the 2D algorithm described by J. Cheng and C.-W. Shu in *High order conservative finite difference WENO scheme for three-temperature radiation hydrodynamics* (Journal of Computational Physics, 2024). The boundary treatment follows the high-order inverse Lax–Wendroff (ILW) / WENO extrapolation approach of S. Tan, C. Wang, C.-W. Shu, and J. Ning in *Efficient implementation of high order inverse Lax–Wendroff boundary treatment for conservation laws* (Journal of Computational Physics, 2012).
 
 ## What this code solves
 
@@ -26,6 +26,33 @@ U_t + dF1/dx + dF2/dy
 where `F1` and `F2` are the conservative convection fluxes, `N` contains the non-conservative pressure combinations, `G1` and `G2` are the electron/ion/radiation diffusion fluxes, and `S` contains the electron-ion and electron-radiation energy exchange terms.
 
 This is the same operator structure assembled in `l()` in `main.rs`: conservative x/y flux divergences, non-conservative x/y contributions, source terms, and diffusion in both directions are combined to form the semi-discrete right-hand side.
+
+## Simulation Results
+
+### Mach 3 flow past a circular cylinder
+
+<p align="center">
+  <img src="figures/solution_0200_density.png" width="600">
+</p>
+
+<p align="center">
+  <em>
+    Density field for Mach 3 flow past a circular cylinder.
+  </em>
+</p>
+
+### Rotated forward-facing step
+
+<p align="center">
+  <img src="figures/solution_0048_schlieren.png" width="800">
+</p>
+
+<p align="center">
+  <em>
+    Numerical schlieren for Mach 3 flow over a forward-facing step
+    rotated 5° relative to the Cartesian grid.
+  </em>
+</p>
 
 ## Numerical method
 
@@ -65,24 +92,27 @@ u^(n+1) = 1/3 u^n + 2/3 u2 + 2 dt/3 L(u2)
 
 In the code this is implemented in `rk3_ssp()`.
 
-The global time step is `dt = 0.05 * dt_cfl`, where `dt_cfl` is the minimum over all fluid cells of `dt::get_local_dt()` (which includes advection, diffusion and exchange-term eigenvalue estimates, scaled by `LAMBDA = 0.5`). The step is clipped so the simulation lands exactly on output times and `t_final`.
+The global time step is `dt = 0.8 * dt_cfl`, where `dt_cfl` is the minimum over all fluid cells of `dt::get_local_dt()` (which includes advection, diffusion and exchange-term eigenvalue estimates, scaled by `LAMBDA = 0.5`). The step is clipped so the simulation lands exactly on output times and `t_final`.
 
 ## Geometry and boundary conditions
 
-The fluid domain is defined by polygons (`geometry.rs`):
+The fluid domain is classified by polygons (`geometry.rs`):
 
-- `outer_bound`: polygon with fluid inside (`FluidSide::Inside`). The cylinder surface is part of this polygon.
-- `inner_bound`: polygon with fluid outside (`FluidSide::Outside`). Currently a dummy placed far outside the domain.
+- `outer_bound`: polygon with fluid inside (`FluidSide::Inside`).
+- `inner_bound`: polygon with fluid outside (`FluidSide::Outside`). In the half-cylinder case it is a dummy placed far outside the domain; in the full-cylinder-in-box case it is the circle around the obstacle.
 
-Every side of each polygon carries a `BCType`. On a Cartesian point that lies outside the fluid domain, `Field::is_in_domain` returns false and the point is treated as a ghost cell.
+A Cartesian point is fluid if and only if it lies inside both polygons (`Field::is_in_domain`); otherwise it is treated as a ghost cell.
+
+The polygons are only the domain classifier / fluid-mask source. The authoritative physical boundary is a set of analytic `BoundaryElement`s stored on the `Field` (`outer_boundary` / `inner_boundary`), each combining ONE analytic geometry — `LineSegment`, `CircularArc` or `Circle` — with ONE `BCType`. For example, the cylinder wall is a single analytic `CircularArc` in the half-cylinder case and a single analytic `Circle` in the full-cylinder case; the many polygon segments that approximate the arc are retained only for fluid masking and never supply the wall normal / `P0` / distance.
 
 ### Ghost grid
 
 `ghost.rs` discovers, once at startup, every ghost index referenced by the solver stencils (a radius-4 cross, `default_stencil_offsets()`, covering WENO, non-conservative and diffusion stencils), and caches for each ghost:
 
-- the closest boundary point `P0` and outward fluid normal,
-- the boundary side (at polygon vertices the side is selected by BC priority: `Wall > ReflectiveWall > Constant/TimeDependent > FarField > Outflow > ZerothOrder > Periodic`),
-- the signed normal distance from `P0` to the ghost point.
+- its analytic physical `BoundaryElement` (`find_boundary_element` returns the closest element, geometric ties broken by BC priority),
+- the analytic projection to the closest boundary point `P0` and the outward fluid normal,
+- the signed normal distance from `P0` to the ghost point,
+- precomputed WENO-extrapolation data for the ghosts that need it (Wall / Outflow / FarField ghosts).
 
 Ghost values are recomputed in parallel (Rayon) once per RK stage in `GhostGrid::update_values_parallel()`. All ghosts are first-stage-independent, so the update is data-parallel.
 
@@ -98,7 +128,7 @@ Ghost values are recomputed in parallel (Rayon) once per RK stage in `GhostGrid:
 | `ZerothOrder` | Ghost value copied from the mirrored interior cell. |
 | `Periodic` | y-periodic wrap (used by the translating-shock test). |
 
-The high-order machinery (`weno_extrapolation()`) follows Tan et al. (2012), Sec. 2.4: for each order r = 0..4 a 2D polynomial of degree r is least-squares fitted to the (r+1)^2-point stencil `E_r` of characteristic variables in boundary-normal coordinates; smoothness indicators and nonlinear weights select the WENO combination of the k-th normal derivatives, which are Taylor-expanded to the ghost point.
+The high-order machinery (`weno_extrapolation()`) follows Tan, Wang, Shu, and Ning (2012), Sec. 2.4: for each order r = 0..4 a 2D polynomial of degree r is least-squares fitted to the (r+1)^2-point stencil `E_r` of characteristic variables in boundary-normal coordinates; smoothness indicators and nonlinear weights select the WENO combination of the k-th normal derivatives, which are Taylor-expanded to the ghost point.
 
 ## Current test problem in `main.rs`
 
@@ -109,32 +139,35 @@ domain      : x in [-3, 0], y in [-6, 6]
 obstacle    : half-disk x^2 + y^2 < 1, x <= 0  (part of the outer polygon)
 grid        : nx = 121, ny = 481, dx = dy = 1/40
 freestream  : rho = 1, p = 1, M = 3  (splits: ee = ei = er)
-t_final     : 0.4
-output      : every dt_store = 0.001
+t_final     : 10.0
+output      : every dt_store = 0.05
+dt          : 0.8 * dt_cfl
 ```
 
-The cylinder arc is approximated by 360 polygon segments with `ReflectiveWall`; all outer rectangular sides use `FarField` (the left side `x = -3` is supersonic inflow).
+The cylinder wall is a single analytic `CircularArc` boundary element with the high-order ILW `Wall` BC; the 360 polygon segments that approximate the arc remain only as the domain classifier / fluid mask. All outer straight sides use `FarField` (the left side `x = -3` is supersonic inflow).
 
-`init::init_double_mach()` is also available (the paper's double-Mach-reflection benchmark with a polygonal domain and a moving shock).
+Other initializers in `init.rs` include `init_shock_cylinder_in_box(wall)` (the full cylinder inside a rectangular box, with `CylinderWallMode::{Reflective, HighOrder, Primitive}`), `init_rotated_shock_cylinder(wall)`, `init_planar_shock_channel()`, `init_forward_facing_step_rotated()`, and `init_double_mach()` (the paper's double-Mach-reflection benchmark).
 
 ## Project layout
 
 ```text
 .
-├── main.rs          grid/driver setup, spatial operator l(), SSP-RK3, time loop, output
-├── state.rs         State representation, pressure splits, physical fluxes, arithmetic
-├── weno.rs          WENO stencil, Roe-average eigen-decomposition, characteristic WENO5 reconstruction
-├── noncon.rs        non-conservative pressure term (6th-order derivative + upwind jumps)
-├── diffusion.rs     diffusion flux (6-point derivative of temperature)
-├── source.rs        electron-ion / electron-radiation energy exchange
-├── dt.rs            local time-step estimate
-├── constant.rs      physical and numerical constants
-├── geometry.rs      points, vectors, projections, polygons, normals
-├── field1.rs        GridInfo + Field with polygon-defined fluid region
-├── ghost.rs         GhostGrid: static ghost layout, parallel per-stage updates
-├── bc1.rs           boundary conditions (ILW wall, WENO extrapolation, far-field, LODI, ...)
-├── init.rs          initial conditions (cylinder, double Mach reflection)
-└── io.rs            binary output/restart writer and reader
+└── src/
+    ├── main.rs          grid/driver setup, spatial operator l(), SSP-RK3, time loop, output
+    ├── state.rs         State representation, pressure splits, physical fluxes, arithmetic
+    ├── weno.rs          WENO stencil, Roe-average eigen-decomposition, characteristic WENO5 reconstruction
+    ├── noncon.rs        non-conservative pressure term (6th-order derivative + upwind jumps)
+    ├── diffusion.rs     diffusion flux (6-point derivative of temperature)
+    ├── source.rs        electron-ion / electron-radiation energy exchange
+    ├── dt.rs            local time-step estimate
+    ├── constant.rs      physical and numerical constants
+    ├── geometry.rs      points, vectors, projections, polygons, analytic boundaries (line/arc/circle)
+    ├── field1.rs        GridInfo + Field with polygon-defined fluid region and analytic boundary elements
+    ├── ghost.rs         GhostGrid: static ghost layout, parallel per-stage updates
+    ├── bc1.rs           boundary conditions (ILW wall, WENO extrapolation, far-field, LODI, ...)
+    ├── init.rs          initial conditions (cylinder, shock-cylinder-in-box, double Mach reflection, ...)
+    ├── io.rs            binary output/restart writer and reader
+    └── monitor.rs       per-step diagnostics / RHS residual norms -> data/monitor.csv
 ```
 
 `bc.rs` and `field.rs` are legacy rectangular-grid variants that are no longer wired into the build (`main.rs` declares `bc1`/`field1` instead).
@@ -145,19 +178,19 @@ The cylinder arc is approximated by 360 polygon segments with `ReflectiveWall`; 
 cargo build --release
 ```
 
-Fresh run (clears `data_new/`):
+Fresh run (clears `data/`):
 
 ```bash
 cargo run --release
 ```
 
-Restart from an existing snapshot, e.g. `data_new/solution_0012.bin`:
+Restart from an existing snapshot, e.g. `data/solution_0012.bin`:
 
 ```bash
 cargo run --release -- 12
 ```
 
-The run prints the grid summary, per-step time/time-step info, and output-file writes.
+The run prints the grid summary, per-step time/time-step info, periodic wall-boundary statistics, and output-file writes. Each step also appends one diagnostics line to `data/monitor.csv` (see [Output](#output)).
 
 ## Tests
 
@@ -167,15 +200,18 @@ cargo test
 
 Test coverage includes:
 
-- WENO: eigen-decomposition (`L * R = I` for x/y), characteristic round-trip, constant-state flux preservation, WENO5 convergence order on a smooth profile.
-- noncon: constant-state and zero-velocity vanishing, direction sensitivity, wrapper consistency.
-- bc1: polynomial least-squares reproduction, derivative extraction, paper stencil `E_r` cardinality/structure on vertical and horizontal walls, constant-state characteristic extrapolation and final ghost reconstruction.
-- ghost: stencil-offset bookkeeping.
-- state: primitive-to-conservative conversion.
+- WENO (`weno.rs`): eigen-decomposition (`L * R = I` for x/y), characteristic round-trip, constant-state flux preservation, WENO5 convergence order on a smooth profile.
+- noncon (`noncon.rs`): constant-state and zero-velocity vanishing, direction sensitivity, wrapper consistency.
+- bc1 (`bc1.rs`): polynomial least-squares reproduction, derivative extraction, paper stencil `E_r` cardinality/structure on vertical and horizontal walls, constant-state characteristic extrapolation and final ghost reconstruction, ILW wall robustness and analytic-element BC resolution at junctions.
+- geometry (`geometry.rs`): analytic line/arc/circle projection and polygon classification.
+- ghost (`ghost.rs`): stencil-offset bookkeeping.
+- state (`state.rs`): primitive-to-conservative conversion.
+- monitor (`monitor.rs`): residual-norm formulas (R1/R2/Rinf), NaN-cell skipping, missing-RHS behaviour and the CSV header column layout.
+- `main.rs` (`parity` module): analytic cylinder-circle geometry and ghost projections, mirror symmetry after an RK step, and initial/admissibility checks of the primitive and high-order walls.
 
 ## Output
 
-Binary files `data_new/solution_NNNN.bin` (little endian):
+Binary files `data/solution_NNNN.bin` (little endian):
 
 ```text
 header:
@@ -192,28 +228,52 @@ payload, j-major (x fastest):
 
 Points outside the fluid polygon are stored as NaN so post-processing can mask them. Files are written to a `.tmp` name and atomically renamed, so a live visualizer never sees a partial file.
 
+### Per-step diagnostics (`monitor.rs`)
+
+Every step appends one line to `data/monitor.csv` (fresh runs truncate and rewrite the header; restarts append):
+
+- step/time/`dt`/`dt_cfl`/`dt_over_dt_cfl` and the number of fluid cells,
+- physical-health extrema (`rho`, total pressure `p`, the partial pressures `pe/pi/pr`, the internal energies `ee/ei/er`, max speed and Mach),
+- global integrals (mass, `mom_x`, `mom_y`, total energy),
+- temporal activity `||(U^{n+1} - U^n)/dt||_RMS` for the six conservative components,
+- spatial oscillation indicators (total variation `tv_rho`/`tv_p`, second-difference `s2_rho`/`s2_p`),
+- semi-discrete RHS residual norms of `dU/dt = RHS(U)`: for each conservative component (`rho`, `mom_x`, `mom_y`, `e_e`, `e_i`, `e_r`) the `R1` (mean absolute), `R2` (RMS) and `R_inf` (max absolute) norms over the valid fluid cells (columns `<component>_R1/_R2/_Rinf`).
+
+The residual is the actual RHS evaluated at the step-start state (the first RK3-SSP stage), never a time-step difference or time-integration error.
+
 ### Visualization
 
-Interactive density viewer (arrow keys step through frames, `q` quits; safe to run while the solver is still writing):
+Interactive snapshot viewer (arrow keys step through frames, `q` quits; safe to run while the solver is still writing). It reads the same `data/solution_*.bin` format through the shared reader `py_utils/solution_io.py`:
 
 ```bash
 python visualize_sol.py
 ```
 
-Additional scripts in `py_utils/`:
+Real-time single-window dashboard (5 pages: `1 Solution | 2 Health | 3 Activity | 4 Oscillation | 5 Global`), combining `data/solution_*.bin` with the live `data/monitor.csv`:
 
-- `contour_gen.py` — contour plots of a single snapshot (edit the gamma values to match `constant.rs`).
+```bash
+python scripts/live_monitor.py          # GUI
+python scripts/live_monitor.py --no-gui # headless, writes dashboard.png
+```
+
+The Activity page shows the semi-discrete RHS residual history: per-component `R1 / R2 / R_inf`, either raw or normalized by each component's own first-row reference (`R(t)/R(t_ref)`, so the first point is 1), on a logarithmic scale; the norm / raw / normalized choice is made with the radio on the page. Historical `monitor.csv` files written before the residual columns existed are still accepted (the page falls back to the temporal-activity view).
+
+Other helper scripts:
+
+- `py_utils/contour_gen.py` — contour plots of a single snapshot (edit the gamma values to match `constant.rs`).
+- `py_utils/solution_io.py` — shared binary reader used by `visualize_sol.py` and `scripts/live_monitor.py`.
 - `energy_split.py` — history of the maximum electron/ion/radiation energy splits across snapshots; writes `energy_split_history.csv`.
 - `conservation_check.py` — legacy text-format (`*.dat`) conservation check.
 
 ## Current physical parameters (`constant.rs`)
 
 ```text
+DEFAULT_EPS = 1e-12
 KAPPA_E = KAPPA_I = KAPPA_R = 0   (no diffusion)
 OMEGA_EI = OMEGA_ER = 0           (no energy exchange)
 CVE = CVI = 1, A = 1
 GAMMA_E = GAMMA_I = GAMMA_R = 1.4
-LAMBDA = 0.5, WENO_Q = 2.0, PHI = 5.0
+LAMBDA = 0.5, WENO_Q = 10.0, PHI = 5.0
 ```
 
 With these settings the code reduces to the 3-T Euler equations; diffusion and exchange terms are in place but inactive.

@@ -1115,9 +1115,9 @@ pub fn init_rotated_shock_cylinder_with(
     // ============================================================
 
     let bc_outer = vec![
-        BCType::Wall,
         BCType::ZerothOrder,
-        BCType::Wall,
+        BCType::ZerothOrder,
+        BCType::ZerothOrder,
         BCType::Constant(post),
     ];
 
@@ -1573,7 +1573,7 @@ pub fn init_planar_shock_channel_with(h: f64, shock_mach: f64, shock_x0: f64) ->
 }
 
 pub fn init_forward_facing_step_rotated() -> Field {
-    init_forward_facing_step_rotated_with(1.0 / 80.0, 8.0, 0.2, 0.0)
+    init_forward_facing_step_rotated_with(1.0 / 320.0, 3.0, 0.2, 5.0)
 }
 
 pub fn init_forward_facing_step_rotated_with(
@@ -1662,16 +1662,16 @@ pub fn init_forward_facing_step_rotated_with(
     // Physical geometry in LOCAL coordinates (xi, eta)
     // ============================================================
 
-    let xi_min = -1.0_f64;
-    let xi_max = 5.0_f64;
+    let xi_min = 0.0_f64;
+    let xi_max = 3.0_f64;
 
     let eta_min = 0.0_f64;
-    let eta_max = 1.5_f64;
+    let eta_max = 1.0_f64;
 
     let step_xi = 0.6_f64;
 
     // Keep your current slightly offset step height.
-    let step_eta = 0.2 + 0.3 * h;
+    let step_eta = 0.2;
 
     assert!(shock_xi0 > xi_min && shock_xi0 < step_xi);
 
@@ -1775,11 +1775,6 @@ pub fn init_forward_facing_step_rotated_with(
     // ============================================================
 
     let outflow_bc = BCType::ZerothOrder;
-    BCType::Outflow {
-        p_inf: p_pre,
-        sigma: 0.25,
-        l_domain: xi_max - xi_min,
-    };
 
     // ============================================================
     // Polygon BCs

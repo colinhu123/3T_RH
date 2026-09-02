@@ -75,6 +75,10 @@ struct Scratch {
     dfy: Vec<State>,
     rhs: Vec<State>,
     derived: Vec<Derived>,
+    /// Copy of the semi-discrete RHS dU/dt at the start state of the most
+    /// recent RK3-SSP step (the stage-1 RHS). Used ONLY by the residual
+    /// monitor; it never feeds back into the time integration.
+    residual: Vec<State>,
 }
 
 impl Scratch {
@@ -88,6 +92,7 @@ impl Scratch {
             dfy: vec![State::new(); nx * (ny + 1)],
             rhs: vec![State::new(); nx * ny],
             derived: vec![Derived::new(); nx * ny],
+            residual: vec![State::new(); nx * ny],
         }
     }
 }
@@ -402,6 +407,15 @@ fn rk3_ssp(
     s: &mut Scratch,
 ) {
     l(&*u, ghosts, s);
+
+    // Monitoring hook (no influence on the integration): the first l() call
+    // of an RK3-SSP step evaluates the semi-discrete operator exactly at the
+    // step-start state, i.e. RHS(U^n) = dU/dt(U^n). Keep a copy so the
+    // residual monitor can report the true RHS residual without a full extra
+    // operator evaluation. Subsequent l() calls overwrite s.rhs, hence the
+    // copy here.
+    s.residual.copy_from_slice(&s.rhs);
+
     stage_update_rhs(u, u1, &s.rhs, dt, "RK1 state");
     u1.time = u.time + dt;
 
@@ -461,9 +475,10 @@ fn main() {
         io::clear_data_folder();
     }
 
-    let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::HighOrder);
-    //let mut u = init::init_forward_facing_step_rotated();
-    let t_store_interval = 0.01_f64;
+    //let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::HighOrder);
+    let mut u = init::init_forward_facing_step_rotated();
+    //let mut u = init::init_isentropic_vortex();
+    let t_store_interval = 0.05_f64;
 
     // ---------------------------------------------------------
     // Load restart file first
@@ -513,8 +528,8 @@ fn main() {
     }
 
     while t < t_final - 1e-14 {
-        let dt_cfl = calc_global_dt(&u);
-        let mut dt = 0.5 * dt_cfl;
+        let dt_cfl = calc_global_dt(&u); 
+        let mut dt = 0.8 * dt_cfl; 
         if next_store_time <= t_final && t + dt > next_store_time {
             dt = next_store_time - t;
         }
@@ -542,7 +557,11 @@ fn main() {
         // After rk3_ssp the mem::swap left U^{n+1} in `u` and the
         // pre-step U^n in `u3`, so the temporal norm reuses the existing
         // buffer without cloning the solution.
-        monitor.write_step(n, &u, Some(&u3), dt, dt_cfl);
+        //
+        // scratch.residual holds the semi-discrete RHS dU/dt evaluated at the
+        // pre-step state U^n (stage-1 RHS of this step); the monitor reduces
+        // it to the per-component R1 / R2 / R_inf residual norms.
+        monitor.write_step(n, &u, Some(&u3), dt, dt_cfl, Some(&scratch.residual));
         if n % 100 == 0 {
             bc1::print_ilw_wall_statistics();
             bc1::print_reflective_wall_statistics();

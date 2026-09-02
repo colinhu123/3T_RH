@@ -3,7 +3,7 @@ use crate::field1::Field;
 use crate::state::{Derived, State};
 
 use std::fs::{File, OpenOptions, create_dir_all};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 // ============================================================
@@ -76,10 +76,57 @@ struct Stats {
     // second-difference indicator
     s2_rho: f64,
     s2_p: f64,
+
+    // --------------------------------------------------------------
+    // Semi-discrete RHS residual norms, per conservative component in the
+    // fixed order [rho, mom_x, mom_y, ee, ei, er] (see RES_COMPONENTS).
+    //
+    // For a valid cell set {i} with N members and per-cell RHS r_k(i):
+    //   R1_k   = (1/N) * sum_i |r_k(i)|          (mean absolute)
+    //   R2_k   = sqrt( (1/N) * sum_i r_k(i)^2 )  (RMS)
+    //   Rinf_k = max_i |r_k(i)|                  (max absolute)
+    // --------------------------------------------------------------
+    res_r1: [f64; 6],
+    res_r2: [f64; 6],
+    res_rinf: [f64; 6],
 }
 
+/// Conservative-variable order shared by the residual-norm arrays and the
+/// CSV column names written by Monitor. The entries are the exact column
+/// prefixes used in the header (e_e / e_i / e_r, matching the internal
+/// energy compartments ee / ei / er).
+const RES_COMPONENTS: [&str; 6] = ["rho", "mom_x", "mom_y", "e_e", "e_i", "e_r"];
+
 impl Monitor {
+    /// CSV header written by the current build. New residual columns are
+    /// appended at the END so the position of every pre-existing column is
+    /// unchanged (readers that index by name or position keep working).
+    fn header_string() -> String {
+        concat!(
+            "step,time,dt,dt_cfl,dt_over_dt_cfl,",
+            "n_fluid,",
+            "rho_min,rho_max,",
+            "p_min,p_max,",
+            "pe_min,pi_min,pr_min,",
+            "ee_int_min,ei_int_min,er_int_min,",
+            "speed_max,mach_max,",
+            "mass,mom_x,mom_y,total_energy,",
+            "drho_dt_l2,dmom_x_dt_l2,dmom_y_dt_l2,",
+            "dee_dt_l2,dei_dt_l2,der_dt_l2,",
+            "tv_rho,tv_p,",
+            "s2_rho,s2_p,",
+            "rho_R1,rho_R2,rho_Rinf,",
+            "mom_x_R1,mom_x_R2,mom_x_Rinf,",
+            "mom_y_R1,mom_y_R2,mom_y_Rinf,",
+            "e_e_R1,e_e_R2,e_e_Rinf,",
+            "e_i_R1,e_i_R2,e_i_Rinf,",
+            "e_r_R1,e_r_R2,e_r_Rinf"
+        )
+        .to_string()
+    }
+
     pub fn new(path: &str, append: bool) -> Self {
+        let header = Self::header_string();
         let exists = Path::new(path).exists();
 
         // Make sure the parent directory exists (data/ may be deleted by
@@ -90,6 +137,28 @@ impl Monitor {
                 create_dir_all(parent).unwrap_or_else(|e| {
                     panic!("cannot create monitor dir {}: {}", parent.display(), e)
                 });
+            }
+        }
+
+        // Appending to a file written by an OLDER build (whose header lacks
+        // the residual columns) would produce a row/column count mismatch and
+        // corrupt the CSV. In that case fall back to a fresh file instead of
+        // silently mislabelling data.
+        let mut append = append;
+        if append && exists {
+            if let Ok(mut f) = File::open(path) {
+                let mut first = String::new();
+                if BufReader::new(&mut f).read_line(&mut first).is_ok() {
+                    let existing = first.trim_end_matches(['\r', '\n']);
+                    if existing != header {
+                        eprintln!(
+                            "monitor: existing {} has a stale header (schema changed); \
+                             starting a fresh monitor file",
+                            path
+                        );
+                        append = false;
+                    }
+                }
             }
         }
 
@@ -104,24 +173,7 @@ impl Monitor {
         let mut writer = BufWriter::new(file);
 
         if !append || !exists {
-            writeln!(
-                writer,
-                concat!(
-                    "step,time,dt,dt_cfl,dt_over_dt_cfl,",
-                    "n_fluid,",
-                    "rho_min,rho_max,",
-                    "p_min,p_max,",
-                    "pe_min,pi_min,pr_min,",
-                    "ee_int_min,ei_int_min,er_int_min,",
-                    "speed_max,mach_max,",
-                    "mass,mom_x,mom_y,total_energy,",
-                    "drho_dt_l2,dmom_x_dt_l2,dmom_y_dt_l2,",
-                    "dee_dt_l2,dei_dt_l2,der_dt_l2,",
-                    "tv_rho,tv_p,",
-                    "s2_rho,s2_p"
-                )
-            )
-            .expect("failed writing monitor header");
+            writeln!(writer, "{}", header).expect("failed writing monitor header");
         }
 
         Self {
@@ -137,10 +189,24 @@ impl Monitor {
         u_old: Option<&Field>,
         dt: f64,
         dt_cfl: f64,
+        rhs: Option<&[State]>,
     ) {
-        let s = compute_stats(u, u_old, dt);
+        let s = compute_stats(u, u_old, dt, rhs);
 
         let dt_ratio = if dt_cfl > 0.0 { dt / dt_cfl } else { f64::NAN };
+
+        // The 18 residual columns are appended after the legacy fields; they
+        // are formatted separately so the original format string stays intact.
+        // The main format string already supplies the separating comma before
+        // `{}`, so the tail carries the 18 values WITHOUT a leading comma.
+        let mut tail_parts: Vec<String> = Vec::with_capacity(6);
+        for k in 0..6 {
+            tail_parts.push(format!(
+                "{:.16e},{:.16e},{:.16e}",
+                s.res_r1[k], s.res_r2[k], s.res_rinf[k]
+            ));
+        }
+        let tail = tail_parts.join(",");
 
         writeln!(
             self.writer,
@@ -156,7 +222,8 @@ impl Monitor {
                 "{:.16e},{:.16e},{:.16e},",
                 "{:.16e},{:.16e},{:.16e},",
                 "{:.16e},{:.16e},",
-                "{:.16e},{:.16e}"
+                "{:.16e},{:.16e},",
+                "{}"
             ),
             step,
             u.time,
@@ -190,6 +257,7 @@ impl Monitor {
             s.tv_p,
             s.s2_rho,
             s.s2_p,
+            tail,
         )
         .expect("failed writing monitor data");
 
@@ -214,10 +282,64 @@ fn pressure(s: State) -> f64 {
 }
 
 // ============================================================
+// Semi-discrete RHS residual norms
+// ============================================================
+
+/// Reduce a per-cell RHS buffer (dU/dt) to the three residual norms of each
+/// conservative component.
+///
+/// `rhs` holds the solver's semi-discrete operator output RHS(U), one `State`
+/// per grid cell. Only fluid cells whose RHS is fully finite enter the
+/// statistics; cells containing NaN/Inf (which would otherwise pollute the
+/// norms) are skipped, mirroring the "valid computational cells" rule of the
+/// monitor. Cell count is therefore the number of cells actually summed, not
+/// necessarily `n_fluid`.
+///
+/// Component order is RES_COMPONENTS = [rho, mom_x, mom_y, ee, ei, er].
+/// Returns (R1, R2, Rinf) arrays; all NaN when no RHS is supplied.
+fn residual_norms(rhs: Option<&[State]>, fluid: &[bool]) -> ([f64; 6], [f64; 6], [f64; 6]) {
+    let Some(rhs) = rhs else {
+        return ([f64::NAN; 6], [f64::NAN; 6], [f64::NAN; 6]);
+    };
+
+    let mut r1 = [0.0f64; 6];
+    let mut r2 = [0.0f64; 6];
+    let mut rinf = [0.0f64; 6];
+    let mut n = 0usize;
+
+    let ncell = rhs.len().min(fluid.len());
+    for l in 0..ncell {
+        if !fluid[l] {
+            continue;
+        }
+        let s = rhs[l];
+        let vals = [s.rho, s.mom_x, s.mom_y, s.ee, s.ei, s.er];
+        if !vals.iter().all(|v| v.is_finite()) {
+            continue; // never let NaN / inf pollute a residual norm
+        }
+        n += 1;
+        for (k, &v) in vals.iter().enumerate() {
+            let a = v.abs();
+            r1[k] += a;
+            r2[k] += a * a;
+            rinf[k] = rinf[k].max(a);
+        }
+    }
+
+    let inv_n = if n > 0 { 1.0 / n as f64 } else { 0.0 };
+    for k in 0..6 {
+        r1[k] *= inv_n;
+        r2[k] = (r2[k] * inv_n).sqrt();
+    }
+
+    (r1, r2, rinf)
+}
+
+// ============================================================
 // Main diagnostic calculation
 // ============================================================
 
-fn compute_stats(field: &Field, old: Option<&Field>, dt: f64) -> Stats {
+fn compute_stats(field: &Field, old: Option<&Field>, dt: f64, rhs: Option<&[State]>) -> Stats {
     let nx = field.grid.nx;
     let ny = field.grid.ny;
     let dx = field.grid.dx;
@@ -496,6 +618,9 @@ fn compute_stats(field: &Field, old: Option<&Field>, dt: f64) -> Stats {
         }
     }
 
+    // Semi-discrete RHS residual norms over the valid (fluid, finite) cells.
+    let (res_r1, res_r2, res_rinf) = residual_norms(rhs, &field.fluid);
+
     Stats {
         n_fluid,
 
@@ -533,5 +658,90 @@ fn compute_stats(field: &Field, old: Option<&Field>, dt: f64) -> Stats {
 
         s2_rho,
         s2_p,
+
+        res_r1,
+        res_r2,
+        res_rinf,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residual_norms_formulas() {
+        // Two valid fluid cells; a third cell is solid and must be excluded.
+        let fluid = vec![true, true, false];
+        let mut rhs = vec![State::new(); 3];
+        rhs[0].rho = 2.0;
+        rhs[0].mom_x = 1.0;
+        rhs[1].rho = -4.0;
+        rhs[1].mom_x = 2.0;
+
+        let (r1, r2, rinf) = residual_norms(Some(&rhs), &fluid);
+
+        // rho: values 2, -4  -> |r|: 2, 4
+        let tol = 1e-12;
+        assert!((r1[0] - 3.0).abs() < tol, "R1 rho = {}", r1[0]);
+        assert!((r2[0] - (10.0f64).sqrt()).abs() < tol, "R2 rho = {}", r2[0]);
+        assert!((rinf[0] - 4.0).abs() < tol, "Rinf rho = {}", rinf[0]);
+
+        // mom_x: values 1, 2
+        assert!((r1[1] - 1.5).abs() < tol, "R1 mom_x = {}", r1[1]);
+        assert!((r2[1] - 2.5f64.sqrt()).abs() < tol, "R2 mom_x = {}", r2[1]);
+        assert!((rinf[1] - 2.0).abs() < tol, "Rinf mom_x = {}", rinf[1]);
+
+        // Cells never written keep zero norms.
+        assert!(r1[2] == 0.0 && r2[2] == 0.0 && rinf[2] == 0.0);
+    }
+
+    #[test]
+    fn residual_norms_skip_nonfinite_cells() {
+        // A NaN RHS in an otherwise fluid cell must not poison the norms; the
+        // offending cell is simply not counted.
+        let fluid = vec![true, true, true];
+        let mut rhs = vec![State::new(); 3];
+        rhs[0].rho = 1.0;
+        rhs[1].rho = f64::NAN;
+        rhs[2].rho = 3.0;
+
+        let (r1, r2, rinf) = residual_norms(Some(&rhs), &fluid);
+
+        let tol = 1e-12;
+        assert!((r1[0] - 2.0).abs() < tol, "R1 rho = {}", r1[0]);
+        assert!((r2[0] - 5.0f64.sqrt()).abs() < tol, "R2 rho = {}", r2[0]);
+        assert!((rinf[0] - 3.0).abs() < tol, "Rinf rho = {}", rinf[0]);
+        assert!(r1[0].is_finite() && r2[0].is_finite() && rinf[0].is_finite());
+    }
+
+    #[test]
+    fn no_rhs_yields_nan_norms() {
+        let fluid = vec![true];
+        let (r1, r2, rinf) = residual_norms(None, &fluid);
+        assert!(r1.iter().all(|v| v.is_nan()));
+        assert!(r2.iter().all(|v| v.is_nan()));
+        assert!(rinf.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn header_has_residual_columns_in_component_major_order() {
+        let header = Monitor::header_string();
+
+        let tail: Vec<String> = RES_COMPONENTS
+            .iter()
+            .flat_map(|c| {
+                ["R1", "R2", "Rinf"]
+                    .iter()
+                    .map(move |n| format!("{}_{}", c, n))
+            })
+            .collect();
+        let tail_csv = format!(",{}", tail.join(","));
+
+        assert!(
+            header.ends_with(&tail_csv),
+            "header must end with the residual columns, got ...{}",
+            &header[header.len().saturating_sub(120)..]
+        );
     }
 }

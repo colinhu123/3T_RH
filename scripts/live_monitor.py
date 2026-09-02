@@ -60,7 +60,7 @@ GAMMA_R = 1.4
 PAGE_TITLES = [
     "Solution",
     "Physical Health",
-    "Temporal Activity",
+    "Activity / Residual",
     "Oscillation",
     "Global Quantities",
 ]
@@ -87,6 +87,52 @@ VARIABLE_TITLES = {
 VARIABLE_COLORBAR = {
     "vorticity": r"$\omega_z$",
 }
+
+# ============================================================
+# RHS residual configuration
+#
+# The Rust solver (src/monitor.rs) writes, for each conservative component,
+# three residual norms of the semi-discrete RHS dU/dt = RHS(U):
+#   R1_k   = (1/N) sum_i |r_k(i)|          (mean absolute)
+#   R2_k   = sqrt((1/N) sum_i r_k(i)^2)    (RMS)
+#   Rinf_k = max_i |r_k(i)|                (max absolute)
+# Column layout:  <component>_R1/_R2/_Rinf  (e.g. rho_R1, mom_x_R2, e_r_Rinf).
+# Normalized columns <component>_R<n>_norm = R / R_ref are derived at read
+# time with R_ref = the first valid value of that column (see _derived_frame).
+# ============================================================
+
+RESIDUAL_COMPONENTS = ["rho", "mom_x", "mom_y", "e_e", "e_i", "e_r"]
+RESIDUAL_NORMS = ["R1", "R2", "Rinf"]
+RESIDUAL_NORM_DISPLAY = {"R1": "R1", "R2": "R2 (RMS)", "Rinf": "R_inf"}
+
+# Reference-residual guard: if the reference residual is <= this the
+# normalized residual is meaningless (division by ~0) and is pinned to 0.
+# 1e-12 mirrors constant::DEFAULT_EPS, the tolerance used throughout the Rust
+# solver for double-precision smoothness/round-off checks.
+RESIDUAL_NORM_EPS = 1e-12
+
+
+def residual_col(component, norm):
+    """Raw CSV column holding residual norm ``norm`` of ``component``."""
+    return "{}_{}".format(component, norm)
+
+
+def residual_norm_col(component, norm):
+    """Derived column holding the normalized residual (R / R_ref)."""
+    return "{}_{}_norm".format(component, norm)
+
+
+# (radio label, norm, normalized?) choices for the Activity page residual view.
+RESIDUAL_MODES = [
+    ("R2  normalized", "R2", True),
+    ("R2  raw", "R2", False),
+    ("R1  normalized", "R1", True),
+    ("R1  raw", "R1", False),
+    ("R_inf  normalized", "Rinf", True),
+    ("R_inf  raw", "Rinf", False),
+]
+
+DEFAULT_RESIDUAL_MODE = 0
 
 
 def _log(msg):
@@ -559,7 +605,17 @@ class SimulationData:
         return False
 
     def _derived_frame(self, df):
-        """Add *_rel relative-change columns with a guarded baseline Q0."""
+        """Add derived columns to a monitor history frame.
+
+        * ``<base>_rel`` relative change of the global integrals, baseline Q0 =
+          first valid value (guarded like the old monitor).
+        * ``<comp>_R<n>_norm`` normalized RHS residual
+          ``R(t) / R(t_ref)`` with ``t_ref`` = the first valid data point of
+          that column, exactly the task definition. Guarding: if the reference
+          is 0 / non-finite (within RESIDUAL_NORM_EPS) the ratio is
+          meaningless, so the normalized value is pinned to 0 instead of
+          dividing by zero.
+        """
         out = df.copy()
         for base in ("mass", "mom_x", "total_energy"):
             if base not in out.columns:
@@ -575,6 +631,26 @@ class SimulationData:
                 out[base + "_rel"] = (series - q0) / abs(q0)
             else:
                 out[base + "_rel"] = series - q0
+
+        # Per-component, per-norm normalized RHS residual: each component uses
+        # its OWN reference value (rho / momentum / energy differ in scale, so
+        # no single global reference is used).
+        for comp in RESIDUAL_COMPONENTS:
+            for norm in RESIDUAL_NORMS:
+                col = residual_col(comp, norm)
+                if col not in out.columns:
+                    continue
+                series = pd.to_numeric(out[col], errors="coerce")
+                finite = series.dropna()
+                if finite.empty:
+                    continue
+                ref = float(finite.iloc[0])
+                if np.isfinite(ref) and ref > RESIDUAL_NORM_EPS:
+                    out[col + "_norm"] = series / ref
+                else:
+                    # Zero / near-zero reference: division by R_ref is
+                    # undefined, so report a flat 0 (never inf/NaN pollution).
+                    out[col + "_norm"] = 0.0
         return out
 
     def refresh_monitor(self):
@@ -625,17 +701,29 @@ class SimulationData:
 class Panel:
     """One axes with a set of lines, autoscaling, optional y=0 line and an
     optional current-snapshot vertical marker. Columns absent from the CSV are
-    skipped (one-time warning)."""
+    skipped (one-time warning).
+
+    ``log_floor`` (residual pages): before plotting/autoscaling, values <= 0
+    are turned into NaN so the logarithmic scale is never forced to linear by
+    a handful of exactly-zero points (e.g. a fully converged residual).
+    """
 
     def __init__(self, ax, columns, present, warn, ylabel, xlabel,
-                 log_ok=False, ref_zero=False, marker=False):
+                 log_ok=False, ref_zero=False, marker=False, log_floor=False,
+                 legend_title=None):
         self.ax = ax
         self.lines = []
         self.log_ok = log_ok
         self.ref_zero = ref_zero
+        self.log_floor = log_floor
+        # full set of columns that may ever be plotted on this panel; used by
+        # reconfigure() so it never re-asks for missing-column warnings.
+        self.available = set(present)
+        self.columns = list(columns)
+        self.legend_title = legend_title
 
         for col, label in columns:
-            if col not in present:
+            if col not in self.available:
                 if warn is not None:
                     warn(col)
                 continue
@@ -646,7 +734,8 @@ class Panel:
             ax.axhline(0.0, color="k", lw=0.8, ls="--", alpha=0.5, zorder=0)
 
         if self.lines:
-            ax.legend(loc="best", fontsize="small", ncol=2)
+            ax.legend(loc="best", fontsize="small", ncol=2,
+                      title=legend_title, title_fontsize="small")
 
         ax.set_ylabel(ylabel)
         ax.set_xlabel(xlabel)
@@ -656,6 +745,45 @@ class Panel:
         if marker:
             self.marker = ax.axvline(0.0, color="tab:red", lw=1.2, ls="--",
                                      alpha=0.85, zorder=5)
+
+    def _plottable(self, values):
+        """Apply the log-floor mask when the panel plots on a log scale."""
+        v = np.asarray(values, dtype=float)
+        if self.log_floor:
+            v = np.where(np.isfinite(v) & (v > 0.0), v, np.nan)
+        return v
+
+    def reconfigure(self, columns, ylabel, title=None, legend_title=None):
+        """Swap the plotted series without rebuilding the axes.
+
+        Used by the Activity-page residual radio to switch norm / raw /
+        normalized on the fly. Old artists and legend are removed first.
+        """
+        for _, line in self.lines:
+            try:
+                line.remove()
+            except Exception:
+                pass
+        self.lines = []
+        self.columns = list(columns)
+        self.legend_title = legend_title
+
+        leg = self.ax.get_legend()
+        if leg is not None:
+            leg.remove()
+
+        for col, label in columns:
+            if col in self.available:
+                line, = self.ax.plot([], [], label=label, lw=1.2)
+                self.lines.append((col, line))
+
+        if self.lines:
+            self.ax.legend(loc="best", fontsize="small", ncol=2,
+                           title=legend_title, title_fontsize="small")
+
+        self.ax.set_ylabel(ylabel)
+        if title is not None:
+            self.ax.set_title(title, fontsize=10)
 
     def update(self, df, xcol, marker_time=None):
         if df is None or len(df) == 0:
@@ -672,7 +800,7 @@ class Panel:
 
         for col, line in self.lines:
             if col in df.columns:
-                line.set_data(xs, sanitize_series(df[col]))
+                line.set_data(xs, self._plottable(sanitize_series(df[col])))
             else:
                 line.set_data([], [])
 
@@ -700,8 +828,11 @@ class Panel:
             xmax += 0.5
         self.ax.set_xlim(xmin, xmax)
 
-        yvals = [sanitize_series(df[col]) for col, _ in self.lines
-                 if col in df.columns]
+        yvals = []
+        for col, _ in self.lines:
+            if col not in df.columns:
+                continue
+            yvals.append(self._plottable(sanitize_series(df[col])))
         if not yvals:
             return
         ys = np.concatenate([v for v in yvals if v.size])
@@ -756,6 +887,11 @@ class Dashboard:
         self.current_page = 0
         self.live_follow = True
         self.selected_variable = "rho"
+
+        # Activity-page residual view: which norm (R1/R2/R_inf) and whether
+        # the raw or normalized residual is displayed.
+        self._res_mode_index = DEFAULT_RESIDUAL_MODE
+        self._res_panel = None
 
         self.fig = None
         self.page_area = None
@@ -867,6 +1003,7 @@ class Dashboard:
 
         self._mesh = None
         self._sol_ax = None
+        self._res_panel = None
 
     def _set_title(self, title):
         self.title_text.set_text(f"3T-RH Simulation Dashboard  \u2014  {title}")
@@ -1060,6 +1197,16 @@ class Dashboard:
         xlabel = "Time" if self.data.xcol == "time" else "Step"
         marker = (self.data.xcol == "time")
         present = set(cols)
+
+        # Page 3 (Activity): when the CSV carries the RHS residual columns,
+        # show the residual view (normalized by default) plus the legacy
+        # temporal-activity panel. Without residual columns the page falls
+        # back to the old temporal-activity layout, so historical CSVs are
+        # still fully supported.
+        if page == 2 and self._residual_data_ready(present):
+            self._build_residual_activity_page(cols, xlabel, marker, present)
+            return
+
         specs = self._monitor_specs(page, present)
 
         sg = self.page_area.subgridspec(len(specs), 1, hspace=0.45)
@@ -1075,6 +1222,142 @@ class Dashboard:
             self._panels.append(pan)
 
         self._update_monitor_panels()
+
+    def _residual_data_ready(self, present):
+        """True when every raw RHS residual column expected by the Activity
+        page is present in the CSV header."""
+        return all(
+            residual_col(comp, norm) in present
+            for comp in RESIDUAL_COMPONENTS
+            for norm in RESIDUAL_NORMS
+        )
+
+    def _build_residual_activity_page(self, cols, xlabel, marker, present):
+        """Page 3 layout when residual columns are available.
+
+        Left: two stacked panels
+            [0] semi-discrete RHS residual (norm / raw / normalized switchable
+                through the radio on the right; default = normalized R2)
+            [1] legacy temporal activity  ||(U^{n+1}-U^n)/dt||_RMS  (kept)
+        Right: vertical radio to pick R1 / R2 / R_inf x raw / normalized.
+        """
+        fig = self.fig
+
+        # *_norm derived columns exist only once the file has data rows; they
+        # are still declared up-front so the normalized view works as soon as
+        # the first row arrives (reconfigure filters by what df actually has).
+        avail = set(cols)
+        for comp in RESIDUAL_COMPONENTS:
+            for norm in RESIDUAL_NORMS:
+                if residual_col(comp, norm) in avail:
+                    avail.add(residual_norm_col(comp, norm))
+        if self.data.plot_df is not None:
+            avail |= set(self.data.plot_df.columns)
+
+        has_temporal = any(
+            c in avail for c in (
+                "drho_dt_l2", "dmom_x_dt_l2", "dmom_y_dt_l2",
+                "dee_dt_l2", "dei_dt_l2", "der_dt_l2",
+            )
+        )
+        nrows = 2 if has_temporal else 1
+
+        sg = self.page_area.subgridspec(
+            1, 2, width_ratios=[0.80, 0.20], wspace=0.06
+        )
+        main_sg = sg[0, 0].subgridspec(nrows, 1, hspace=0.5)
+        radio_ax = fig.add_subplot(sg[0, 1])
+        self._page_axes.append(radio_ax)
+
+        self._panels = []
+
+        res_ax = fig.add_subplot(main_sg[0, 0])
+        self._page_axes.append(res_ax)
+        self._res_panel = None
+
+        labels = [m[0] for m in RESIDUAL_MODES]
+        idx = max(0, min(self._res_mode_index, len(labels) - 1))
+        radio = self.RadioButtons(radio_ax, labels, active=idx)
+        radio.set_label_props({"fontsize": [7.5] * len(labels)})
+        radio_ax.set_title("RHS residual", fontsize=9, pad=3)
+        radio.on_clicked(self._on_residual_mode)
+        self._radio = radio
+
+        res_panel = Panel(
+            res_ax, [], avail, None, "", xlabel,
+            log_ok=True, marker=marker, log_floor=True,
+        )
+        self._panels.append(res_panel)
+        self._res_panel = res_panel
+
+        # Apply the currently selected norm / raw / normalized mode; this also
+        # draws the six component lines with the correct labels/scale.
+        self._apply_residual_mode()
+
+        if has_temporal:
+            tact_ax = fig.add_subplot(main_sg[1, 0])
+            self._page_axes.append(tact_ax)
+            tact = Panel(
+                tact_ax,
+                [("drho_dt_l2", "d(rho)/dt"), ("dmom_x_dt_l2", "d(mom_x)/dt"),
+                 ("dmom_y_dt_l2", "d(mom_y)/dt"), ("dee_dt_l2", "d(ee)/dt"),
+                 ("dei_dt_l2", "d(ei)/dt"), ("der_dt_l2", "d(er)/dt")],
+                avail, self._warn_missing,
+                "RMS ||(U^{n+1} - U^n)/dt||", xlabel,
+                log_ok=True, marker=marker, log_floor=True,
+            )
+            self._panels.append(tact)
+
+        self._update_monitor_panels()
+
+    def _residual_mode(self):
+        """(norm, normalized) selected by the Activity-page radio."""
+        labels = [m[0] for m in RESIDUAL_MODES]
+        idx = max(0, min(self._res_mode_index, len(labels) - 1))
+        return RESIDUAL_MODES[idx][1], RESIDUAL_MODES[idx][2]
+
+    def _on_residual_mode(self, label):
+        labels = [m[0] for m in RESIDUAL_MODES]
+        if label not in labels:
+            return
+        self._res_mode_index = labels.index(label)
+        self._apply_residual_mode()
+        self._update_monitor_panels()
+        self.fig.canvas.draw_idle()
+
+    def _apply_residual_mode(self):
+        """(Re)configure the residual panel for the selected norm / mode.
+
+        Six component lines; the selected norm and raw/normalized state are
+        spelled out in the title, y-label and legend title so a user always
+        knows which residual definition is shown.
+        """
+        if self._res_panel is None:
+            return
+        norm, normalized = self._residual_mode()
+        norm_disp = RESIDUAL_NORM_DISPLAY.get(norm, norm)
+
+        columns = []
+        for comp in RESIDUAL_COMPONENTS:
+            if normalized:
+                col = residual_norm_col(comp, norm)
+            else:
+                col = residual_col(comp, norm)
+            columns.append((col, comp))
+
+        if normalized:
+            mode_word = "normalized  R/R_ref  (t_ref = first row)"
+            ylabel = "normalized RHS residual  R / R_ref"
+        else:
+            mode_word = "raw"
+            ylabel = "raw RHS residual magnitude"
+
+        title = f"Semi-discrete RHS residual dU/dt=RHS(U)  |  {norm_disp}  {mode_word}"
+        legend_title = f"{norm_disp}  ({'normalized' if normalized else 'raw'})"
+
+        self._res_panel.reconfigure(
+            columns, ylabel, title=title, legend_title=legend_title,
+        )
 
     def _warn_missing(self, col):
         if col not in self.data.warned_cols:

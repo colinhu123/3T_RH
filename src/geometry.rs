@@ -132,7 +132,7 @@ pub enum FluidSide {
     Outside,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Polygon {
     pub points: Vec<Point>,
     pub fluid: FluidSide,
@@ -518,6 +518,27 @@ impl Circle {
             distance,
         }
     }
+
+    /// Sample the complete circle into a closed polygon vertex ring whose
+    /// largest chord is at most `chord_max`. The first vertex is not
+    /// repeated: the ring is closed implicitly by the polygon edges.
+    pub fn sample_points(&self, chord_max: f64) -> Vec<Point> {
+        assert!(chord_max > 0.0, "chord_max must be positive");
+        let r = self.radius.abs();
+
+        let per_seg = 2.0 * (chord_max.min(2.0 * r) / (2.0 * r)).asin();
+        let n = ((2.0 * std::f64::consts::PI / per_seg).ceil().max(3.0)) as usize;
+
+        (0..n)
+            .map(|i| {
+                let theta = i as f64 / n as f64 * 2.0 * std::f64::consts::PI;
+                Point {
+                    x: self.center.x + self.radius * theta.cos(),
+                    y: self.center.y + self.radius * theta.sin(),
+                }
+            })
+            .collect()
+    }
 }
 
 // ============================================================================
@@ -659,6 +680,27 @@ impl CircularArc {
             x: self.center.x + self.radius * theta_end.cos(),
             y: self.center.y + self.radius * theta_end.sin(),
         }
+    }
+
+    /// Sample the finite arc into an ordered polyline (both endpoints
+    /// included) whose largest chord is at most `chord_max`.
+    pub fn sample_points(&self, chord_max: f64) -> Vec<Point> {
+        assert!(chord_max > 0.0, "chord_max must be positive");
+        let r = self.radius.abs();
+
+        // Central angle per segment so that the chord <= chord_max.
+        let per_seg = 2.0 * (chord_max.min(2.0 * r) / (2.0 * r)).asin();
+        let n = ((self.sweep.abs() / per_seg).ceil().max(1.0)) as usize;
+
+        (0..=n)
+            .map(|i| {
+                let theta = self.theta_start + self.sweep * (i as f64 / n as f64);
+                Point {
+                    x: self.center.x + self.radius * theta.cos(),
+                    y: self.center.y + self.radius * theta.sin(),
+                }
+            })
+            .collect()
     }
 
     /// Exact closest point on the finite arc.
@@ -841,6 +883,96 @@ impl BoundaryGeometry {
             BoundaryGeometry::Circle(c) => c.radius,
         }
     }
+}
+
+// ============================================================================
+// Polygonizing analytic boundaries into the domain-classifier Polygon.
+//
+// The BoundaryElements are the authoritative boundary description; the
+// returned Polygon is derived (sampled) data used only for the fluid-mask /
+// Outer-vs-Inner classification. A list of Line/Arc elements is sampled in
+// chain order and must form a closed loop; a single Circle is sampled to a
+// full ring.
+// ============================================================================
+
+const CHAIN_CLOSE_TOL: f64 = 1e-8;
+
+fn push_chain_point(pts: &mut Vec<Point>, p: Point) {
+    if let Some(&last) = pts.last() {
+        if (last.x - p.x).hypot(last.y - p.y) <= CHAIN_CLOSE_TOL {
+            return;
+        }
+    }
+    pts.push(p);
+}
+
+/// Build a closed classifier polygon from ordered analytic boundary
+/// elements.
+///
+/// * `elements` empty is an error (an absent boundary is represented by not
+///   calling this function / by `Option::None`, not by an empty polygon).
+/// * a single `Circle` element is sampled to a closed vertex ring;
+/// * otherwise every element must be a `Line` or `Arc`, listed in chain
+///   order, whose last endpoint returns to the first start (tolerance
+///   `CHAIN_CLOSE_TOL`).
+///
+/// The ray-casting `is_fluid` is winding-independent, so `fluid` states the
+/// semantic side directly (outer boundary => `Inside`, obstacle => `Outside`).
+pub fn polygonize_boundary(
+    elements: &[BoundaryGeometry],
+    chord_max: f64,
+    fluid: FluidSide,
+) -> Polygon {
+    assert!(chord_max > 0.0, "chord_max must be positive");
+    assert!(!elements.is_empty(), "cannot polygonize an empty boundary");
+
+    let mut pts: Vec<Point> = Vec::new();
+
+    if elements.len() == 1 {
+        if let BoundaryGeometry::Circle(c) = &elements[0] {
+            for p in c.sample_points(chord_max) {
+                push_chain_point(&mut pts, p);
+            }
+            assert!(
+                pts.len() >= 3,
+                "sampled circle must have at least 3 vertices"
+            );
+            return Polygon::new(pts, fluid);
+        }
+    }
+
+    for e in elements {
+        match e {
+            BoundaryGeometry::Line(l) => {
+                push_chain_point(&mut pts, l.start);
+                push_chain_point(&mut pts, l.end);
+            }
+            BoundaryGeometry::Arc(a) => {
+                for p in a.sample_points(chord_max) {
+                    push_chain_point(&mut pts, p);
+                }
+            }
+            BoundaryGeometry::Circle(_) => {
+                panic!("Circle element cannot be combined into a chained boundary");
+            }
+        }
+    }
+
+    // If the chain literally returns to its first vertex, drop the duplicate
+    // (the polygon edge list closes implicitly from last to first).
+    if let (Some(&first), Some(&last)) = (pts.first(), pts.last()) {
+        if (first.x - last.x).hypot(first.y - last.y) <= CHAIN_CLOSE_TOL {
+            pts.pop();
+        }
+    }
+
+    assert!(
+        pts.len() >= 3,
+        "polygonized boundary must have at least 3 vertices (got {})",
+        pts.len()
+    );
+
+    Polygon::new(pts, fluid)
 }
 
 #[cfg(test)]
@@ -1271,5 +1403,112 @@ mod circle_tests {
         // Must panic rather than silently divide by zero.
         let c = unit_circle_outside();
         let _ = c.project(Point { x: 0.0, y: 0.0 });
+    }
+}
+
+#[cfg(test)]
+mod polygonize_tests {
+    use super::*;
+
+    fn assert_close(a: f64, b: f64, tol: f64) {
+        assert!((a - b).abs() < tol, "{} vs {}", a, b);
+    }
+
+    #[test]
+    fn circle_ring_is_closed_and_dense_enough() {
+        let c = Circle::new(Point { x: 0.0, y: 0.0 }, 1.0, FluidSide::Outside);
+        let pts = c.sample_points(0.1);
+        assert!(pts.len() >= 3);
+        // largest chord <= chord_max
+        let mut max_chord = 0.0f64;
+        for w in pts.windows(2) {
+            let d = (w[1].x - w[0].x).hypot(w[1].y - w[0].y);
+            max_chord = max_chord.max(d);
+        }
+        let last = (pts[0].x - pts[pts.len() - 1].x).hypot(pts[0].y - pts[pts.len() - 1].y);
+        max_chord = max_chord.max(last);
+        assert!(max_chord <= 0.1 + 1e-12, "max chord {}", max_chord);
+
+        let poly = polygonize_boundary(
+            &[BoundaryGeometry::Circle(c)],
+            0.1,
+            FluidSide::Outside,
+        );
+        // points inside the disk are NOT fluid (Outside), outside IS fluid.
+        assert!(!poly.is_fluid(Point { x: 0.0, y: 0.0 }));
+        assert!(!poly.is_fluid(Point { x: 0.5, y: 0.0 }));
+        assert!(poly.is_fluid(Point { x: 2.0, y: 0.0 }));
+        assert!(poly.is_fluid(Point { x: 0.0, y: 2.0 }));
+    }
+
+    #[test]
+    fn line_chain_polygonizes_and_closes() {
+        let rect = polygonize_boundary(
+            &[
+                BoundaryGeometry::Line(LineSegment::new(
+                    Point { x: 0.0, y: 0.0 },
+                    Point { x: 1.0, y: 0.0 },
+                    Vec2 { x: 0.0, y: -1.0 },
+                )),
+                BoundaryGeometry::Line(LineSegment::new(
+                    Point { x: 1.0, y: 0.0 },
+                    Point { x: 1.0, y: 1.0 },
+                    Vec2 { x: 1.0, y: 0.0 },
+                )),
+                BoundaryGeometry::Line(LineSegment::new(
+                    Point { x: 1.0, y: 1.0 },
+                    Point { x: 0.0, y: 1.0 },
+                    Vec2 { x: 0.0, y: 1.0 },
+                )),
+                BoundaryGeometry::Line(LineSegment::new(
+                    Point { x: 0.0, y: 1.0 },
+                    Point { x: 0.0, y: 0.0 },
+                    Vec2 { x: -1.0, y: 0.0 },
+                )),
+            ],
+            0.5,
+            FluidSide::Inside,
+        );
+
+        assert!(rect.is_fluid(Point { x: 0.5, y: 0.5 }));
+        assert!(!rect.is_fluid(Point { x: 1.5, y: 0.5 }));
+        assert!(!rect.is_fluid(Point { x: -0.1, y: 0.5 }));
+        assert!((rect.signed_area2() / 2.0 - 1.0).abs() < 1e-9);
+        let _ = assert_close;
+    }
+
+    #[test]
+    fn open_chain_panics() {
+        let res = std::panic::catch_unwind(|| {
+            polygonize_boundary(
+                &[BoundaryGeometry::Line(LineSegment::new(
+                    Point { x: 0.0, y: 0.0 },
+                    Point { x: 1.0, y: 0.0 },
+                    Vec2 { x: 0.0, y: -1.0 },
+                ))],
+                0.5,
+                FluidSide::Inside,
+            )
+        });
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn arc_chain_samples_endpoints() {
+        // Half circle from (1,0) ccw to (-1,0) around origin.
+        let arc = CircularArc::new(
+            Point { x: 0.0, y: 0.0 },
+            1.0,
+            0.0,
+            std::f64::consts::PI,
+            FluidSide::Inside,
+        );
+        let pts = arc.sample_points(0.05);
+        let n = pts.len();
+        assert!(n >= 3);
+        assert_close(pts[0].x, 1.0, 1e-12);
+        assert_close(pts[0].y, 0.0, 1e-12);
+        assert_close(pts[n - 1].x, -1.0, 1e-12);
+        assert_close(pts[n - 1].y, 0.0, 1e-9);
     }
 }

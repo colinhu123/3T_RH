@@ -1,4 +1,4 @@
-use crate::bc1::{self, BCType};
+use crate::bc1;
 use crate::geometry::{self, FluidSide, Geometry, Point, Polygon};
 use crate::state::State;
 
@@ -62,48 +62,94 @@ impl GridInfo {
     }
 }
 
+/// Derive the fluid-domain classifier polygon from a list of analytic
+/// boundary elements (the single source of boundary definition).
+///
+/// `polygonize_boundary` samples lines / arcs / circles so that the derived
+/// polygon reproduces the fluid mask; the analytic elements remain the
+/// authoritative geometry for ghost reconstruction.
+fn classifier_polygon(elements: &[bc1::BoundaryElement], chord_max: f64, fluid: FluidSide) -> Polygon {
+    let geoms: Vec<geometry::BoundaryGeometry> = elements.iter().map(|e| e.geometry).collect();
+    geometry::polygonize_boundary(&geoms, chord_max, fluid)
+}
+
 pub struct Field {
     pub grid: GridInfo,
     pub value: Vec<State>,
+
+    /// Derived outer-domain classifier polygon (fluid inside). Generated
+    /// from `outer_boundary`; kept only for mask / Outer-vs-Inner
+    /// classification, never for ghost geometry.
     pub outer_bound: Polygon,
-    pub inner_bound: Polygon,
-    // LEGACY / domain-compat: BC lists keyed by Polygon side. After the
-    // analytic-boundary refactor these are no longer authoritative for
-    // ghost BCs (use outer_boundary / inner_boundary instead). Kept
-    // because Field::new() and existing initializers still build them.
-    pub bc_inner: Vec<BCType>,
-    pub bc_outer: Vec<BCType>,
+
+    /// Derived obstacle classifier polygon (fluid outside), if any.
+    /// `None` when there is no inner boundary (no manual dummy needed).
+    pub inner_bound: Option<Polygon>,
+
     pub time: f64,
     /// Fluid mask over the Cartesian grid (linear index = i*ny + j),
     /// computed once at construction. `is_in_domain` reads this mask.
     pub fluid: Vec<bool>,
+
     /// Analytic physical boundary elements (ONE geometry + ONE BC each).
-    /// These are the authoritative physical boundary geometry for ghosts;
-    /// the Polygon above is only the domain classifier / fluid-mask source.
+    /// These are the authoritative physical boundary geometry for ghosts.
     pub outer_boundary: Vec<bc1::BoundaryElement>,
     pub inner_boundary: Vec<bc1::BoundaryElement>,
 }
 
 impl Field {
-    pub fn new(
+    /// Construct a Field from the authoritative analytic boundaries.
+    ///
+    /// The classifier polygons and the fluid mask are derived internally:
+    /// this is the only boundary description callers must provide.
+    pub fn from_boundaries(
         grid: GridInfo,
-        bc_inner: Vec<BCType>,
-        bc_outer: Vec<BCType>,
+        outer: Vec<bc1::BoundaryElement>,
+        inner: Vec<bc1::BoundaryElement>,
         value: State,
+        time: f64,
+    ) -> Self {
+        // Chord target keeps the sampled classifier within a quarter cell
+        // of the exact analytic geometry, so boundary-adjacent cell centers
+        // keep the same fluid classification.
+        let chord_max = 0.25 * grid.dx.min(grid.dy);
+
+        let outer_bound = classifier_polygon(&outer, chord_max, FluidSide::Inside);
+        let inner_bound = if inner.is_empty() {
+            None
+        } else {
+            Some(classifier_polygon(&inner, chord_max, FluidSide::Outside))
+        };
+
+        Self::from_parts(grid, outer_bound, inner_bound, outer, inner, value, time)
+    }
+
+    /// Construct a Field from explicitly supplied classifier polygons and
+    /// analytic boundary elements.
+    ///
+    /// Used internally by [`Field::from_boundaries`] and by unit tests that
+    /// need a hand-built classifier polygon (thin strips, corner boxes,
+    /// oblique walls). The analytic elements remain the authoritative
+    /// boundary geometry for ghost reconstruction.
+    pub(crate) fn from_parts(
+        grid: GridInfo,
         outer_bound: Polygon,
-        inner_bound: Polygon,
+        inner_bound: Option<Polygon>,
+        outer_elements: Vec<bc1::BoundaryElement>,
+        inner_elements: Vec<bc1::BoundaryElement>,
+        value: State,
         time: f64,
     ) -> Self {
         assert!(
             outer_bound.fluid == FluidSide::Inside,
-            "Wrong outer boundary setting"
+            "Wrong outer classifier setting"
         );
-        assert!(
-            inner_bound.fluid == FluidSide::Outside,
-            "Wrong inner boundary setting"
-        );
-        assert!(bc_inner.len() == inner_bound.points.len());
-        assert!(bc_outer.len() == outer_bound.points.len());
+        if let Some(inner) = &inner_bound {
+            assert!(
+                inner.fluid == FluidSide::Outside,
+                "Wrong inner classifier setting"
+            );
+        }
 
         let nx = grid.nx;
         let ny = grid.ny;
@@ -116,35 +162,33 @@ impl Field {
                     x: grid.x(i as isize),
                     y: grid.y(j as isize),
                 };
-                outer_bound.is_fluid(p) && inner_bound.is_fluid(p)
+                outer_bound.is_fluid(p)
+                    && inner_bound
+                        .as_ref()
+                        .map_or(true, |poly| poly.is_fluid(p))
             })
             .collect();
 
         Self {
-            grid: grid,
+            grid,
             value: vec![value; grid.len()],
-            outer_bound: outer_bound,
-            inner_bound: inner_bound,
-            bc_inner: bc_inner,
-            bc_outer: bc_outer,
-            time: time,
-            fluid: fluid,
-            outer_boundary: Vec::new(),
-            inner_boundary: Vec::new(),
+            outer_bound,
+            inner_bound,
+            time,
+            fluid,
+            outer_boundary: outer_elements,
+            inner_boundary: inner_elements,
         }
     }
 
-    /// Scratch field with the same geometry, BC lists and fluid mask,
-    /// but zeroed values. Does not re-run the polygon point-in-polygon
-    /// mask construction.
+    /// Scratch field with the same geometry and fluid mask, but zeroed
+    /// values. Does not re-run the mask construction.
     pub fn empty_like(&self) -> Self {
         Self {
             grid: self.grid,
             value: vec![State::new(); self.grid.len()],
-            outer_bound: Polygon::new(self.outer_bound.points.clone(), self.outer_bound.fluid),
-            inner_bound: Polygon::new(self.inner_bound.points.clone(), self.inner_bound.fluid),
-            bc_inner: self.bc_inner.clone(),
-            bc_outer: self.bc_outer.clone(),
+            outer_bound: self.outer_bound.clone(),
+            inner_bound: self.inner_bound.clone(),
             time: self.time,
             fluid: self.fluid.clone(),
             outer_boundary: self.outer_boundary.clone(),
@@ -152,14 +196,34 @@ impl Field {
         }
     }
 
+    /// True if `p` is fluid with respect to the outer domain classifier.
+    #[inline(always)]
+    pub fn outer_contains(&self, p: Point) -> bool {
+        self.outer_bound.is_fluid(p)
+    }
+
+    /// True if `p` is not cut out by an inner obstacle (always true when
+    /// there is no inner boundary).
+    #[inline(always)]
+    pub fn inner_contains(&self, p: Point) -> bool {
+        self.inner_bound
+            .as_ref()
+            .map_or(true, |poly| poly.is_fluid(p))
+    }
+
+    /// Fluid if inside the outer domain AND not inside an obstacle.
+    #[inline(always)]
+    pub fn is_fluid_point(&self, p: Point) -> bool {
+        self.outer_contains(p) && self.inner_contains(p)
+    }
+
     pub fn is_in_domain(&self, idx: (isize, isize)) -> bool {
         if !self.grid.is_in_domain(idx) {
-            let x = self.grid.x(idx.0);
-            let y = self.grid.y(idx.1);
-            let p = Point { x: x, y: y };
-            let con1 = self.outer_bound.is_fluid(p);
-            let con2 = self.inner_bound.is_fluid(p);
-            return con1 && con2;
+            let p = Point {
+                x: self.grid.x(idx.0),
+                y: self.grid.y(idx.1),
+            };
+            return self.is_fluid_point(p);
         }
 
         let i = idx.0 as usize;
@@ -218,21 +282,20 @@ impl Field {
         // ------------------------------------------------------------
         // Determine outer / inner boundary.
         //
-        // The Polygon only classifies the domain here; the physical
-        // boundary geometry comes from the analytic BoundaryElements.
+        // The derived Polygon only classifies the domain here; the
+        // physical boundary geometry comes from the analytic
+        // BoundaryElements.
         //
-        // Both classifications are explicit:
-        //
-        //     outside the outer rectangle   -> outer boundary
-        //     inside the interior obstacle  -> inner boundary
+        //     outside the outer domain   -> outer boundary
+        //     inside the interior cutout -> inner boundary
         //
         // A ghost point must satisfy exactly one of the two, so the
-        // remaining case (fluid by both polygons) is a bug.
+        // remaining case (fluid by both) is a bug.
         // ------------------------------------------------------------
 
-        let outer_fluid = self.outer_bound.is_fluid(p);
+        let outer_fluid = self.outer_contains(p);
 
-        let inner_fluid = self.inner_bound.is_fluid(p);
+        let inner_fluid = self.inner_contains(p);
 
         let (boundary, elements) = if !outer_fluid {
             (crate::ghost::BoundaryKind::Outer, &self.outer_boundary)
@@ -241,7 +304,7 @@ impl Field {
         } else {
             panic!(
                 "Field::get: ghost point p=({:.6e},{:.6e}) is classified fluid \
-             by BOTH polygons (outer and inner)",
+             by BOTH outer and inner domains",
                 p.x, p.y,
             );
         };
@@ -258,3 +321,4 @@ impl Field {
         bc1::set_ghost_point_value(idx, project, boundary, boundary_id, self, None)
     }
 }
+

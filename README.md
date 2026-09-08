@@ -96,14 +96,27 @@ The global time step is `dt = 0.8 * dt_cfl`, where `dt_cfl` is the minimum over 
 
 ## Geometry and boundary conditions
 
-The fluid domain is classified by polygons (`geometry.rs`):
+The **single source of boundary definition** is the list of analytic
+`BoundaryElement`s on the `Field` (`outer_boundary` / `inner_boundary`),
+each combining ONE analytic geometry — `LineSegment`, `CircularArc` or
+`Circle` — with ONE `BCType`. Initializers pass these straight to
+`Field::from_boundaries(...)`.
 
-- `outer_bound`: polygon with fluid inside (`FluidSide::Inside`).
-- `inner_bound`: polygon with fluid outside (`FluidSide::Outside`). In the half-cylinder case it is a dummy placed far outside the domain; in the full-cylinder-in-box case it is the circle around the obstacle.
+The classifier polygons and the fluid mask are **derived** from those
+elements at construction time (`geometry::polygonize_boundary` samples the
+analytic curves into closed classifier rings). The derived polygons are
+stored on the `Field` only to answer "is this Cartesian point fluid / which
+side is this ghost on?":
 
-A Cartesian point is fluid if and only if it lies inside both polygons (`Field::is_in_domain`); otherwise it is treated as a ghost cell.
+- `outer_bound`: derived polygon with fluid inside (`FluidSide::Inside`).
+- `inner_bound`: optional derived polygon with fluid outside
+  (`FluidSide::Outside`); `None` when there is no inner obstacle.
 
-The polygons are only the domain classifier / fluid-mask source. The authoritative physical boundary is a set of analytic `BoundaryElement`s stored on the `Field` (`outer_boundary` / `inner_boundary`), each combining ONE analytic geometry — `LineSegment`, `CircularArc` or `Circle` — with ONE `BCType`. For example, the cylinder wall is a single analytic `CircularArc` in the half-cylinder case and a single analytic `Circle` in the full-cylinder case; the many polygon segments that approximate the arc are retained only for fluid masking and never supply the wall normal / `P0` / distance.
+A Cartesian point is fluid if and only if it lies inside the outer
+classifier and outside any inner classifier (`Field::is_in_domain`);
+otherwise it is treated as a ghost cell. Because the polygons are derived,
+initializers never describe a boundary twice, and the legacy per-polygon-side
+`bc_outer` / `bc_inner` BC lists have been removed.
 
 ### Ghost grid
 
@@ -123,6 +136,7 @@ Ghost values are recomputed in parallel (Rayon) once per RK stage in `GhostGrid:
 | `Wall` | High-order ILW: no-penetration constraint on the momentum row, characteristic WENO extrapolation for the other rows, 4th-order Taylor expansion to the ghost point. |
 | `ReflectiveWall` | Geometric reflection of the nearest interior state with normal momentum flipped. |
 | `FarField(state)` | Characteristic BC: outgoing characteristics from WENO extrapolation, incoming characteristics from the freestream state. Becomes supersonic inflow/outflow automatically. |
+| `NonReflectiveOutflow` | Non-reflecting outlet: outgoing characteristics extrapolated, incoming set to zero. Uses the same precomputed `GhostBC` fast path as `FarField`/`Outflow`. |
 | `Outflow { p_inf, sigma, l_domain }` | LODI pressure relaxation for the incoming acoustic wave. |
 | `Constant(state)` / `TimeDependent(f)` | Prescribed boundary state. |
 | `ZerothOrder` | Ghost value copied from the mirrored interior cell. |
@@ -302,3 +316,6 @@ The boundary treatment follows:
 The grid-aligned shock instability cure follows:
 
 > N. Fleischmann, S. Adami, X. Y. Hu, and N. A. Adams, "A low dissipation method to cure the grid-aligned shock instability," *Journal of Computational Physics* 401 (2020), 109004.
+
+The positivity preserving follows: 
+> X. Zhang and C.-W. Shu, "Positivity-preserving high order finite difference WENO schemes for compressible Euler equations," Journal of Computational Physics 231 (2012), 2245–2258.

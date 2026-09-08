@@ -2,7 +2,6 @@ use crate::bc1::*;
 use crate::field1::*;
 use crate::geometry::*;
 use crate::state::*;
-use std::sync::Arc;
 
 /// Analytic straight boundary element.
 ///
@@ -82,68 +81,19 @@ pub fn init_double_mach() -> Field {
     // C->D: supersonic outflow
     // D->E: exact moving Mach-10 shock
     // E->A: supersonic inflow
-    let outer_bound = Polygon::new(vec![a, b, c, d, e], FluidSide::Inside);
 
-    let top_pre = pre;
-    let top_post = post;
-    let top_bc = BCType::TimeDependent(Arc::new(move |p: Point, _n, t: f64| {
-        // Upstream sound speed is 1, so Mach 10 shock speed is 10.
-        let x_shock = 10.0 * t;
-        if p.x <= x_shock { top_post } else { top_pre }
-    }));
-
-    let bc_outer = vec![
-        BCType::Constant(post), // A -> B
-        BCType::Wall,           // B -> C, inclined solid wall
-        BCType::Constant(pre),  // C -> D, supersonic outflow: all chars leave
-        BCType::ZerothOrder,    // D -> E, exact moving shock
-        BCType::Constant(post), // E -> A, supersonic inflow
+    // Analytic physical outer boundary (single source of boundary
+    // definition): each element is ONE analytic segment + ONE BC. The
+    // classifier polygon and the fluid mask are derived inside Field.
+    let outer_elements = vec![
+        line_element(a, b, BCType::Constant(post)), // A -> B
+        line_element(b, c, BCType::Wall),           // B -> C, inclined wall
+        line_element(c, d, BCType::Constant(pre)),  // C -> D, supersonic outflow
+        line_element(d, e, BCType::ZerothOrder),    // D -> E, moving shock
+        line_element(e, a, BCType::Constant(post)), // E -> A, supersonic inflow
     ];
 
-    // No inner obstacle.
-    let inner_bound = Polygon::new(
-        vec![
-            Point {
-                x: -1002.0,
-                y: -1002.0,
-            },
-            Point {
-                x: -1001.0,
-                y: -1002.0,
-            },
-            Point {
-                x: -1001.0,
-                y: -1001.0,
-            },
-            Point {
-                x: -1002.0,
-                y: -1001.0,
-            },
-        ],
-        FluidSide::Outside,
-    );
-    let bc_inner = vec![BCType::Wall; 4];
-
-    let mut u = Field::new(
-        grid,
-        bc_inner,
-        bc_outer,
-        State::new(),
-        outer_bound,
-        inner_bound,
-        0.0,
-    );
-
-    // Analytic physical outer boundary (CCW polygon, fluid inside):
-    //  A->B bottom (post-shock), B->C wedge Wall, C->D supersonic
-    //  outflow, D->E moving shock, E->A supersonic inflow.
-    u.outer_boundary = vec![
-        line_element(a, b, BCType::Constant(post)),
-        line_element(b, c, BCType::Wall),
-        line_element(c, d, BCType::Constant(pre)),
-        line_element(d, e, BCType::ZerothOrder),
-        line_element(e, a, BCType::Constant(post)),
-    ];
+    let mut u = Field::from_boundaries(grid, outer_elements, Vec::new(), State::new(), 0.0);
 
     // Initial vertical shock at x=0: post-shock on the left, pre-shock right.
     for i in 0..nx {
@@ -268,198 +218,44 @@ pub fn init_cylinder() -> Field {
     // when following the polygon CCW.
     // ============================================================
 
-    let mut outer_points = Vec::<Point>::new();
-    let mut bc_outer = Vec::<BCType>::new();
-
-    // ------------------------------------------------------------
-    // A = (-3,-6)
-    // ------------------------------------------------------------
-
-    outer_points.push(Point { x: -3.0, y: -6.0 });
-
-    // ------------------------------------------------------------
-    // A -> B
-    //
-    // bottom far field
-    // ------------------------------------------------------------
-
-    outer_points.push(Point { x: 0.0, y: -6.0 });
-
-    bc_outer.push(BCType::FarField(u_inf));
-
-    // ------------------------------------------------------------
-    // B -> C
-    //
-    // x = 0, -6 <= y <= -1
-    //
-    // This is an open far-field/outflow boundary.
-    // ------------------------------------------------------------
-
-    outer_points.push(Point {
-        x: 0.0,
-        y: -1.0 + 0.0125,
-    });
-
-    bc_outer.push(BCType::FarField(u_inf));
-
-    // ============================================================
-    // C -> ... -> D
-    //
-    // LEFT semicircle:
-    //
-    //       (0,-1)
-    //          \
-    //           \
-    //          (-1,0)
-    //           /
-    //          /
-    //       (0,1)
-    //
-    // Each segment gets Wall BC.
-    // ============================================================
-
-    let n_arc = 360_usize;
-
-    for k in 1..=n_arc {
-        let s = k as f64 / n_arc as f64;
-
-        // Start:
-        //     theta = -pi/2
-        //
-        // End:
-        //     theta = -3pi/2
-        //
-        // This traces the LEFT semicircle:
-        //
-        //     (0,-1) -> (-1,0) -> (0,1)
-        //
-        let theta = -0.5 * std::f64::consts::PI - std::f64::consts::PI * s;
-
-        outer_points.push(Point {
-            x: theta.cos(),
-            y: theta.sin() + 0.0125,
-        });
-
-        bc_outer.push(BCType::Wall);
-    }
+    // Half a Cartesian cell: keeps the wall half a cell away from the
+    // nearest grid center so no center sits exactly on the boundary.
+    let delta = 0.0125;
 
     // Analytic circular arc defining the physical cylinder boundary.
     // The three points select the LEFT arc passing through `mid`.
     let cylinder_arc = crate::geometry::CircularArc::from_three_points(
         Point {
             x: 0.0,
-            y: -1.0 + 0.0125,
+            y: -1.0 + delta,
         },
         Point {
             x: -1.0,
-            y: 0.0 + 0.0125,
+            y: delta,
         },
         Point {
             x: 0.0,
-            y: 1.0 + 0.0125,
+            y: 1.0 + delta,
         },
         FluidSide::Outside,
     );
 
-    // At this point the last arc point should be approximately:
-    //
-    //     (0,1)
-
-    // ------------------------------------------------------------
-    // (0,1) -> (0,6)
-    //
-    // right-side open boundary
-    // ------------------------------------------------------------
-
-    outer_points.push(Point { x: 0.0, y: 6.0 });
-
-    bc_outer.push(BCType::FarField(u_inf));
-
-    // ------------------------------------------------------------
-    // (0,6) -> (-3,6)
-    //
-    // top far field
-    // ------------------------------------------------------------
-
-    outer_points.push(Point { x: -3.0, y: 6.0 });
-
-    bc_outer.push(BCType::FarField(u_inf));
-
-    // ------------------------------------------------------------
-    // (-3,6) -> (-3,-6)
-    //
-    // left Mach-3 inflow.
-    //
-    // FarField automatically becomes supersonic inflow here.
-    // ------------------------------------------------------------
-
-    bc_outer.push(BCType::FarField(u_inf));
-
-    // Number of BCs MUST equal number of polygon sides.
-    assert_eq!(bc_outer.len(), outer_points.len());
-
-    let outer_bound = Polygon::new(outer_points, FluidSide::Inside);
-
     // ============================================================
-    // NO physical inner boundary.
+    // Analytic physical outer boundary (single source): SIX elements.
     //
-    // Field currently requires an inner polygon, so leave a dummy
-    // polygon far outside the computational domain.
+    // The classifier polygon and the fluid mask are derived inside
+    // Field::from_boundaries. The vertical far-field lines end exactly at
+    // the arc endpoints so the element chain closes:
     //
-    // It will never participate in the cylinder BC.
+    //   0. bottom line  (-3,-6) -> (0,-6)              FarField
+    //   1. lower right  (0,-6)  -> (0,-1+delta)         FarField
+    //   2. LEFT semicircle (0,-1+delta) -> (0,1+delta)  Wall (cylinder)
+    //   3. upper right  (0,1+delta) -> (0,6)            FarField
+    //   4. top line     (0,6)    -> (-3,6)              FarField
+    //   5. left line    (-3,6)   -> (-3,-6)             FarField
     // ============================================================
 
-    let inner_bound = Polygon::new(
-        vec![
-            Point {
-                x: -1002.0,
-                y: -1002.0,
-            },
-            Point {
-                x: -1001.0,
-                y: -1002.0,
-            },
-            Point {
-                x: -1001.0,
-                y: -1001.0,
-            },
-            Point {
-                x: -1002.0,
-                y: -1001.0,
-            },
-        ],
-        FluidSide::Outside,
-    );
-
-    let bc_inner = vec![BCType::Wall; 4];
-
-    // ============================================================
-    // Analytic physical outer boundary: SIX BoundaryElements.
-    //
-    // The 360 Polygon arc segments above remain ONLY as the domain
-    // classifier / fluid-mask approximation. All physical ghost
-    // boundary geometry (P0, normal, D) and BC ownership now come
-    // from these analytic elements:
-    //
-    //   0. bottom line  (-3,-6) -> (0,-6)        FarField
-    //   1. lower right  (0,-6)  -> (0,-1)        FarField
-    //   2. LEFT semicircle (0,-1) -> (-1,0) -> (0,+1)  cylinder BC
-    //   3. upper right  (0,+1)  -> (0,+6)        FarField
-    //   4. top line     (0,+6)  -> (-3,+6)       FarField
-    //   5. left line    (-3,+6) -> (-3,-6)       FarField
-    // ============================================================
-
-    let mut u = Field::new(
-        grid,
-        bc_inner,
-        bc_outer,
-        State::new(),
-        outer_bound,
-        inner_bound,
-        0.0,
-    );
-
-    u.outer_boundary = vec![
+    let outer_elements = vec![
         line_element(
             Point { x: -3.0, y: -6.0 },
             Point { x: 0.0, y: -6.0 },
@@ -467,7 +263,7 @@ pub fn init_cylinder() -> Field {
         ),
         line_element(
             Point { x: 0.0, y: -6.0 },
-            Point { x: 0.0, y: -1.0 },
+            Point { x: 0.0, y: -1.0 + delta },
             BCType::FarField(u_inf),
         ),
         crate::bc1::BoundaryElement {
@@ -475,7 +271,7 @@ pub fn init_cylinder() -> Field {
             bc: BCType::Wall,
         },
         line_element(
-            Point { x: 0.0, y: 1.0 },
+            Point { x: 0.0, y: 1.0 + delta },
             Point { x: 0.0, y: 6.0 },
             BCType::FarField(u_inf),
         ),
@@ -491,13 +287,16 @@ pub fn init_cylinder() -> Field {
         ),
     ];
 
+    // No physical inner boundary.
+    let mut u = Field::from_boundaries(grid, outer_elements, Vec::new(), State::new(), 0.0);
+
     // ============================================================
     // Initial condition
     //
     // Uniform Mach-3 freestream on every FLUID grid point.
     //
-    // Points inside the half cylinder are now automatically
-    // excluded by outer_bound.is_fluid().
+    // Points inside the half cylinder are excluded automatically by
+    // the derived fluid mask.
     // ============================================================
 
     for i in 0..nx {
@@ -525,9 +324,8 @@ pub fn init_cylinder() -> Field {
     );
 
     println!(
-        "Half-cylinder: R=1, arc segments={}, outer sides={}",
-        n_arc,
-        u.bc_outer.len(),
+        "Half-cylinder: R=1, analytic arc, outer elements={}",
+        u.outer_boundary.len(),
     );
 
     u
@@ -682,137 +480,40 @@ pub fn init_shock_cylinder_in_box_with(
 
     let grid = GridInfo::new(nx, ny, h, h, x0, y0);
 
-    let outer_bound = Polygon::new(
-        vec![
-            Point { x: xmin, y: ymin },
-            Point { x: xmax, y: ymin },
-            Point { x: xmax, y: ymax },
-            Point { x: xmin, y: ymax },
-        ],
-        FluidSide::Inside,
-    );
-
-    let mut inner_points = Vec::with_capacity(n_circle);
-
-    for k in 0..n_circle {
-        let theta = 2.0 * std::f64::consts::PI * k as f64 / n_circle as f64;
-
-        inner_points.push(Point {
-            x: cx + radius * theta.cos(),
-
-            y: cy + radius * theta.sin(),
-        });
-    }
-
-    let inner_bound = Polygon::new(inner_points, FluidSide::Outside);
-
-    let shock_bc =
-        BCType::TimeDependent(Arc::new(move |p: Point, _normal: Vec2, t: f64| -> State {
-            let x_shock = shock_x0 + shock_speed * t;
-
-            if p.x <= x_shock { post } else { pre }
-        }));
-
     // ============================================================
-    // Legacy Polygon-side BC arrays.
+    // ANALYTIC OUTER / INNER PHYSICAL BOUNDARIES (single source)
     //
-    // Rectangle side ordering:
+    // Outer rectangle side ordering:
     //
-    //      0 bottom
-    //      1 right
-    //      2 top
-    //      3 left
+    //      bottom (moving-shock region wall)
+    //      right  (zeroth-order outflow)
+    //      top    (moving-shock region wall)
+    //      left   (constant post-shock inflow)
     //
-    // The analytic BoundaryElements below are authoritative for
-    // physical ghost geometry/BC lookup.
+    // Inner: ONE complete Circle, fluid OUTSIDE the cylinder
+    // (FluidSide::Outside makes Projection.normal point from the fluid
+    // into the solid cylinder).
+    //
+    // The classifier polygons and the fluid mask are derived inside
+    // Field::from_boundaries.
     // ============================================================
 
-    let bc_outer = vec![
-        BCType::FarField(post),
-        BCType::ZerothOrder,
-        BCType::FarField(post),
-        BCType::Constant(post),
-    ];
-
-    // Inner Polygon has n_circle sides.
-    //
-    // This is legacy/domain compatibility data only.
-    // Physical cylinder BC comes from ONE Circle element.
-
-    let bc_inner = vec![wall.bc(); n_circle];
-
-    // ============================================================
-    // Construct Field
-    // ============================================================
-
-    let mut u = Field::new(
-        grid,
-        bc_inner,
-        bc_outer,
-        State::new(),
-        outer_bound,
-        inner_bound,
-        0.0,
-    );
-
-    // ============================================================
-    // ANALYTIC OUTER PHYSICAL BOUNDARY
-    //
-    // Side ordering:
-    //
-    //      bottom
-    //      right
-    //      top
-    //      left
-    //
-    // ------------------------------------------------------------
-    //
-    // bottom:
-    //
-    //      exact moving shock BC
-    //
-    // right:
-    //
-    //      zeroth-order outflow
-    //
-    // top:
-    //
-    //      exact moving shock BC
-    //
-    // left:
-    //
-    //      constant post-shock inflow
-    //
-    // ============================================================
-
-    u.outer_boundary = vec![
-        // ----------------------------------------------------
-        // Bottom
-        // ----------------------------------------------------
+    let outer_elements = vec![
         line_element(
             Point { x: xmin, y: ymin },
             Point { x: xmax, y: ymin },
             BCType::ReflectiveWall,
         ),
-        // ----------------------------------------------------
-        // Right
-        // ----------------------------------------------------
         line_element(
             Point { x: xmax, y: ymin },
             Point { x: xmax, y: ymax },
             BCType::ZerothOrder,
         ),
-        // ----------------------------------------------------
-        // Top
-        // ----------------------------------------------------
         line_element(
             Point { x: xmax, y: ymax },
             Point { x: xmin, y: ymax },
             BCType::ReflectiveWall,
         ),
-        // ----------------------------------------------------
-        // Left
-        // ----------------------------------------------------
         line_element(
             Point { x: xmin, y: ymax },
             Point { x: xmin, y: ymin },
@@ -820,26 +521,16 @@ pub fn init_shock_cylinder_in_box_with(
         ),
     ];
 
-    // ============================================================
-    // ANALYTIC INNER PHYSICAL BOUNDARY
-    //
-    // ONE complete Circle.
-    //
-    // Fluid is OUTSIDE the cylinder.
-    //
-    // Therefore FluidSide::Outside makes Projection.normal point
-    // from fluid into the solid cylinder.
-    // ============================================================
-
-    u.inner_boundary = vec![BoundaryElement {
+    let inner_elements = vec![BoundaryElement {
         geometry: BoundaryGeometry::Circle(Circle::new(
             Point { x: cx, y: cy },
             radius,
             FluidSide::Outside,
         )),
-
         bc: wall.bc(),
     }];
+
+    let mut u = Field::from_boundaries(grid, outer_elements, inner_elements, State::new(), 0.0);
 
     // ============================================================
     // INITIAL CONDITION
@@ -923,7 +614,7 @@ pub fn init_shock_cylinder_in_box_with(
 }
 
 pub fn init_rotated_shock_cylinder(wall: CylinderWallMode) -> Field {
-    init_rotated_shock_cylinder_with(wall, 1.0 / 40.0, 360, 5.0, -1.10, 10.0)
+    init_rotated_shock_cylinder_with(wall, 1.0 / 40.0, 360, 5.0, -1.10, 5.0)
 }
 
 pub fn init_rotated_shock_cylinder_with(
@@ -1071,104 +762,40 @@ pub fn init_rotated_shock_cylinder_with(
     let grid = GridInfo::new(nx, ny, h, h, x0, y0);
 
     // ============================================================
-    // OUTER DOMAIN CLASSIFIER
+    // ANALYTIC OUTER / INNER BOUNDARIES (single source)
     //
-    // Rotated rectangle.
-    //
-    // Fluid is inside.
-    // ============================================================
-
-    let outer_bound = Polygon::new(vec![p00, p10, p11, p01], FluidSide::Inside);
-
-    // ============================================================
-    // INNER CIRCLE CLASSIFIER
-    //
-    // Circle center remains at global (0,0).
+    // The 4 rotated LineSegments (CCW: p00->p10 lower wall, p10->p11
+    // downstream outflow, p11->p01 upper wall, p01->p00 upstream inflow)
+    // and the ONE analytic Circle for the cylinder are the only boundary
+    // definition. The classifier polygons and the fluid mask are derived
+    // inside Field::from_boundaries.
     // ============================================================
 
     let cx = 0.0 + h / 3.0;
     let cy = 0.0 + h / 3.0;
     let radius = 1.0_f64;
 
-    let mut inner_points = Vec::with_capacity(n_circle);
-
-    for k in 0..n_circle {
-        let phi = 2.0 * std::f64::consts::PI * k as f64 / n_circle as f64;
-
-        inner_points.push(Point {
-            x: cx + radius * phi.cos(),
-            y: cy + radius * phi.sin(),
-        });
-    }
-
-    let inner_bound = Polygon::new(inner_points, FluidSide::Outside);
-
-    // ============================================================
-    // Polygon-side BC compatibility arrays
-    //
-    // CCW sides:
-    //
-    // p00 -> p10 : lower wall
-    // p10 -> p11 : downstream outflow
-    // p11 -> p01 : upper wall
-    // p01 -> p00 : upstream inflow
-    // ============================================================
-
-    let bc_outer = vec![
-        BCType::ZerothOrder,
-        BCType::ZerothOrder,
-        BCType::ZerothOrder,
-        BCType::Constant(post),
-    ];
-
-    let bc_inner = vec![wall.bc(); n_circle];
-
-    // ============================================================
-    // Field
-    // ============================================================
-
-    let mut u = Field::new(
-        grid,
-        bc_inner,
-        bc_outer,
-        State::new(),
-        outer_bound,
-        inner_bound,
-        0.0,
-    );
-
-    // ============================================================
-    // ANALYTIC OUTER BOUNDARIES
-    //
-    // line_element derives the fluid-domain outward normal from
-    // the CCW segment orientation, so the rotated geometry works
-    // automatically.
-    // ============================================================
-
-    u.outer_boundary = vec![
-        // lower reflective wall
-        line_element(p00, p10, BCType::Wall),
+    let outer_elements = vec![
+        // lower wall
+        line_element(p00, p10, BCType::NonReflectiveOutflow),
         // downstream outflow
         line_element(p10, p11, BCType::ZerothOrder),
-        // upper reflective wall
-        line_element(p11, p01, BCType::Wall),
+        // upper wall
+        line_element(p11, p01, BCType::NonReflectiveOutflow),
         // upstream post-shock inflow
         line_element(p01, p00, BCType::Constant(post)),
     ];
 
-    // ============================================================
-    // ANALYTIC CYLINDER
-    // ============================================================
-
-    u.inner_boundary = vec![BoundaryElement {
+    let inner_elements = vec![BoundaryElement {
         geometry: BoundaryGeometry::Circle(Circle::new(
             Point { x: cx, y: cy },
             radius,
             FluidSide::Outside,
         )),
-
         bc: wall.bc(),
     }];
+
+    let mut u = Field::from_boundaries(grid, outer_elements, inner_elements, State::new(), 0.0);
 
     // ============================================================
     // INITIAL CONDITION
@@ -1371,128 +998,27 @@ pub fn init_planar_shock_channel_with(h: f64, shock_mach: f64, shock_x0: f64) ->
 
     let p_top_left = Point { x: xmin, y: ymax };
 
-    let outer_bound = Polygon::new(
-        vec![p_bottom_left, p_bottom_right, p_top_right, p_top_left],
-        FluidSide::Inside,
-    );
-
     // ============================================================
-    // No physical inner boundary.
-    //
-    // Field currently expects an inner Polygon, so put a tiny
-    // dummy polygon far outside the computational domain.
-    //
-    // If your Field now supports "no inner boundary", replace this
-    // with your corresponding empty/no-inner-boundary constructor.
+    // Analytic physical outer boundaries (single source of boundary
+    // definition). The classifier polygons and fluid mask are derived
+    // inside Field::from_boundaries.
     // ============================================================
 
-    let dummy_x = xmin - 100.0;
-    let dummy_y = ymin - 100.0;
-
-    let inner_bound = Polygon::new(
-        vec![
-            Point {
-                x: dummy_x,
-                y: dummy_y,
-            },
-            Point {
-                x: dummy_x + 1.0,
-                y: dummy_y,
-            },
-            Point {
-                x: dummy_x,
-                y: dummy_y + 1.0,
-            },
-        ],
-        FluidSide::Outside,
-    );
-
-    // ============================================================
-    // OUTER BC
-    //
-    // Polygon side order:
-    //
-    //      0: bottom
-    //      1: right
-    //      2: top
-    //      3: left
-    //
-    // Start with ReflectiveWall because it gives us a robust
-    // baseline.
-    //
-    // Once this works, replace top/bottom with BCType::Wall.
-    // ============================================================
-
-    let p_inf = p_pre;
-
-    let sigma = 0.25_f64;
-
-    let l_domain = xmax - xmin;
-
-    let outflow_bc = BCType::Outflow {
-        p_inf,
-        sigma,
-        l_domain,
-    };
     let outflow_bc = BCType::ZerothOrder;
 
-    let bc_outer = vec![
-        // bottom
-        BCType::ReflectiveWall,
-        // right
-        outflow_bc.clone(),
-        // top
-        BCType::ReflectiveWall,
-        // left
-        BCType::Constant(post),
-    ];
-
-    // Dummy inner BC.
-    let bc_inner = vec![BCType::ZerothOrder; 3];
-
-    // ============================================================
-    // Construct Field
-    // ============================================================
-
-    let mut u = Field::new(
-        grid,
-        bc_inner,
-        bc_outer,
-        State::new(),
-        outer_bound,
-        inner_bound,
-        0.0,
-    );
-
-    // ============================================================
-    // Analytic physical outer boundaries
-    // ============================================================
-
-    u.outer_boundary = vec![
-        // ----------------------------------------------------
+    let outer_elements = vec![
         // Bottom wall
-        //
-        // CCW:
-        //
-        // bottom-left -> bottom-right
-        // ----------------------------------------------------
         line_element(p_bottom_left, p_bottom_right, BCType::ReflectiveWall),
-        // ----------------------------------------------------
         // Right outlet
-        // ----------------------------------------------------
         line_element(p_bottom_right, p_top_right, outflow_bc),
-        // ----------------------------------------------------
         // Top wall
-        // ----------------------------------------------------
         line_element(p_top_right, p_top_left, BCType::ReflectiveWall),
-        // ----------------------------------------------------
         // Left post-shock inflow
-        // ----------------------------------------------------
         line_element(p_top_left, p_bottom_left, BCType::Constant(post)),
     ];
 
-    // No physical inner BoundaryElement.
-    u.inner_boundary = Vec::new();
+    // No physical inner boundary.
+    let mut u = Field::from_boundaries(grid, outer_elements, Vec::new(), State::new(), 0.0);
 
     // ============================================================
     // Initial condition
@@ -1736,89 +1262,19 @@ pub fn init_forward_facing_step_rotated_with(
     let grid = GridInfo::new(nx, ny, h, h, xmin, ymin);
 
     // ============================================================
-    // Rotated forward-step polygon
+    // Analytic rotated boundaries (single source of boundary
+    // definition): each side is ONE analytic segment + ONE BC. The
+    // classifier polygon and the fluid mask are derived in Field.
     // ============================================================
 
-    let outer_bound = Polygon::new(vec![p0, p1, p2, p3, p4, p5], FluidSide::Inside);
-
-    // ============================================================
-    // Dummy inner boundary
-    // ============================================================
-
-    let inner_bound = Polygon::new(
-        vec![
-            Point {
-                x: -100.0,
-                y: -100.0,
-            },
-            Point {
-                x: -99.0,
-                y: -100.0,
-            },
-            Point {
-                x: -100.0,
-                y: -99.0,
-            },
-        ],
-        FluidSide::Outside,
-    );
-
-    // ============================================================
-    // Outflow
+    // Outflow:
     //
-    // IMPORTANT:
-    // This outlet is now oblique relative to the Cartesian grid.
-    //
-    // Since you already found that the high-order Outflow stencil
-    // can fail on oblique outer boundaries, I recommend routing
-    // this BC through robust_outflow_copy for this experiment.
-    // ============================================================
-
+    // This outlet is oblique relative to the Cartesian grid. The
+    // high-order Outflow stencil can fail on oblique outer
+    // boundaries, so route this BC through ZerothOrder for now.
     let outflow_bc = BCType::ZerothOrder;
 
-    // ============================================================
-    // Polygon BCs
-    //
-    // p0 -> p1 : bottom Wall
-    // p1 -> p2 : step front Wall
-    // p2 -> p3 : step top Wall
-    // p3 -> p4 : outlet
-    // p4 -> p5 : top Wall
-    // p5 -> p0 : inflow
-    // ============================================================
-
-    let bc_outer = vec![
-        // Wall: high-order ILW with a LOCAL ReflectiveWall fallback
-        // for ghosts where the ILW reconstruction is untrustworthy.
-        BCType::Wall,
-        BCType::Wall,
-        BCType::Wall,
-        outflow_bc.clone(),
-        BCType::Wall,
-        BCType::Constant(post),
-    ];
-
-    let bc_inner = vec![BCType::ZerothOrder; 3];
-
-    // ============================================================
-    // Field
-    // ============================================================
-
-    let mut u = Field::new(
-        grid,
-        bc_inner,
-        bc_outer,
-        State::new(),
-        outer_bound,
-        inner_bound,
-        0.0,
-    );
-
-    // ============================================================
-    // Analytic rotated boundaries
-    // ============================================================
-
-    u.outer_boundary = vec![
+    let outer_elements = vec![
         // bottom
         line_element(p0, p1, BCType::Wall),
         // step vertical face
@@ -1833,7 +1289,7 @@ pub fn init_forward_facing_step_rotated_with(
         line_element(p5, p0, BCType::Constant(inflow)),
     ];
 
-    u.inner_boundary = Vec::new();
+    let mut u = Field::from_boundaries(grid, outer_elements, Vec::new(), State::new(), 0.0);
 
     // ============================================================
     // Initial condition

@@ -34,7 +34,7 @@ fn main() {
         io::clear_data_folder();
     }
 
-    let mut u = init::init_forward_facing_step_rotated();
+    let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::HighOrder);
 
     if let Some(id) = restart_id {
         let path = format!("data/solution_{:04}.bin", id);
@@ -137,8 +137,6 @@ fn main() {
 #[cfg(test)]
 mod parity {
     use super::*;
-    use crate::field1::Field;
-    use crate::ghost::GhostGrid;
     use crate::solver::{Scratch, calc_global_dt, l, rk3_ssp, stage_update_rhs};
     use crate::state::{Derived, Direction, State};
 
@@ -276,9 +274,12 @@ mod parity {
             "cylinder arc must use the PrimitiveWall BC"
         );
 
-        // The 360 Polygon arc segments remain only as domain-classifier
-        // detail: the physical boundary must NOT scale with them.
-        assert_eq!(u.bc_outer.len(), 365);
+        // The classifier polygon is DERIVED from the analytic elements
+        // (arc + 5 lines), so it carries the sampled arc vertices.
+        assert!(
+            u.outer_bound.points.len() >= 6,
+            "derived outer classifier must hold the sampled arc"
+        );
     }
 
     #[test]
@@ -808,9 +809,64 @@ mod parity {
             geometry::BoundaryGeometry::Circle(_)
         ));
 
-        // The 360 inner Polygon segments remain only as a domain
-        // classifier: the physical boundary must NOT scale with them.
-        assert_eq!(u.bc_inner.len(), 360);
-        assert_eq!(u.bc_outer.len(), 4);
+        // The classifier polygons are DERIVED from the analytic elements:
+        // outer rectangle -> 4 vertices, inner circle -> sampled ring.
+        assert_eq!(u.outer_bound.points.len(), 4);
+        let inner = u
+            .inner_bound
+            .as_ref()
+            .expect("full cylinder must have an inner classifier");
+        assert!(inner.points.len() > 100, "inner circle must be sampled");
+    }
+
+    /// End-to-end smoke test of the two reference cases: the rotated
+    /// shock-cylinder-in-box and the rotated forward-facing step. After the
+    /// single-source boundary refactor, both must initialize, build their
+    /// GhostGrid (which polygonizes the analytic boundaries) and advance a
+    /// few RK3 steps with a finite, admissible field.
+    #[test]
+    fn reference_cases_build_and_advance() {
+        let cases = [
+            (
+                "rotated_shock_cylinder",
+                init::init_rotated_shock_cylinder(init::CylinderWallMode::Reflective),
+            ),
+            ("forward_facing_step", init::init_forward_facing_step_rotated()),
+        ];
+
+        for (name, mut u) in cases {
+            let mut solver = crate::solver::Solver::new(&u);
+
+            // Fluid fraction sanity: the derived classifier must leave a
+            // nonzero amount of fluid.
+            let n_fluid = u.fluid.iter().filter(|&&f| f).count();
+            assert!(n_fluid > 0, "{}: empty fluid mask", name);
+
+            let dt_cfl = solver.global_dt(&u);
+            assert!(dt_cfl.is_finite() && dt_cfl > 0.0, "{}: bad dt", name);
+            let dt = 0.01 * dt_cfl;
+
+            for _ in 0..3 {
+                solver.step(&mut u, dt);
+            }
+
+            for l in 0..u.fluid.len() {
+                if !u.fluid[l] {
+                    continue;
+                }
+                let s = u.value[l];
+                assert!(
+                    s.rho.is_finite()
+                        && s.rho > 0.0
+                        && s.mom_x.is_finite()
+                        && s.mom_y.is_finite()
+                        && s.ee.is_finite()
+                        && s.ei.is_finite()
+                        && s.er.is_finite(),
+                    "{}: non-finite state at cell {} after RK3 steps",
+                    name, l
+                );
+            }
+        }
     }
 }

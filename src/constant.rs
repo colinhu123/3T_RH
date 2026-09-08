@@ -29,4 +29,4 @@ pub const EPS_LIMITER: f64 = 1e-13; //constant used in positivity limiter
 pub const PP_W: f64 = 1.0/12.0;
 pub const MAX_ITER: usize = 60;
 
-pub const PP_SWITCH: bool = true;
+pub const PP_SWITCH: bool = false;

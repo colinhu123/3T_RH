@@ -268,7 +268,7 @@ pub enum BCType {
     },
     ZerothOrder,
     FarField(State),
-    NonReflective,
+    NonReflectiveOutflow,
 }
 
 // ============================================================================
@@ -289,7 +289,7 @@ pub fn bc_priority(bc: &BCType) -> usize {
         BCType::Constant(_) => 70,
         BCType::TimeDependent(_) => 70,
         BCType::FarField(_) => 20,
-        BCType::NonReflective => 15,
+        BCType::NonReflectiveOutflow => 15,
         BCType::Outflow { .. } => 10,
         BCType::ZerothOrder => 5,
         BCType::Periodic => 0,
@@ -1704,15 +1704,6 @@ pub fn set_ghost_point_value(
     };
 
     match bc {
-        BCType::NonReflective => {
-            for i in 0..6 {
-                if lambda[i] < 0.0 {
-                    v[0][i] = 0.0;
-                }
-            }
-
-            state::State::new()
-        }
 
         // Symmetry / Periodic / Constant(_) still need their own row-0
         // substitution (different g(t), different BC-row structure).
@@ -1881,7 +1872,166 @@ pub fn set_ghost_point_value(
                 er: u_ghost[5],
             }
         }
-        BCType::Constant(_) | BCType::TimeDependent(_) | BCType::ReflectiveWall => unreachable!(),
+
+    BCType::NonReflectiveOutflow =>{
+        let n = project.normal;
+
+    // ------------------------------------------------------------
+    // Sanity check: boundary normal.
+    // ------------------------------------------------------------
+
+    let n2 = n.x * n.x + n.y * n.y;
+
+    if !n2.is_finite() || n2 <= 0.0 {
+        panic!(
+            "NonReflectiveOutflow: invalid boundary normal: \
+             nx={}, ny={}, |n|^2={}",
+            n.x, n.y, n2
+        );
+    }
+
+    // The existing boundary machinery should normally provide
+    // a unit normal.
+    //
+    // We do not renormalize it here because left/right and v[k]
+    // were already constructed using the existing normal convention.
+    debug_assert!(
+        (n2 - 1.0).abs() < 1.0e-8,
+        "NonReflectiveOutflow: boundary normal is not unit: \
+         nx={}, ny={}, |n|^2={}",
+        n.x,
+        n.y,
+        n2
+    );
+
+
+    let mut u = vec![
+        Array1::<f64>::zeros(6),
+        Array1::<f64>::zeros(6),
+        Array1::<f64>::zeros(6),
+        Array1::<f64>::zeros(6),
+        Array1::<f64>::zeros(6),
+    ];
+
+    let rhs0 = Array1::from_vec(v[0].to_vec());
+
+    // Transform characteristic variables back to local conservative
+    // variables:
+    //
+    //     U(P0) = R W(P0)
+    //
+    u[0] = right.dot(&rhs0);
+
+    for k in 1..=WALL_TAYLOR_ORDER {
+        let mut rhs_k = Array1::from_vec(v[k].to_vec());
+
+        for m in 0..6 {
+            let lam = lambda[m];
+
+            if !lam.is_finite() {
+                panic!(
+                    "NonReflectiveOutflow: non-finite eigenvalue \
+                     lambda[{}]={}",
+                    m, lam
+                );
+            }
+
+            if lam < 0.0 {
+                rhs_k[m] = 0.0;
+            }
+
+        }
+
+        // Back to local conservative derivatives:
+        //
+        //     U^(k) = R W^(k)
+        //
+        u[k] = right.dot(&rhs_k);
+    }
+
+    let d = project.distance;
+
+    if !d.is_finite() {
+        panic!(
+            "NonReflectiveOutflow: non-finite ghost distance: {}",
+            d
+        );
+    }
+
+    let mut u_ghost = u[0].clone();
+
+    let mut coef = 1.0_f64;
+
+    for k in 1..=WALL_TAYLOR_ORDER {
+        // Recursively produces:
+        //
+        // k = 1: d
+        // k = 2: d^2 / 2!
+        // k = 3: d^3 / 3!
+        // ...
+        coef *= d / (k as f64);
+
+        u_ghost = u_ghost + coef * &u[k];
+    }
+
+
+    // ============================================================
+    // Check local ghost state before rotating momentum.
+    // ============================================================
+
+    for m in 0..6 {
+        if !u_ghost[m].is_finite() {
+            panic!(
+                "NonReflectiveOutflow produced non-finite \
+                 local ghost component {}: {:?}",
+                m,
+                u_ghost
+            );
+        }
+    }
+    let mom_n = u_ghost[1];
+    let mom_t = u_ghost[2];
+
+    let mom_x =
+        mom_n * n.x
+        - mom_t * n.y;
+
+    let mom_y =
+        mom_n * n.y
+        + mom_t * n.x;
+
+
+    // ============================================================
+    // Construct global conservative ghost state.
+    // ============================================================
+
+    let ghost = state::State {
+        rho: u_ghost[0],
+
+        mom_x,
+        mom_y,
+
+        ee: u_ghost[3],
+        ei: u_ghost[4],
+        er: u_ghost[5],
+    };
+
+    if !ghost.rho.is_finite()
+        || !ghost.mom_x.is_finite()
+        || !ghost.mom_y.is_finite()
+        || !ghost.ee.is_finite()
+        || !ghost.ei.is_finite()
+        || !ghost.er.is_finite()
+    {
+        panic!(
+            "NonReflectiveOutflow produced non-finite global ghost state: {:?}",
+            ghost
+        );
+    }
+
+    ghost
+    },
+    BCType::Constant(_) | BCType::TimeDependent(_) | BCType::ReflectiveWall => unreachable!(),
         _ => state::State::new(),
     }
 }
@@ -2614,37 +2764,18 @@ mod tests {
             FluidSide::Inside,
         );
 
-        // Dummy obstacle outside the computational domain.
-        let inner = Polygon::new(
-            vec![
-                Point {
-                    x: -1002.0,
-                    y: -1002.0,
-                },
-                Point {
-                    x: -1001.0,
-                    y: -1002.0,
-                },
-                Point {
-                    x: -1001.0,
-                    y: -1001.0,
-                },
-                Point {
-                    x: -1002.0,
-                    y: -1001.0,
-                },
-            ],
-            FluidSide::Outside,
+        // Analytic physical boundary: four Wall line segments (built below).
+        let mut field = field1::Field::from_parts(
+            grid,
+            outer,
+            None,
+            Vec::new(),
+            Vec::new(),
+            value,
+            0.0,
         );
 
-        let outer_bc = vec![BCType::Wall, BCType::Wall, BCType::Wall, BCType::Wall];
-
-        let inner_bc = vec![BCType::Wall, BCType::Wall, BCType::Wall, BCType::Wall];
-
-        let mut field = field1::Field::new(grid, inner_bc, outer_bc, value, outer, inner, 0.0);
-
-        // Analytic physical boundary: four Wall line segments.
-        // CCW polygon with fluid inside => outward normal = (dy, -dx)/len.
+        // Four Wall line segments, outward normal explicit.
         field.outer_boundary = vec![
             BoundaryElement {
                 geometry: geometry::BoundaryGeometry::Line(geometry::LineSegment::new(
@@ -2796,6 +2927,55 @@ mod tests {
         assert_periodic_wrap(&field, (-4, 4), (nx as isize - 4, 4));
         assert_periodic_wrap(&field, (nx as isize, 1), (0, 1));
         assert_periodic_wrap(&field, (nx as isize + 3, 2), (3, 2));
+    }
+
+    #[test]
+    fn non_reflective_outflow_ghosts_use_precomputed_fast_path() {
+        // NonReflectiveOutflow must now take the accelerated route: every
+        // NonReflectiveOutflow ghost in the production GhostGrid carries a
+        // precomputed GhostBC (ghost.rs precompute list), and the
+        // precomputed reconstruction reproduces a constant interior state.
+        let value = State::primi2con(1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+        let mut field = make_rect_field(40, 40, 1.0, 1.0, value);
+        field.outer_boundary[1].bc = BCType::NonReflectiveOutflow; // right
+        field.outer_boundary[3].bc = BCType::NonReflectiveOutflow; // left
+
+        let offsets = crate::ghost::default_stencil_offsets();
+        let mut ghosts = crate::ghost::GhostGrid::build(&field, &offsets);
+
+        let mut count = 0usize;
+        for g in &ghosts.info {
+            if !matches!(
+                field.outer_boundary[g.boundary_id].bc,
+                BCType::NonReflectiveOutflow
+            ) {
+                continue;
+            }
+            count += 1;
+            assert!(
+                g.bc.is_some(),
+                "NonReflectiveOutflow ghost {:?} did not precompute GhostBC",
+                g.idx
+            );
+        }
+        assert!(count > 0, "no NonReflectiveOutflow ghosts found");
+
+        ghosts.update_values_parallel(&field);
+        let mut worst = 0.0f64;
+        for (id, g) in ghosts.info.iter().enumerate() {
+            if !matches!(
+                field.outer_boundary[g.boundary_id].bc,
+                BCType::NonReflectiveOutflow
+            ) {
+                continue;
+            }
+            worst = worst.max(state_max_error(ghosts.values[id], value));
+        }
+        assert!(
+            worst < 1e-8,
+            "constant-state NonReflectiveOutflow ghost error too large: {}",
+            worst
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -3149,35 +3329,13 @@ mod tests {
             FluidSide::Inside,
         );
 
-        let inner = Polygon::new(
-            vec![
-                Point {
-                    x: -1002.0,
-                    y: -1002.0,
-                },
-                Point {
-                    x: -1001.0,
-                    y: -1002.0,
-                },
-                Point {
-                    x: -1001.0,
-                    y: -1001.0,
-                },
-                Point {
-                    x: -1002.0,
-                    y: -1001.0,
-                },
-            ],
-            FluidSide::Outside,
-        );
-
-        let field = field1::Field::new(
+        let field = field1::Field::from_parts(
             grid,
-            vec![BCType::Wall; 4],
-            vec![BCType::Wall; 3],
-            value,
             outer,
-            inner,
+            None,
+            Vec::new(),
+            Vec::new(),
+            value,
             0.0,
         );
 
@@ -3598,35 +3756,13 @@ mod tests {
             FluidSide::Inside,
         );
 
-        let inner = Polygon::new(
-            vec![
-                Point {
-                    x: -1002.0,
-                    y: -1002.0,
-                },
-                Point {
-                    x: -1001.0,
-                    y: -1002.0,
-                },
-                Point {
-                    x: -1001.0,
-                    y: -1001.0,
-                },
-                Point {
-                    x: -1002.0,
-                    y: -1001.0,
-                },
-            ],
-            FluidSide::Outside,
-        );
-
-        let mut field = field1::Field::new(
+        let mut field = field1::Field::from_parts(
             grid,
-            vec![BCType::Wall; 4],
-            vec![BCType::Wall; 4],
-            value,
             outer,
-            inner,
+            None,
+            Vec::new(),
+            Vec::new(),
+            value,
             0.0,
         );
 
@@ -3913,35 +4049,13 @@ mod tests {
             FluidSide::Inside,
         );
 
-        let inner = Polygon::new(
-            vec![
-                Point {
-                    x: -1002.0,
-                    y: -1002.0,
-                },
-                Point {
-                    x: -1001.0,
-                    y: -1002.0,
-                },
-                Point {
-                    x: -1001.0,
-                    y: -1001.0,
-                },
-                Point {
-                    x: -1002.0,
-                    y: -1001.0,
-                },
-            ],
-            FluidSide::Outside,
-        );
-
-        let mut field = field1::Field::new(
+        let mut field = field1::Field::from_parts(
             grid,
-            vec![BCType::ReflectiveWall; 4],
-            vec![BCType::ReflectiveWall; 3],
-            value,
             outer,
-            inner,
+            None,
+            Vec::new(),
+            Vec::new(),
+            value,
             0.0,
         );
 

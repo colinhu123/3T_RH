@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bc1;
 use crate::field1::Field;
-use crate::geometry::{self, Geometry, Projection};
+use crate::geometry::{self, Projection};
 use crate::state::{Derived, State};
 
 pub type Offset = (isize, isize);
@@ -24,7 +24,7 @@ pub struct GhostInfo {
     /// analytic physical BoundaryElement this ghost belongs to.
     pub boundary_id: usize,
     /// Precomputed WENO-extrapolation data (only for Wall / Outflow /
-    /// FarField ghosts).
+    /// FarField / NonReflectiveOutflow ghosts).
     pub bc: Option<Box<bc1::GhostBC>>,
 }
 
@@ -324,8 +324,8 @@ fn build_ghost_info(
     // outside the outer polygon -> outer boundary; inside the interior
     // obstacle polygon -> inner boundary. A ghost must satisfy exactly
     // one, so the remaining case is a bug.
-    let outer_fluid = field.outer_bound.is_fluid(p);
-    let inner_fluid = field.inner_bound.is_fluid(p);
+    let outer_fluid = field.outer_contains(p);
+    let inner_fluid = field.inner_contains(p);
     let (boundary, elements) = if !outer_fluid {
         (BoundaryKind::Outer, &field.outer_boundary)
     } else if !inner_fluid {
@@ -352,6 +352,7 @@ fn build_ghost_info(
         bc1::BCType::Wall
         | bc1::BCType::PrimitiveWall
         | bc1::BCType::Outflow { .. }
+        | bc1::BCType::NonReflectiveOutflow
         | bc1::BCType::FarField(_) => {
             // PrimitiveWall uses the benchmark boundary WENO exponent
             // (q = 10 for the Mach-3 cylinder, Tan et al. 2012);
@@ -366,8 +367,15 @@ fn build_ghost_info(
             // geometries) simply carries no precomputed data and the
             // per-stage Wall reconstruction degrades LOCALLY to
             // ReflectiveWall instead of aborting the build.
+            //
+            // NonReflectiveOutflow also uses the fallible variant: it has
+            // no ReflectiveWall-style fallback arm, so a ghost whose paper
+            // stencil cannot be formed keeps the pre-stage slow path
+            // (bc_pre = None) instead of aborting the build.
             let pre = match &elements[boundary_id].bc {
-                bc1::BCType::Wall => bc1::try_precompute_ghost_bc(&project, field, beta_forms, q),
+                bc1::BCType::Wall | bc1::BCType::NonReflectiveOutflow => {
+                    bc1::try_precompute_ghost_bc(&project, field, beta_forms, q)
+                }
                 _ => Some(bc1::precompute_ghost_bc(&project, field, beta_forms, q)),
             };
 

@@ -20,7 +20,7 @@ use state::{Derived, Direction, State};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::bc1::BCType;
+
 static REPORTED_BAD_STATE: AtomicBool = AtomicBool::new(false);
 #[inline(always)]
 fn state_is_finite(s: State) -> bool {

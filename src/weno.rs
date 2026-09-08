@@ -1,6 +1,7 @@
-use crate::{constant, state};
+use crate::{constant, state,state::State};
 use ndarray::{Array1, Array2};
 use ndarray_linalg::Inverse;
+
 
 #[derive(Clone, Copy, Debug)]
 pub struct Stencil6 {
@@ -478,6 +479,201 @@ impl Stencil6 {
         let l = Self::build_l_plain(&points[3], &points[2], &d[3], &d[2], dir);
         let (lambda, r) = Self::build_r_plain(&points[3], &points[2], &d[3], &d[2], dir);
 
+        // ====================================================================
+        // Positivity-preserving characteristic FD-WENO5 branch
+        // (the PP_SWITCH == true "else" path of the original split).
+        //
+        // Input stencil for interface i+1/2:
+        //
+        //     points[0] = U_{i-2}
+        //     points[1] = U_{i-1}
+        //     points[2] = U_i
+        //     points[3] = U_{i+1}
+        //     points[4] = U_{i+2}
+        //     points[5] = U_{i+3}
+        //
+        // Zhang-Shu normalized LF splitting:
+        //
+        //     f+(U) = 1/2 [ U + F(U)/alpha ]
+        //     f-(U) = 1/2 [ U - F(U)/alpha ]
+        //
+        // with a single scalar local Lax-Friedrichs speed alpha, followed by
+        //
+        //     Fhat = alpha [ (h+)^-_PP - (h-)^+_PP ].
+        //
+        // NOTE: this branch ignores `recon_type`; it always works in the
+        // Roe characteristic space.
+        // ====================================================================
+        if constant::PP_SWITCH {
+            // ----------------------------------------------------------------
+            // Scalar local Lax-Friedrichs alpha over the whole stencil:
+            //
+            //     X:  alpha = max_j ( |u_j| + c_j )
+            //     Y:  alpha = max_j ( |v_j| + c_j )
+            //
+            // We need a single scalar LF speed, so no PHI-based c reduction.
+            // ----------------------------------------------------------------
+            let mut alpha = 0.0_f64;
+
+            for j in 0..6 {
+                let velocity = match dir {
+                    state::Direction::X => d[j].u,
+                    state::Direction::Y => d[j].v,
+                };
+
+                let cs = points[j].cs();
+
+                if !velocity.is_finite() || !cs.is_finite() {
+                    panic!(
+                        "PP-WENO: non-finite velocity/sound speed at stencil point {}. \
+                         velocity={}, cs={}, state={:?}",
+                        j, velocity, cs, points[j]
+                    );
+                }
+
+                if cs < 0.0 {
+                    panic!(
+                        "PP-WENO: negative sound speed at stencil point {}: cs={}",
+                        j, cs
+                    );
+                }
+
+                alpha = alpha.max(velocity.abs() + cs);
+            }
+
+            if !alpha.is_finite() || alpha <= 0.0 {
+                panic!(
+                    "PP-WENO: invalid local LF alpha={} for stencil {:?}",
+                    alpha, points
+                );
+            }
+
+            // ----------------------------------------------------------------
+            // Physical-space normalized LF split states:
+            //
+            //     fp = 1/2 ( U + F/alpha )
+            //     fm = 1/2 ( U - F/alpha )
+            // ----------------------------------------------------------------
+            let mut fp_phys = [State::new(); 6];
+            let mut fm_phys = [State::new(); 6];
+
+            for j in 0..6 {
+                let flux = points[j].flux_from_derived(&d[j], dir);
+
+                fp_phys[j] = State {
+                    rho: 0.5 * (points[j].rho + flux.rho / alpha),
+                    mom_x: 0.5 * (points[j].mom_x + flux.mom_x / alpha),
+                    mom_y: 0.5 * (points[j].mom_y + flux.mom_y / alpha),
+                    ee: 0.5 * (points[j].ee + flux.ee / alpha),
+                    ei: 0.5 * (points[j].ei + flux.ei / alpha),
+                    er: 0.5 * (points[j].er + flux.er / alpha),
+                };
+
+                fm_phys[j] = State {
+                    rho: 0.5 * (points[j].rho - flux.rho / alpha),
+                    mom_x: 0.5 * (points[j].mom_x - flux.mom_x / alpha),
+                    mom_y: 0.5 * (points[j].mom_y - flux.mom_y / alpha),
+                    ee: 0.5 * (points[j].ee - flux.ee / alpha),
+                    ei: 0.5 * (points[j].ei - flux.ei / alpha),
+                    er: 0.5 * (points[j].er - flux.er / alpha),
+                };
+            }
+
+            // ----------------------------------------------------------------
+            // Transform the split states into the Roe characteristic space:
+            //
+            //     cp_j = L fp_j
+            //     cm_j = L fm_j
+            // ----------------------------------------------------------------
+            let mut cp = [[0.0_f64; 6]; 6];
+            let mut cm = [[0.0_f64; 6]; 6];
+
+            for j in 0..6 {
+                cp[j] = l_dot(&l, &fp_phys[j].state2arr());
+                cm[j] = l_dot(&l, &fm_phys[j].state2arr());
+            }
+
+            // ----------------------------------------------------------------
+            // Positive split: positive waves run left -> right, so reconstruct
+            // from the LEFT of interface i+1/2 using points 0..4 (i-2 .. i+2).
+            //
+            //     hp_char = L (h+)^-_{i+1/2}
+            // ----------------------------------------------------------------
+            let mut hp_char = [0.0_f64; 6];
+
+            for k in 0..6 {
+                let stencil = [cp[0][k], cp[1][k], cp[2][k], cp[3][k], cp[4][k]];
+                hp_char[k] = weno5(&stencil);
+            }
+
+            // ----------------------------------------------------------------
+            // Negative split: negative waves run right -> left, so mirror the
+            // stencil to points 5..1 (i+3 .. i-1) and reuse the same
+            // left-biased weno5().
+            //
+            //     hm_char = L (h-)^+_{i+1/2}
+            // ----------------------------------------------------------------
+            let mut hm_char = [0.0_f64; 6];
+
+            for k in 0..6 {
+                let stencil = [cm[5][k], cm[4][k], cm[3][k], cm[2][k], cm[1][k]];
+                hm_char[k] = weno5(&stencil);
+            }
+
+            // ----------------------------------------------------------------
+            // Transform the reconstructed split states back to physical space.
+            // ----------------------------------------------------------------
+            let hp = r_dot(&r, &hp_char);
+            let hm = r_dot(&r, &hm_char);
+
+            let h_plus_high = State {
+                rho: hp[0],
+                mom_x: hp[1],
+                mom_y: hp[2],
+                ee: hp[3],
+                ei: hp[4],
+                er: hp[5],
+            };
+
+            let h_minus_high = State {
+                rho: hm[0],
+                mom_x: hm[1],
+                mom_y: hm[2],
+                ee: hm[3],
+                ei: hm[4],
+                er: hm[5],
+            };
+
+            // ----------------------------------------------------------------
+            // Safe states:
+            //
+            //     h_plus_high  is reconstructed on cell i      -> safe_plus  = f+(U_i)    = fp_phys[2]
+            //     h_minus_high is reconstructed on cell i+1    -> safe_minus = f-(U_{i+1}) = fm_phys[3]
+            // ----------------------------------------------------------------
+            let safe_plus = fp_phys[2];
+            let safe_minus = fm_phys[3];
+
+            // ----------------------------------------------------------------
+            // Apply the positivity/admissibility limiter to each split state.
+            // ----------------------------------------------------------------
+            let h_plus_pp = positivity_limiter(safe_plus, h_plus_high);
+            let h_minus_pp = positivity_limiter(safe_minus, h_minus_high);
+
+            // ----------------------------------------------------------------
+            // Final numerical flux:
+            //
+            //     Fhat = alpha [ (h+)^-_PP - (h-)^+_PP ]
+            // ----------------------------------------------------------------
+            return State {
+                rho: alpha * (h_plus_pp.rho - h_minus_pp.rho),
+                mom_x: alpha * (h_plus_pp.mom_x - h_minus_pp.mom_x),
+                mom_y: alpha * (h_plus_pp.mom_y - h_minus_pp.mom_y),
+                ee: alpha * (h_plus_pp.ee - h_minus_pp.ee),
+                ei: alpha * (h_plus_pp.ei - h_minus_pp.ei),
+                er: alpha * (h_plus_pp.er - h_minus_pp.er),
+            };
+        }
+
         let mut char_flux = [state::State::new(); 6];
         let mut char_state = [state::State::new(); 6];
 
@@ -576,6 +772,8 @@ impl Stencil6 {
             flux_minus[i] = weno5(&stencil);
         }
 
+        // The PP_SWITCH path was already handled above by an early return,
+        // so this legacy reconstruction is only reached when PP is disabled.
         let flux = state::State {
             rho: flux_plus[0] + flux_minus[0],
             mom_x: flux_plus[1] + flux_minus[1],
@@ -596,8 +794,365 @@ impl Stencil6 {
             ee: c[3],
             ei: c[4],
             er: c[5],
+        
         }
     }
+}
+
+
+#[inline(always)]
+fn q_star(safe: State, high: State) -> State {
+    let inv = 1.0 / (1.0 - constant::PP_W);
+
+    State {
+        rho: (safe.rho - constant::PP_W * high.rho) * inv,
+        mom_x: (safe.mom_x - constant::PP_W * high.mom_x) * inv,
+        mom_y: (safe.mom_y - constant::PP_W * high.mom_y) * inv,
+        ee: (safe.ee - constant::PP_W * high.ee) * inv,
+        ei: (safe.ei - constant::PP_W * high.ei) * inv,
+        er: (safe.er - constant::PP_W * high.er) * inv,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EnergyComponent {
+    Electron,
+    Ion,
+    Radiation,
+}
+#[inline(always)]
+fn state_lerp(safe: State, q: State, theta: f64) -> State {
+    State {
+        rho: safe.rho + theta * (q.rho - safe.rho),
+        mom_x: safe.mom_x + theta * (q.mom_x - safe.mom_x),
+        mom_y: safe.mom_y + theta * (q.mom_y - safe.mom_y),
+        ee: safe.ee + theta * (q.ee - safe.ee),
+        ei: safe.ei + theta * (q.ei - safe.ei),
+        er: safe.er + theta * (q.er - safe.er),
+    }
+}
+
+///
+/// Your admissibility constraint is
+///
+///     e_s = E_s/rho - (u^2 + v^2)/6 > 0
+///
+/// which, for rho > 0, is equivalent to
+///
+///     G_s(U)
+///       = E_s - (mx^2 + my^2)/(6 rho)
+///       > 0.
+///
+/// We return G_s here.
+///
+#[inline(always)]
+fn internal_constraint(s: State, component: EnergyComponent) -> f64 {
+    if !s.rho.is_finite() || s.rho <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+
+    let energy = match component {
+        EnergyComponent::Electron => s.ee,
+        EnergyComponent::Ion => s.ei,
+        EnergyComponent::Radiation => s.er,
+    };
+
+    energy - (s.mom_x * s.mom_x + s.mom_y * s.mom_y) / (6.0 * s.rho)
+}
+
+
+#[inline(always)]
+fn state_is_finite(s: State) -> bool {
+    s.rho.is_finite()
+        && s.mom_x.is_finite()
+        && s.mom_y.is_finite()
+        && s.ee.is_finite()
+        && s.ei.is_finite()
+        && s.er.is_finite()
+}
+
+
+#[inline(always)]
+fn is_admissible(s: State) -> bool {
+    state_is_finite(s)
+        && s.rho >= constant::EPS_LIMITER
+        && internal_constraint(s, EnergyComponent::Electron) >= constant::EPS_LIMITER
+        && internal_constraint(s, EnergyComponent::Ion) >= constant::EPS_LIMITER
+        && internal_constraint(s, EnergyComponent::Radiation) >= constant::EPS_LIMITER
+}
+
+#[inline]
+fn density_limiter(safe: State, high: State) -> State {
+    let qs = q_star(safe, high);
+
+    let rho_min = high.rho.min(qs.rho);
+
+    if rho_min >= constant::EPS_LIMITER {
+        return high;
+    }
+
+    let denominator = safe.rho - rho_min;
+
+    if !denominator.is_finite() || denominator <= 0.0 {
+        panic!(
+            "PP density limiter: invalid denominator. \
+             safe.rho={}, high.rho={}, qstar.rho={}",
+            safe.rho, high.rho, qs.rho
+        );
+    }
+
+    let theta =
+        ((safe.rho - constant::EPS_LIMITER) / denominator)
+            .clamp(0.0, 1.0);
+
+    if !theta.is_finite() {
+        panic!(
+            "PP density limiter produced non-finite theta: \
+             safe.rho={}, rho_min={}",
+            safe.rho, rho_min
+        );
+    }
+
+    let mut limited = high;
+
+    limited.rho =
+        safe.rho + theta * (high.rho - safe.rho);
+
+    limited
+}
+
+#[inline]
+fn theta_for_component(
+    safe: State,
+    candidate: State,
+    component: EnergyComponent,
+) -> f64 {
+    let g_candidate = internal_constraint(candidate, component);
+
+    if g_candidate >= constant::EPS_LIMITER {
+        return 1.0;
+    }
+
+    let g_safe = internal_constraint(safe, component);
+
+    if !g_safe.is_finite() || g_safe <= constant::EPS_LIMITER {
+        panic!(
+            "PP limiter: safe state is not safely admissible. \
+             G_safe={}",
+            g_safe
+        );
+    }
+
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+
+    for _ in 0..constant::MAX_ITER {
+        let mid = 0.5 * (lo + hi);
+
+        let s = state_lerp(safe, candidate, mid);
+
+        let g = internal_constraint(s, component);
+
+        if g.is_finite() && g >= constant::EPS_LIMITER {
+            // Still inside the admissible region.
+            // Try to retain more of the high-order state.
+            lo = mid;
+        } else {
+            // Outside the admissible region.
+            hi = mid;
+        }
+    }
+
+    lo
+}
+
+#[inline]
+fn theta_admissible(safe: State, candidate: State) -> f64 {
+    // Fast path: overwhelmingly common in smooth regions.
+    if internal_constraint(candidate, EnergyComponent::Electron) >= constant::EPS_LIMITER
+        && internal_constraint(candidate, EnergyComponent::Ion) >= constant::EPS_LIMITER
+        && internal_constraint(candidate, EnergyComponent::Radiation) >= constant::EPS_LIMITER
+    {
+        return 1.0;
+    }
+
+    let theta_e =
+        theta_for_component(
+            safe,
+            candidate,
+            EnergyComponent::Electron,
+        );
+
+    let theta_i =
+        theta_for_component(
+            safe,
+            candidate,
+            EnergyComponent::Ion,
+        );
+
+    let theta_r =
+        theta_for_component(
+            safe,
+            candidate,
+            EnergyComponent::Radiation,
+        );
+
+    theta_e.min(theta_i).min(theta_r)
+}
+
+pub fn positivity_limiter(safe: State, high: State) -> State {
+    // ------------------------------------------------------------------
+    // 0. Validate safe state.
+    // ------------------------------------------------------------------
+
+    if !state_is_finite(safe) {
+        panic!(
+            "PP limiter received non-finite safe state: {:?}",
+            safe
+        );
+    }
+
+    if !is_admissible(safe) {
+        panic!(
+            "PP limiter safe state is not admissible.\n\
+             safe = {:?}\n\
+             G_e = {:e}\n\
+             G_i = {:e}\n\
+             G_r = {:e}",
+            safe,
+            internal_constraint(safe, EnergyComponent::Electron),
+            internal_constraint(safe, EnergyComponent::Ion),
+            internal_constraint(safe, EnergyComponent::Radiation),
+        );
+    }
+
+    if !state_is_finite(high) {
+        panic!(
+            "PP limiter received non-finite high-order state: {:?}",
+            high
+        );
+    }
+
+
+    // ------------------------------------------------------------------
+    // 1. Density limiter.
+    //
+    // This modifies only high.rho.
+    // ------------------------------------------------------------------
+
+    let high_hat = density_limiter(safe, high);
+
+
+    // ------------------------------------------------------------------
+    // 2. Reconstruct q* AFTER density limiting.
+    // ------------------------------------------------------------------
+
+    let qstar_hat = q_star(safe, high_hat);
+
+
+    // ------------------------------------------------------------------
+    // 3. Density must now be positive for BOTH states.
+    // ------------------------------------------------------------------
+
+    let rho_tol = 100.0 * f64::EPSILON * safe.rho.abs().max(1.0);
+
+    if high_hat.rho < constant::EPS_LIMITER - rho_tol
+        || qstar_hat.rho < constant::EPS_LIMITER - rho_tol
+    {
+        panic!(
+            "PP density limiter failed.\n\
+             safe.rho     = {:e}\n\
+             high.rho     = {:e}\n\
+             high_hat.rho = {:e}\n\
+             qstar.rho    = {:e}",
+            safe.rho,
+            high.rho,
+            high_hat.rho,
+            qstar_hat.rho,
+        );
+    }
+
+
+    // ------------------------------------------------------------------
+    // 4. Generalized pressure/internal-energy limiter.
+    //
+    // We must check BOTH:
+    //
+    //     high_hat
+    //     qstar_hat
+    //
+    // against the same safe state.
+    // ------------------------------------------------------------------
+
+    let theta_high =
+        theta_admissible(safe, high_hat);
+
+    let theta_star =
+        theta_admissible(safe, qstar_hat);
+
+    let theta =
+        theta_high.min(theta_star);
+
+
+    if !theta.is_finite() || theta < 0.0 || theta > 1.0 {
+        panic!(
+            "PP limiter produced invalid theta: {}",
+            theta
+        );
+    }
+
+
+    // ------------------------------------------------------------------
+    // 5. Full conservative-state convex scaling.
+    // ------------------------------------------------------------------
+
+    let limited =
+        state_lerp(safe, high_hat, theta);
+
+
+    // ------------------------------------------------------------------
+    // 6. q* is NOT independently limited.
+    //
+    // Reconstruct it from the final interface state so that:
+    //
+    //     safe = (1-w) q* + w limited
+    //
+    // remains exactly satisfied.
+    // ------------------------------------------------------------------
+
+    let qstar_final =
+        q_star(safe, limited);
+
+
+    // ------------------------------------------------------------------
+    // 7. Final sanity check.
+    // ------------------------------------------------------------------
+
+    if !is_admissible(limited)
+        || !is_admissible(qstar_final)
+    {
+        panic!(
+            "PP limiter final state is not admissible.\n\
+             safe        = {:?}\n\
+             high        = {:?}\n\
+             high_hat    = {:?}\n\
+             limited     = {:?}\n\
+             qstar_final = {:?}\n\
+             theta_high  = {:e}\n\
+             theta_star  = {:e}\n\
+             theta       = {:e}",
+            safe,
+            high,
+            high_hat,
+            limited,
+            qstar_final,
+            theta_high,
+            theta_star,
+            theta,
+        );
+    }
+
+    limited
 }
 
 /// component-major: arr[component][point] for a 6-point stencil
@@ -685,6 +1240,8 @@ pub fn weno5(stencil: &[f64; 5]) -> f64 {
 
     w0 * p0 + w1 * p1 + w2 * p2
 }
+
+
 
 #[cfg(test)]
 mod tests {

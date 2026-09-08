@@ -192,6 +192,28 @@ impl State {
         }
     }
 
+    pub fn minus(&self, s2: State) -> Self {
+        Self {
+            rho: self.rho - s2.rho,
+            mom_x: self.mom_x - s2.mom_x,
+            mom_y: self.mom_y - s2.mom_y,
+            ee: self.ee - s2.ee,
+            ei: self.ei - s2.ei,
+            er: self.er - s2.er,
+        }
+    }
+
+    pub fn lerp(&self, q:State, theta: f64) -> Self {
+        Self {
+        rho: self.rho + theta * (q.rho - self.rho),
+        mom_x: self.mom_x + theta * (q.mom_x - self.mom_x),
+        mom_y: self.mom_y + theta * (q.mom_y - self.mom_y),
+        ee: self.ee + theta * (q.ee - self.ee),
+        ei: self.ei + theta * (q.ei - self.ei),
+        er: self.er + theta * (q.er - self.er),
+    }
+    }
+
     pub fn scalar_prod(&self, scalar: f64) -> Self {
         Self {
             rho: self.rho * scalar,

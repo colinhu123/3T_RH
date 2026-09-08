@@ -24,3 +24,9 @@ pub const DIFFUSION_ACTIVE: bool = KAPPA_E != 0.0 || KAPPA_I != 0.0 || KAPPA_R !
 pub const SOURCE_ACTIVE: bool = OMEGA_EI != 0.0 || OMEGA_ER != 0.0;
 
 pub const PHI: f64 = 5.0; //this is used in modified LF to reduce carbuncle effect
+
+pub const EPS_LIMITER: f64 = 1e-13; //constant used in positivity limiter
+pub const PP_W: f64 = 1.0/12.0;
+pub const MAX_ITER: usize = 60;
+
+pub const PP_SWITCH: bool = true;

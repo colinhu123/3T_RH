@@ -1573,7 +1573,7 @@ pub fn init_planar_shock_channel_with(h: f64, shock_mach: f64, shock_x0: f64) ->
 }
 
 pub fn init_forward_facing_step_rotated() -> Field {
-    init_forward_facing_step_rotated_with(1.0 / 320.0, 3.0, 0.2, 5.0)
+    init_forward_facing_step_rotated_with(1.0 / 80.0, 3.0, 0.2, 5.0)
 }
 
 pub fn init_forward_facing_step_rotated_with(

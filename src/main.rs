@@ -9,512 +9,57 @@ mod init;
 mod io;
 mod monitor;
 mod noncon;
+mod solver;
 mod source;
 mod state;
 mod weno;
 
-use field1::Field;
-use ghost::GhostGrid;
-use rayon::prelude::*;
-use state::{Derived, Direction, State};
+use solver::{Config, Solver};
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-
-static REPORTED_BAD_STATE: AtomicBool = AtomicBool::new(false);
-#[inline(always)]
-fn state_is_finite(s: State) -> bool {
-    s.rho.is_finite()
-        && s.mom_x.is_finite()
-        && s.mom_y.is_finite()
-        && s.ee.is_finite()
-        && s.ei.is_finite()
-        && s.er.is_finite()
-}
-#[inline(always)]
-fn internal_energies(s: State) -> Option<(f64, f64, f64)> {
-    if !state_is_finite(s) || s.rho <= 0.0 {
-        return None;
-    }
-    let ux = s.mom_x / s.rho;
-    let uy = s.mom_y / s.rho;
-    let k = (ux * ux + uy * uy) / 6.0;
-    Some((s.ee / s.rho - k, s.ei / s.rho - k, s.er / s.rho - k))
-}
-#[inline(always)]
-fn assert_admissible(s: State, idx: (isize, isize), where_: &str) {
-    let e = internal_energies(s);
-    let bad = !state_is_finite(s)
-        || s.rho <= 0.0
-        || e.map_or(true, |q| q.0 <= 0.0 || q.1 <= 0.0 || q.2 <= 0.0);
-    if bad {
-        if !REPORTED_BAD_STATE.swap(true, Ordering::SeqCst) {
-            eprintln!(
-                "\nFIRST NON-PHYSICAL STATE\nwhere = {}\nidx = {:?}\nstate = {:?}\ninternal energies = {:?}\n",
-                where_, idx, s, e
-            );
-        }
-        panic!("non-physical state at {:?} in {}", idx, where_);
-    }
-}
-
-// ============================================================================
-// Per-step scratch buffers, allocated once in main().
-//
-// fx[i][j] : x-interface flux at i-1/2          (i in 0..=nx)
-// fy[j][i] : y-interface flux at j-1/2          (j in 0..=ny)
-// dfx/dfy  : diffusion interface fluxes (same layout)
-// rhs      : semi-discrete operator output
-// derived  : per-stage derived quantities for fluid cells
-// ============================================================================
-
-struct Scratch {
-    fx: Vec<State>,
-    fy: Vec<State>,
-    dfx: Vec<State>,
-    dfy: Vec<State>,
-    rhs: Vec<State>,
-    derived: Vec<Derived>,
-    /// Copy of the semi-discrete RHS dU/dt at the start state of the most
-    /// recent RK3-SSP step (the stage-1 RHS). Used ONLY by the residual
-    /// monitor; it never feeds back into the time integration.
-    residual: Vec<State>,
-}
-
-impl Scratch {
-    fn new(u: &Field) -> Self {
-        let nx = u.grid.nx;
-        let ny = u.grid.ny;
-        Self {
-            fx: vec![State::new(); (nx + 1) * ny],
-            fy: vec![State::new(); nx * (ny + 1)],
-            dfx: vec![State::new(); (nx + 1) * ny],
-            dfy: vec![State::new(); nx * (ny + 1)],
-            rhs: vec![State::new(); nx * ny],
-            derived: vec![Derived::new(); nx * ny],
-            residual: vec![State::new(); nx * ny],
-        }
-    }
-}
-
-#[inline(always)]
-fn v_at(u: &Field, g: &GhostGrid, t: u32) -> State {
-    let t = t as usize;
-    if t < u.grid.len() {
-        u.value[t]
-    } else {
-        g.values[t - u.grid.len()]
-    }
-}
-
-#[inline(always)]
-fn d_at(g: &GhostGrid, derived: &[Derived], t: u32) -> Derived {
-    let t = t as usize;
-    if t < derived.len() {
-        derived[t]
-    } else {
-        g.derived[t - derived.len()]
-    }
-}
-
-/// Gather a 6-point interface stencil from a fluid anchor cell.
-///
-/// `di0` is the offset (relative to the anchor) of the first stencil point
-/// along `dir`. For an interface centered exactly on the anchor, di0 = -3;
-/// for an interface centered one cell to the right/top, di0 = -2.
-#[inline(always)]
-fn gather6(
-    u: &Field,
-    g: &GhostGrid,
-    derived: &[Derived],
-    anchor: usize,
-    di0: isize,
-    dir: Direction,
-) -> ([State; 6], [Derived; 6]) {
-    let mut st = [State::new(); 6];
-    let mut dd = [Derived::new(); 6];
-    for q in 0..6isize {
-        let d = di0 + q;
-        let k = match dir {
-            Direction::X => g.k_for(d, 0),
-            Direction::Y => g.k_for(0, d),
-        };
-        let t = g.target(anchor, k);
-        st[q as usize] = v_at(u, g, t);
-        dd[q as usize] = d_at(g, derived, t);
-    }
-    (st, dd)
-}
-
-/// Gather a 9-point derived stencil (non-conservative term).
-#[inline(always)]
-fn gather9d(
-    g: &GhostGrid,
-    derived: &[Derived],
-    anchor: usize,
-    di0: isize,
-    dir: Direction,
-) -> [Derived; 9] {
-    let mut dd = [Derived::new(); 9];
-    for q in 0..9isize {
-        let d = di0 + q;
-        let k = match dir {
-            Direction::X => g.k_for(d, 0),
-            Direction::Y => g.k_for(0, d),
-        };
-        let t = g.target(anchor, k);
-        dd[q as usize] = d_at(g, derived, t);
-    }
-    dd
-}
-
-/// Compute the interface fluxes (WENO + diffusion) once per interface, and
-/// then assemble the cell-centered semi-discrete operator from the stored
-/// interface values plus the non-conservative / source terms.
-fn l(u: &Field, ghosts: &mut GhostGrid, s: &mut Scratch) {
-    let nx = u.grid.nx;
-    let ny = u.grid.ny;
-    let dx = u.grid.dx;
-    let dy = u.grid.dy;
-
-    // Every unique ghost is reconstructed exactly once for this RK stage.
-    ghosts.update_values_parallel(u);
-
-    // Per-stage derived quantities for fluid cells.
-    s.derived.par_iter_mut().enumerate().for_each(|(l, o)| {
-        if u.fluid[l] {
-            *o = Derived::from_state(u.value[l]);
-        }
-    });
-
-    let g = &*ghosts;
-
-    // ------------------------------------------------------------------
-    // X-direction interface fluxes.
-    //
-    // Interface i-1/2 is centered on cell (i, j):
-    //   * if (i, j)     is fluid, anchor = (i, j),   offsets -3..=2
-    //   * else if (i-1,j) is fluid, anchor = (i-1,j), offsets -2..=3
-    //   * else the interface is unused (both neighbors solid).
-    // ------------------------------------------------------------------
-    {
-        let fx = &mut s.fx;
-        let derived = &s.derived;
-        fx.par_iter_mut().enumerate().for_each(|(lin, out)| {
-            let i = lin / ny;
-            let anchor = if i < nx && u.fluid[lin] {
-                (lin, -3isize)
-            } else if i >= 1 && u.fluid[lin - ny] {
-                (lin - ny, -2isize)
-            } else {
-                *out = State::new();
-                return;
-            };
-            let (st, dd) = gather6(u, g, derived, anchor.0, anchor.1, Direction::X);
-            *out = weno::Stencil6::reconstruction_fast(&st, &dd, Direction::X, true);
-        });
-    }
-
-    // ------------------------------------------------------------------
-    // Y-direction interface fluxes (layout: [j][i] = j*nx + i).
-    // ------------------------------------------------------------------
-    {
-        let fy = &mut s.fy;
-        let derived = &s.derived;
-        fy.par_iter_mut().enumerate().for_each(|(lin, out)| {
-            let j = lin / nx;
-            let i = lin % nx;
-            let cell = i * ny + j;
-            let anchor = if j < ny && u.fluid[cell] {
-                (cell, -3isize)
-            } else if j >= 1 && u.fluid[cell - 1] {
-                (cell - 1, -2isize)
-            } else {
-                *out = State::new();
-                return;
-            };
-            let (st, dd) = gather6(u, g, derived, anchor.0, anchor.1, Direction::Y);
-            *out = weno::Stencil6::reconstruction_fast(&st, &dd, Direction::Y, true);
-        });
-    }
-
-    // ------------------------------------------------------------------
-    // Diffusion interface fluxes (only when diffusion is enabled).
-    // ------------------------------------------------------------------
-    if constant::DIFFUSION_ACTIVE {
-        {
-            let dfx = &mut s.dfx;
-            let derived = &s.derived;
-            dfx.par_iter_mut().enumerate().for_each(|(lin, out)| {
-                let i = lin / ny;
-                let anchor = if i < nx && u.fluid[lin] {
-                    (lin, -3isize)
-                } else if i >= 1 && u.fluid[lin - ny] {
-                    (lin - ny, -2isize)
-                } else {
-                    *out = State::new();
-                    return;
-                };
-                let (_st, dd) = gather6(u, g, derived, anchor.0, anchor.1, Direction::X);
-                *out = diffusion::build_diffusion_from_derived(&dd);
-            });
-        }
-        {
-            let dfy = &mut s.dfy;
-            let derived = &s.derived;
-            dfy.par_iter_mut().enumerate().for_each(|(lin, out)| {
-                let j = lin / nx;
-                let i = lin % nx;
-                let cell = i * ny + j;
-                let anchor = if j < ny && u.fluid[cell] {
-                    (cell, -3isize)
-                } else if j >= 1 && u.fluid[cell - 1] {
-                    (cell - 1, -2isize)
-                } else {
-                    *out = State::new();
-                    return;
-                };
-                let (_st, dd) = gather6(u, g, derived, anchor.0, anchor.1, Direction::Y);
-                *out = diffusion::build_diffusion_from_derived(&dd);
-            });
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Cell-centered right-hand side.
-    // ------------------------------------------------------------------
-    {
-        let rhs = &mut s.rhs;
-        let fx = &s.fx;
-        let fy = &s.fy;
-        let dfx = &s.dfx;
-        let dfy = &s.dfy;
-        let derived = &s.derived;
-
-        rhs.par_iter_mut().enumerate().for_each(|(lin, out)| {
-            if !u.fluid[lin] {
-                *out = State::new();
-                return;
-            }
-
-            let i = lin / ny;
-            let j = lin % ny;
-
-            let flux_l = fx[lin];
-            let flux_r = fx[lin + ny];
-            let flux_b = fy[j * nx + i];
-            let flux_t = fy[(j + 1) * nx + i];
-
-            let fx_term = state::update(flux_l, flux_r).scalar_prod(1.0 / dx);
-            let fy_term = state::update(flux_b, flux_t).scalar_prod(1.0 / dy);
-
-            let dx9 = gather9d(g, derived, lin, -4, Direction::X);
-            let dy9 = gather9d(g, derived, lin, -4, Direction::Y);
-
-            let nc_x = noncon::nonconservative_x_pre(&dx9, dx);
-            let nc_y = noncon::nonconservative_y_pre(&dy9, dy);
-
-            let source_term = if constant::SOURCE_ACTIVE {
-                source::source(u.value[lin])
-            } else {
-                State::new()
-            };
-
-            let mut dif_term = State::new();
-            if constant::DIFFUSION_ACTIVE {
-                let dif_x = state::update(dfx[lin], dfx[lin + ny]).scalar_prod(-1.0 / (dx * dx));
-                let dif_y = state::update(dfy[j * nx + i], dfy[(j + 1) * nx + i])
-                    .scalar_prod(-1.0 / (dy * dy));
-                dif_term = dif_x.add(dif_y);
-            }
-
-            *out = fx_term
-                .add(fy_term)
-                .add(nc_x)
-                .add(nc_y)
-                .add(source_term)
-                .add(dif_term);
-        });
-    }
-}
-
-#[inline(always)]
-fn project_equal_energies(mut s: State) -> State {
-    let e_avg = (s.ee + s.ei + s.er) / 3.0;
-
-    s.ee = e_avg;
-    s.ei = e_avg;
-    s.er = e_avg;
-
-    s
-}
-#[inline]
-fn stage_update_rhs(base: &Field, dst: &mut Field, rhs: &[State], coef: f64, label: &str) {
-    let ny = base.grid.ny;
-
-    dst.value.par_iter_mut().enumerate().for_each(|(l, o)| {
-        if !base.fluid[l] {
-            return;
-        }
-
-        let value = base.value[l].add(rhs[l].scalar_prod(coef));
-
-        let value = project_equal_energies(value);
-        assert_admissible(value, ((l / ny) as isize, (l % ny) as isize), label);
-
-        *o = value;
-    });
-}
-
-#[inline]
-fn stage_update_comb(
-    base: &Field,
-    add: &Field,
-    dst: &mut Field,
-    rhs: &[State],
-    coef: f64,
-    w_base: f64,
-    w_add: f64,
-    label: &str,
-) {
-    let ny = base.grid.ny;
-
-    dst.value.par_iter_mut().enumerate().for_each(|(l, o)| {
-        if !base.fluid[l] {
-            return;
-        }
-
-        let value = base.value[l]
-            .scalar_prod(w_base)
-            .add(add.value[l].scalar_prod(w_add))
-            .add(rhs[l].scalar_prod(coef));
-
-        let value = project_equal_energies(value);
-
-        assert_admissible(value, ((l / ny) as isize, (l % ny) as isize), label);
-
-        *o = value;
-    });
-}
-
-fn rk3_ssp(
-    u: &mut Field,
-    ghosts: &mut GhostGrid,
-    dt: f64,
-    u1: &mut Field,
-    u2: &mut Field,
-    u3: &mut Field,
-    s: &mut Scratch,
-) {
-    l(&*u, ghosts, s);
-
-    // Monitoring hook (no influence on the integration): the first l() call
-    // of an RK3-SSP step evaluates the semi-discrete operator exactly at the
-    // step-start state, i.e. RHS(U^n) = dU/dt(U^n). Keep a copy so the
-    // residual monitor can report the true RHS residual without a full extra
-    // operator evaluation. Subsequent l() calls overwrite s.rhs, hence the
-    // copy here.
-    s.residual.copy_from_slice(&s.rhs);
-
-    stage_update_rhs(u, u1, &s.rhs, dt, "RK1 state");
-    u1.time = u.time + dt;
-
-    l(&*u1, ghosts, s);
-    stage_update_comb(u, u1, u2, &s.rhs, dt / 4.0, 0.75, 0.25, "RK2 state");
-    u2.time = u.time + 0.5 * dt;
-
-    l(&*u2, ghosts, s);
-    stage_update_comb(
-        u,
-        u2,
-        u3,
-        &s.rhs,
-        2.0 * dt / 3.0,
-        1.0 / 3.0,
-        2.0 / 3.0,
-        "RK3 state",
-    );
-    u3.time = u.time + dt;
-
-    std::mem::swap(u, u3);
-}
-
-fn calc_global_dt(u: &Field) -> f64 {
-    let nx = u.grid.nx;
-    let ny = u.grid.ny;
-
-    let dx = u.grid.dx;
-    let dy = u.grid.dy;
-
-    let mut global_dt = f64::INFINITY;
-
-    for i in 0..nx {
-        for j in 0..ny {
-            let idx = (i as isize, j as isize);
-            if !u.is_in_domain(idx) {
-                continue;
-            }
-            let state = u.get(idx);
-
-            let local_dt = dt::get_local_dt(state, dx, dy);
-
-            global_dt = global_dt.min(local_dt);
-        }
-    }
-
-    global_dt
+/// Parse the optional restart id from the command line
+/// (e.g. `cargo run --release -- 12`).
+fn parse_restart_id() -> Option<usize> {
+    std::env::args()
+        .nth(1)
+        .map(|s| s.parse::<usize>().expect("restart id must be integer"))
 }
 
 fn main() {
     // Fresh: cargo run --release
     // Restart from solution_0012.bin: cargo run --release -- 12
-    let restart_id = std::env::args()
-        .nth(1)
-        .map(|s| s.parse::<usize>().expect("restart id must be integer"));
+    let cfg = Config::default();
+    let restart_id = parse_restart_id();
+
     if restart_id.is_none() {
         io::clear_data_folder();
     }
 
-    //let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::HighOrder);
     let mut u = init::init_forward_facing_step_rotated();
-    //let mut u = init::init_isentropic_vortex();
-    let t_store_interval = 0.05_f64;
 
-    // ---------------------------------------------------------
-    // Load restart file first
-    // ---------------------------------------------------------
     if let Some(id) = restart_id {
         let path = format!("data/solution_{:04}.bin", id);
         io::load_data(&mut u, &path);
     }
 
     let mut store_id = if restart_id.is_some() {
-        (u.time / t_store_interval).round() as usize
+        (u.time / cfg.store_interval).round() as usize
     } else {
         0
     };
 
-    let dx = u.grid.dx;
-    let dy = u.grid.dy;
-    let lx = dx * u.grid.nx as f64;
-    let ly = dy * u.grid.ny as f64;
-    let offsets = ghost::default_stencil_offsets();
-    let mut ghosts = ghost::GhostGrid::build(&u, &offsets);
-    ghosts.print_summary();
+    // Physical extents for the restart-file header.
+    let lx = u.grid.dx * u.grid.nx as f64;
+    let ly = u.grid.dy * u.grid.ny as f64;
 
-    let mut scratch = Scratch::new(&u);
-    let mut u1 = u.empty_like();
-    let mut u2 = u.empty_like();
-    let mut u3 = u.empty_like();
+    let mut solver = Solver::new(&u);
+    solver.ghosts().print_summary();
 
-    // Per-step numerical-health diagnostics.
-    // Fresh runs truncate data/monitor.csv and write a new header;
-    // restarts append to the existing file.
+    // Per-step numerical-health diagnostics. Fresh runs truncate
+    // data/monitor.csv and write a new header; restarts append to the file.
     let mut monitor = monitor::Monitor::new("data/monitor.csv", restart_id.is_some());
 
     let mut t = u.time;
-    let t_final = 10.0_f64;
-    let mut next_store_time = (store_id + 1) as f64 * t_store_interval;
+    let mut next_store_time = (store_id + 1) as f64 * cfg.store_interval;
     let mut n = 0usize;
 
     if restart_id.is_none() {
@@ -527,26 +72,20 @@ fn main() {
         );
     }
 
-    while t < t_final - 1e-14 {
-        let dt_cfl = calc_global_dt(&u); 
-        let mut dt = 0.8 * dt_cfl; 
-        if next_store_time <= t_final && t + dt > next_store_time {
+    while t < cfg.t_final - 1e-14 {
+        let dt_cfl = solver.global_dt(&u);
+        let mut dt = cfg.dt_factor * dt_cfl;
+
+        // Clip dt so the run lands exactly on output times and t_final.
+        if next_store_time <= cfg.t_final && t + dt > next_store_time {
             dt = next_store_time - t;
         }
-        if t + dt > t_final {
-            dt = t_final - t;
+        if t + dt > cfg.t_final {
+            dt = cfg.t_final - t;
         }
         assert!(dt > 0.0, "non-positive dt at t={}", t);
 
-        rk3_ssp(
-            &mut u,
-            &mut ghosts,
-            dt,
-            &mut u1,
-            &mut u2,
-            &mut u3,
-            &mut scratch,
-        );
+        solver.step(&mut u, dt);
         t = u.time;
         n += 1;
         println!(
@@ -554,29 +93,33 @@ fn main() {
             n, t, dt, dt_cfl
         );
 
-        // After rk3_ssp the mem::swap left U^{n+1} in `u` and the
-        // pre-step U^n in `u3`, so the temporal norm reuses the existing
-        // buffer without cloning the solution.
-        //
-        // scratch.residual holds the semi-discrete RHS dU/dt evaluated at the
-        // pre-step state U^n (stage-1 RHS of this step); the monitor reduces
-        // it to the per-component R1 / R2 / R_inf residual norms.
-        monitor.write_step(n, &u, Some(&u3), dt, dt_cfl, Some(&scratch.residual));
+        // residual() is the RHS dU/dt evaluated at the pre-step state U^n
+        // of the step just taken; previous_state() is that same U^n. The
+        // monitor reuses both as its old-field / residual inputs.
+        monitor.write_step(
+            n,
+            &u,
+            Some(solver.previous_state()),
+            dt,
+            dt_cfl,
+            Some(solver.residual()),
+        );
+
         if n % 100 == 0 {
             bc1::print_ilw_wall_statistics();
             bc1::print_reflective_wall_statistics();
         }
 
-        if next_store_time <= t_final && t >= next_store_time - 1e-12 {
+        if next_store_time <= cfg.t_final && t >= next_store_time - 1e-12 {
             store_id += 1;
             let filename = format!("solution_{:04}.bin", store_id);
             io::save_data(&u, &filename, lx, ly);
             println!("stored {} at t={:.8e}", filename, t);
-            next_store_time = (store_id + 1) as f64 * t_store_interval;
+            next_store_time = (store_id + 1) as f64 * cfg.store_interval;
         }
     }
 
-    let last_regular = store_id as f64 * t_store_interval;
+    let last_regular = store_id as f64 * cfg.store_interval;
     if (t - last_regular).abs() > 1e-12 {
         store_id += 1;
         let filename = format!("solution_{:04}.bin", store_id);
@@ -594,6 +137,10 @@ fn main() {
 #[cfg(test)]
 mod parity {
     use super::*;
+    use crate::field1::Field;
+    use crate::ghost::GhostGrid;
+    use crate::solver::{Scratch, calc_global_dt, l, rk3_ssp, stage_update_rhs};
+    use crate::state::{Derived, Direction, State};
 
     fn rng(seed: &mut u64) -> f64 {
         *seed = seed

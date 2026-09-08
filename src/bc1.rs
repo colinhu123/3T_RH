@@ -1329,50 +1329,44 @@ fn periodic_value(
 ) -> state::State {
     let (i, j) = idx;
 
-    // This implementation is for the translating-shock test,
-    // where periodicity is only applied in the y direction.
+    // Axis-general periodic wrap for the translating-shock test.
     //
-    // Physical periodic interval:
+    // The ghost lies just outside a periodic side of a rectangular fluid
+    // domain. Periodicity applies along whichever grid axis the ghost
+    // leaves the domain:
     //
-    //     y in [y0, y0 + Ly)
+    //   * left/right ghosts (i out of [0, nx)) wrap the x index,
+    //   * top/bottom ghosts (j out of [0, ny)) wrap the y index,
+    //   * corner ghosts (both out of range, fully periodic domain) wrap
+    //     both coordinates.
     //
-    // The polygon upper boundary itself is not a fluid grid point.
-    // Therefore the valid periodic y indices are
+    // The periodic cell count is the grid extent along the axis, i.e. the
+    // full domain is one period:
     //
-    //     j = 0, ..., Np - 1.
+    //     i = 0, ..., nx - 1
+    //     j = 0, ..., ny - 1
     //
-    // Find Np from the projected horizontal boundary.
-    let dy = field.grid.dy;
+    // Wrapping a coordinate that is already in range is a no-op, so a
+    // single rem_euclid on both coordinates covers every configuration.
+    let nx = field.grid.nx as isize;
+    let ny = field.grid.ny as isize;
 
-    let y_bottom = field.grid.y0;
-
-    // For a top/bottom periodic boundary, project.point.y is
-    // either y_bottom or y_top.
-    //
-    // Determine Ly from the rectangular domain.
-    //
-    // Here the translating-shock case uses Ly = 0.5.
-    let ly = 0.5_f64;
-
-    let np = (ly / dy).round() as isize;
-
-    debug_assert!(np > 0);
+    debug_assert!(nx > 0);
+    debug_assert!(ny > 0);
 
     // Euclidean modulo:
     //
-    //   -1   -> np-1
-    //   -2   -> np-2
-    //   np   -> 0
-    //   np+1 -> 1
-    let j_wrap = j.rem_euclid(np);
-
-    let wrapped_idx = (i, j_wrap);
+    //   -1   -> n-1
+    //   -2   -> n-2
+    //   n    -> 0
+    //   n+1  -> 1
+    let wrapped_idx = (i.rem_euclid(nx), j.rem_euclid(ny));
 
     if !field.is_in_domain(wrapped_idx) {
         panic!(
             "periodic wrapped point is not fluid: \
-             ghost={:?}, wrapped={:?}, np={}, P0=({:.8e},{:.8e})",
-            idx, wrapped_idx, np, project.point.x, project.point.y,
+             ghost={:?}, wrapped={:?}, nx={}, ny={}, P0=({:.8e},{:.8e})",
+            idx, wrapped_idx, nx, ny, project.point.x, project.point.y,
         );
     }
 
@@ -2687,6 +2681,121 @@ mod tests {
         ];
 
         field
+    }
+
+    // ------------------------------------------------------------------------
+    // Periodic wrap helpers and tests (x / y / fully-periodic corner).
+    // ------------------------------------------------------------------------
+    fn make_periodic_rect(nx: usize, ny: usize, lx: f64, ly: f64) -> field1::Field {
+        let mut field = make_rect_field(nx, ny, lx, ly, State::new());
+
+        for e in field.outer_boundary.iter_mut() {
+            e.bc = BCType::Periodic;
+        }
+
+        field
+    }
+
+    fn index_state(i: isize, j: isize) -> State {
+        State {
+            rho: (100 * i + j) as f64,
+            mom_x: i as f64,
+            mom_y: j as f64,
+            ee: 1.0,
+            ei: 2.0,
+            er: 3.0,
+        }
+    }
+
+    fn fill_index_states(field: &mut field1::Field) {
+        for i in 0..field.grid.nx as isize {
+            for j in 0..field.grid.ny as isize {
+                field.set((i, j), index_state(i, j));
+            }
+        }
+    }
+
+    fn assert_periodic_wrap(
+        field: &field1::Field,
+        ghost: (isize, isize),
+        expected: (isize, isize),
+    ) {
+        let got = field.get(ghost);
+        let want = index_state(expected.0, expected.1);
+        let err = state_max_error(got, want);
+        assert!(
+            err < TOL_CONST,
+            "periodic wrap: ghost {:?} -> got {:?} (state {:?}), \
+             expected {:?} (state {:?}), max_err={:.3e}",
+            ghost, ghost, got, expected, want, err,
+        );
+    }
+
+    #[test]
+    fn periodic_x_left_wraps_to_right() {
+        let nx = 8;
+        let ny = 5;
+        let mut field = make_periodic_rect(nx, ny, 0.8, 0.5);
+        fill_index_states(&mut field);
+
+        assert_periodic_wrap(&field, (-1, 2), (nx as isize - 1, 2));
+        assert_periodic_wrap(&field, (-2, 1), (nx as isize - 2, 1));
+        assert_periodic_wrap(&field, (-3, 4), (nx as isize - 3, 4));
+    }
+
+    #[test]
+    fn periodic_x_right_wraps_to_left() {
+        let nx = 8;
+        let ny = 5;
+        let mut field = make_periodic_rect(nx, ny, 0.8, 0.5);
+        fill_index_states(&mut field);
+
+        assert_periodic_wrap(&field, (nx as isize, 2), (0, 2));
+        assert_periodic_wrap(&field, (nx as isize + 1, 1), (1, 1));
+        assert_periodic_wrap(&field, (nx as isize + 3, 3), (3, 3));
+    }
+
+    #[test]
+    fn periodic_y_wraps_vertically() {
+        let nx = 8;
+        let ny = 5;
+        let mut field = make_periodic_rect(nx, ny, 0.8, 0.5);
+        fill_index_states(&mut field);
+
+        assert_periodic_wrap(&field, (2, ny as isize), (2, 0));
+        assert_periodic_wrap(&field, (2, -1), (2, ny as isize - 1));
+        assert_periodic_wrap(&field, (5, -3), (5, ny as isize - 3));
+    }
+
+    #[test]
+    fn periodic_corner_wraps_both_axes() {
+        let nx = 8;
+        let ny = 5;
+        let mut field = make_periodic_rect(nx, ny, 0.8, 0.5);
+        fill_index_states(&mut field);
+
+        assert_periodic_wrap(&field, (-1, ny as isize), (nx as isize - 1, 0));
+        assert_periodic_wrap(&field, (-1, -1), (nx as isize - 1, ny as isize - 1));
+        assert_periodic_wrap(&field, (nx as isize, ny as isize), (0, 0));
+        assert_periodic_wrap(&field, (nx as isize + 2, -2), (2, ny as isize - 2));
+    }
+
+    #[test]
+    fn periodic_only_x_pair_wraps_along_x() {
+        // Topology of the x-periodic translating-shock test: only left/right
+        // sides are Periodic, top/bottom stay as walls. Interior-row ghosts
+        // on the periodic sides must wrap on x.
+        let nx = 8;
+        let ny = 5;
+        let mut field = make_rect_field(nx, ny, 0.8, 0.5, State::new());
+        field.outer_boundary[1].bc = BCType::Periodic; // right
+        field.outer_boundary[3].bc = BCType::Periodic; // left
+        fill_index_states(&mut field);
+
+        assert_periodic_wrap(&field, (-1, 2), (nx as isize - 1, 2));
+        assert_periodic_wrap(&field, (-4, 4), (nx as isize - 4, 4));
+        assert_periodic_wrap(&field, (nx as isize, 1), (0, 1));
+        assert_periodic_wrap(&field, (nx as isize + 3, 2), (3, 2));
     }
 
     // ------------------------------------------------------------------------

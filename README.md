@@ -126,7 +126,7 @@ Ghost values are recomputed in parallel (Rayon) once per RK stage in `GhostGrid:
 | `Outflow { p_inf, sigma, l_domain }` | LODI pressure relaxation for the incoming acoustic wave. |
 | `Constant(state)` / `TimeDependent(f)` | Prescribed boundary state. |
 | `ZerothOrder` | Ghost value copied from the mirrored interior cell. |
-| `Periodic` | y-periodic wrap (used by the translating-shock test). |
+| `Periodic` | Periodic wrap along the grid axis the ghost leaves the domain on: left/right sides wrap the x index, top/bottom sides wrap the y index (used by the translating-shock test). |
 
 The high-order machinery (`weno_extrapolation()`) follows Tan, Wang, Shu, and Ning (2012), Sec. 2.4: for each order r = 0..4 a 2D polynomial of degree r is least-squares fitted to the (r+1)^2-point stencil `E_r` of characteristic variables in boundary-normal coordinates; smoothness indicators and nonlinear weights select the WENO combination of the k-th normal derivatives, which are Taylor-expanded to the ghost point.
 

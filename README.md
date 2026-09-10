@@ -364,53 +364,16 @@ of the high-order wall boundary treatment.
 
 The exact solution is
 
-$$
-\rho
-=
-1 + 0.1\sin(x)\cos(y)\cos(t),
-$$
-
-$$
-u
-=
-1 + 0.2\cos(x)\cos(y)\cos(t),
-$$
-
-$$
-v
-=
-0.2\sin(x)\sin(y)\cos(t),
-$$
-
-$$
-\rho e_e
-=
-3 + 0.2\cos(x)\cos(y)\sin(t),
-$$
-
-$$
-\rho e_i
-=
-3 + 0.15\sin(x)\cos(y)\cos(t),
-$$
-
-$$
-\rho e_r
-=
-2 + 0.1\cos(2x)\cos(y)\sin(t).
-$$
+$$\rho=1 + 0.1\sin(x)\cos(y)\cos(t),$$
+$$u=1 + 0.2\cos(x)\cos(y)\cos(t),$$
+$$v=0.2\sin(x)\sin(y)\cos(t),$$
+$$\rho e_e=3 + 0.2\cos(x)\cos(y)\sin(t),$$
+$$\rho e_i=3 + 0.15\sin(x)\cos(y)\cos(t),$$
+$$\rho e_r=2 + 0.1\cos(2x)\cos(y)\sin(t).$$
 
 The conservative energy variables are defined as
 
-$$
-E_\alpha
-=
-\rho e_\alpha
-+
-\frac{\rho(u^2+v^2)}{6},
-\qquad
-\alpha\in\{e,i,r\}.
-$$
+$$E_\alpha=\rho e_\alpha+\frac{\rho(u^2+v^2)}{6},\qquad\alpha\in\{e,i,r\}.$$
 
 The computational domain is
 

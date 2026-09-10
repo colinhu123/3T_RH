@@ -15,3 +15,14 @@ density_contour.png
 pressure_contour.png
 
 py_utils/__pycache__
+
+n40.bin
+n80.bin
+n120.bin
+n160.bin
+n200.bin
+convergence_test.py
+
+src/oblique_wall_test.rs
+
+n320.bin

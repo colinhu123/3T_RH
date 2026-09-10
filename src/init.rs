@@ -1388,3 +1388,635 @@ pub fn init_forward_facing_step_rotated_with(
 
     u
 }
+
+
+
+#[inline(always)]
+pub fn mms_63_exact_state(x: f64, y: f64, t: f64) -> State {
+    let xi = x + y - 2.0 * t;
+
+    let s = xi.sin();
+    let c = xi.cos();
+
+    // ------------------------------------------------------------------------
+    // Exact primitive / internal-energy-density fields, Eq. (6.9)
+    // ------------------------------------------------------------------------
+
+    let rho = 1.0 + 0.5 * s;
+
+    let ux = 1.0;
+    let uy = 1.0;
+
+    let rho_ee = 3.0 * (1.0 + 0.2 * s);
+    let rho_ei = 3.0 * (1.0 + 0.2 * c);
+    let rho_er = 2.0 * (1.0 + 0.1 * s);
+
+    // ------------------------------------------------------------------------
+    // Modified energy variables used by this solver:
+    //
+    //     E_alpha
+    //       =
+    //     rho e_alpha + rho (u^2 + v^2)/6.
+    //
+    // Since u=v=1 here,
+    //
+    //     kinetic_share = rho/3.
+    // ------------------------------------------------------------------------
+
+    let kinetic_share = rho * (ux * ux + uy * uy) / 6.0;
+
+    State {
+        rho,
+
+        mom_x: rho * ux,
+        mom_y: rho * uy,
+
+        ee: rho_ee + kinetic_share,
+        ei: rho_ei + kinetic_share,
+        er: rho_er + kinetic_share,
+    }
+}
+
+
+/// Convenience version using the number of cells N directly.
+///
+/// For the paper:
+///
+///     N = 40, 80, 120, 160, 200
+///
+pub fn init_mms_63(n: usize) -> Field {
+    assert!(n >= 8, "MMS grid is too small");
+
+    let pi = std::f64::consts::PI;
+
+    // ========================================================================
+    // Computational domain
+    // ========================================================================
+
+    let xmin = 0.0_f64;
+    let xmax = 2.0 * pi;
+
+    let ymin = 0.0_f64;
+    let ymax = 2.0 * pi;
+
+    let lx = xmax - xmin;
+    let ly = ymax - ymin;
+
+    // N uniform intervals in each direction.
+    let dx = lx / n as f64;
+    let dy = ly / n as f64;
+
+    // ------------------------------------------------------------------------
+    // Periodic grid size.
+    //
+    // The periodic cell count is the grid extent along the axis (see
+    // bc1::periodic_value, which wraps with rem_euclid(nx)), so the domain
+    // is one full period of exactly n cells per axis:
+    //
+    //     nx = ny = n,     dx = dy = 2*pi/n
+    //
+    // The stored points span [0, 2*pi - dx]; the point at x = 2*pi (or
+    // y = 2*pi) is the periodic image of the point at x = 0 (or y = 0)
+    // and is obtained by wrapping, never stored twice.
+    // ------------------------------------------------------------------------
+
+    let nx = n;
+    let ny = n;
+
+    let grid = GridInfo::new(
+        nx,
+        ny,
+        dx,
+        dy,
+        xmin,
+        ymin,
+    );
+
+    // ========================================================================
+    // Rectangular domain
+    //
+    // Counter-clockwise:
+    //
+    //       p01 ---------------- p11
+    //        |                    |
+    //        |                    |
+    //        |                    |
+    //       p00 ---------------- p10
+    //
+    // Polygon side ordering:
+    //
+    //     0 : bottom     p00 -> p10
+    //     1 : right      p10 -> p11
+    //     2 : top        p11 -> p01
+    //     3 : left       p01 -> p00
+    //
+    // All four sides are periodic.
+    // ========================================================================
+
+    let p00 = Point {
+        x: xmin,
+        y: ymin,
+    };
+
+    let p10 = Point {
+        x: xmax,
+        y: ymin,
+    };
+
+    let p11 = Point {
+        x: xmax,
+        y: ymax,
+    };
+
+    let p01 = Point {
+        x: xmin,
+        y: ymax,
+    };
+
+    // Analytic physical outer boundaries (single source of boundary
+    // definition). The classifier polygon and the fluid mask are derived
+    // inside Field::from_boundaries.
+    let outer_elements = vec![
+        line_element(p00, p10, BCType::Periodic), // bottom
+        line_element(p10, p11, BCType::Periodic), // right
+        line_element(p11, p01, BCType::Periodic), // top
+        line_element(p01, p00, BCType::Periodic), // left
+    ];
+
+    // No physical inner boundary.
+    let inner_elements = Vec::new();
+
+    // ========================================================================
+    // Construct Field
+    // ========================================================================
+
+    let mut u = Field::from_boundaries(
+        grid,
+        outer_elements,
+        inner_elements,
+        State::new(),
+        0.0,
+    );
+
+    // ========================================================================
+    // Initial condition
+    //
+    // U(x,y,0) = exact manufactured solution.
+    // ========================================================================
+
+    for i in 0..nx {
+        for j in 0..ny {
+            let idx = (
+                i as isize,
+                j as isize,
+            );
+
+            if !u.is_in_domain(idx) {
+                continue;
+            }
+
+            let x = grid.x(idx.0);
+            let y = grid.y(idx.1);
+
+            let state = mms_63_exact_state(
+                x,
+                y,
+                0.0,
+            );
+
+            u.set(idx, state);
+        }
+    }
+
+    // ========================================================================
+    // Diagnostics
+    // ========================================================================
+
+    println!();
+    println!("============================================================");
+    println!("CHENG-LEI-SHU SEC. 6.3 MMS ACCURACY TEST");
+    println!("============================================================");
+
+    println!(
+        "N = {}, nx = {}, ny = {}",
+        n, nx, ny
+    );
+
+    println!(
+        "dx = {:.16e}, dy = {:.16e}",
+        dx, dy
+    );
+
+    println!(
+        "domain = [{:.8},{:.8}] x [{:.8},{:.8}]",
+        xmin,
+        xmax,
+        ymin,
+        ymax
+    );
+
+    println!();
+    println!("Exact solution:");
+    println!("  xi        = x + y - 2 t");
+    println!("  rho       = 1 + 0.5 sin(xi)");
+    println!("  u = v     = 1");
+    println!("  rho e_e   = 3 [1 + 0.2 sin(xi)]");
+    println!("  rho e_i   = 3 [1 + 0.2 cos(xi)]");
+    println!("  rho e_r   = 2 [1 + 0.1 sin(xi)]");
+
+    println!();
+    println!("Parameters:");
+    println!("  gamma_e = gamma_i = 5/3");
+    println!("  gamma_r = 4/3");
+    println!("  omega_ei = omega_er = 0");
+    println!("  kappa_e = kappa_i = kappa_r = 0");
+
+    println!();
+    println!("BC:");
+    println!("  x = 0    <-> x = 2*pi : Periodic");
+    println!("  y = 0    <-> y = 2*pi : Periodic");
+
+    println!();
+    println!("Recommended final time:");
+    println!("  t_final = 0.1");
+
+    println!();
+    println!("IMPORTANT:");
+    println!("  mms_63_source(x,y,t) must be included in RHS.");
+    println!("  project_equal_energies() must be disabled.");
+    println!("============================================================");
+    println!();
+
+    u
+}
+
+#[inline(always)]
+pub fn wall_mms_exact_state(x: f64, y: f64, t: f64) -> State {
+    let sx = x.sin();
+    let cx = x.cos();
+
+    let sy = y.sin();
+    let cy = y.cos();
+
+    let st = t.sin();
+    let ct = t.cos();
+
+    // ------------------------------------------------------------------------
+    // Density
+    // ------------------------------------------------------------------------
+
+    let rho =
+        1.0
+        + 0.1 * sx * cy * ct;
+
+    // ------------------------------------------------------------------------
+    // Velocity
+    //
+    // Notice:
+    //
+    //     v(x,0,t)     = 0
+    //     v(x,2*pi,t)  = 0
+    //
+    // so the exact solution satisfies the top/bottom slip walls.
+    // ------------------------------------------------------------------------
+
+    let ux =
+        1.0
+        + 0.2 * cx * cy * ct;
+
+    let uy =
+        0.2 * sx * sy * ct;
+
+    // ------------------------------------------------------------------------
+    // Physical internal-energy densities:
+    //
+    //     q_alpha = rho e_alpha
+    // ------------------------------------------------------------------------
+
+    let rho_ee =
+        3.0
+        + 0.2 * cx * cy * st;
+
+    let rho_ei =
+        3.0
+        + 0.15 * sx * cy * ct;
+
+    let rho_er =
+        2.0
+        + 0.1 * (2.0 * x).cos() * cy * st;
+
+    // ------------------------------------------------------------------------
+    // Modified energy variables used by the solver
+    // ------------------------------------------------------------------------
+
+    let kinetic_share =
+        rho * (ux * ux + uy * uy) / 6.0;
+
+    State {
+        rho,
+
+        mom_x: rho * ux,
+        mom_y: rho * uy,
+
+        ee: rho_ee + kinetic_share,
+        ei: rho_ei + kinetic_share,
+        er: rho_er + kinetic_share,
+    }
+}
+
+pub fn init_mms_wall(n: usize) -> Field {
+    assert!(
+        n >= 8,
+        "Wall MMS grid is too small"
+    );
+
+    let pi = std::f64::consts::PI;
+
+    let xmin = 0.0_f64;
+    let xmax = 2.0 * pi;
+
+    let ymin = 0.0_f64;
+    let ymax = 2.0 * pi;
+
+    let lx = xmax - xmin;
+    let ly = ymax - ymin;
+
+    let dx = lx / n as f64;
+    let dy = ly / n as f64;
+
+    let nx = n;
+    let ny = n;
+
+    let x0 = xmin + 0.5 * dx;
+    let y0 = ymin + 0.5 * dy;
+
+    let grid = GridInfo::new(
+        nx,
+        ny,
+        dx,
+        dy,
+        x0,
+        y0,
+    );
+
+
+    let p00 = Point {
+        x: xmin,
+        y: ymin,
+    };
+
+    let p10 = Point {
+        x: xmax,
+        y: ymin,
+    };
+
+    let p11 = Point {
+        x: xmax,
+        y: ymax,
+    };
+
+    let p01 = Point {
+        x: xmin,
+        y: ymax,
+    };
+
+    let outer_elements = vec![
+
+
+        line_element(
+            p00,
+            p10,
+            BCType::Wall,
+        ),
+
+
+        line_element(
+            p10,
+            p11,
+            BCType::Periodic,
+        ),
+
+        // --------------------------------------------------------------------
+        // Top:
+        //
+        //     y = 2*pi
+        //
+        // Exact normal velocity:
+        //
+        //     uy = 0.2 sin(x) sin(2*pi) cos(t) = 0
+        // --------------------------------------------------------------------
+
+        line_element(
+            p11,
+            p01,
+            BCType::Wall,
+        ),
+
+        // --------------------------------------------------------------------
+        // Left:
+        //
+        //     x = 0
+        //
+        // Periodic partner: x = 2*pi
+        // --------------------------------------------------------------------
+
+        line_element(
+            p01,
+            p00,
+            BCType::Periodic,
+        ),
+    ];
+
+    // No physical inner boundary.
+    let inner_elements = Vec::new();
+
+    // ========================================================================
+    // Construct Field
+    // ========================================================================
+
+    let mut u = Field::from_boundaries(
+        grid,
+        outer_elements,
+        inner_elements,
+        State::new(),
+        0.0,
+    );
+
+    // ========================================================================
+    // Initial condition
+    //
+    //     U_ij(t=0) = U_exact(x_i,y_j,0)
+    //
+    // ========================================================================
+
+    for i in 0..nx {
+        for j in 0..ny {
+            let idx = (
+                i as isize,
+                j as isize,
+            );
+
+            if !u.is_in_domain(idx) {
+                continue;
+            }
+
+            let x = grid.x(idx.0);
+            let y = grid.y(idx.1);
+
+            let state =
+                wall_mms_exact_state(
+                    x,
+                    y,
+                    0.0,
+                );
+
+            u.set(
+                idx,
+                state,
+            );
+        }
+    }
+
+    // ========================================================================
+    // Diagnostics
+    // ========================================================================
+
+    println!();
+    println!("============================================================");
+    println!("SMOOTH WALL MMS ACCURACY TEST");
+    println!("============================================================");
+
+    println!(
+        "N = {}, nx = {}, ny = {}",
+        n,
+        nx,
+        ny,
+    );
+
+    println!(
+        "dx = {:.16e}, dy = {:.16e}",
+        dx,
+        dy,
+    );
+
+    println!(
+        "domain = [{:.8},{:.8}] x [{:.8},{:.8}]",
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+    );
+
+    println!();
+
+    println!("Exact solution:");
+
+    println!(
+        "  rho       = 1 + 0.1 sin(x) cos(y) cos(t)"
+    );
+
+    println!(
+        "  u         = 1 + 0.2 cos(x) cos(y) cos(t)"
+    );
+
+    println!(
+        "  v         = 0.2 sin(x) sin(y) cos(t)"
+    );
+
+    println!(
+        "  rho e_e   = 3 + 0.2 cos(x) cos(y) sin(t)"
+    );
+
+    println!(
+        "  rho e_i   = 3 + 0.15 sin(x) cos(y) cos(t)"
+    );
+
+    println!(
+        "  rho e_r   = 2 + 0.1 cos(2x) cos(y) sin(t)"
+    );
+
+    println!();
+
+    println!("BC:");
+
+    println!(
+        "  x = 0    <-> x = 2*pi : Periodic"
+    );
+
+    println!(
+        "  y = 0                 : Wall"
+    );
+
+    println!(
+        "  y = 2*pi              : Wall"
+    );
+
+    println!();
+
+    println!("Wall compatibility:");
+
+    println!(
+        "  v(x,0,t)    = 0"
+    );
+
+    println!(
+        "  v(x,2*pi,t) = 0"
+    );
+
+    println!(
+        "  velocity dot normal = 0 exactly"
+    );
+
+    println!();
+
+    println!("Parameters:");
+
+    println!(
+        "  gamma_e = gamma_i = 5/3"
+    );
+
+    println!(
+        "  gamma_r = 4/3"
+    );
+
+    println!(
+        "  omega_ei = omega_er = 0"
+    );
+
+    println!(
+        "  kappa_e = kappa_i = kappa_r = 0"
+    );
+
+    println!();
+
+    println!("Recommended convergence study:");
+
+    println!(
+        "  N = 40, 80, 120, 160, 200"
+    );
+
+    println!(
+        "  t_final = 0.1"
+    );
+
+    println!(
+        "  dt = 1e-5"
+    );
+
+    println!();
+
+    println!("IMPORTANT:");
+
+    println!(
+        "  wall_mms_source(x,y,t) must be included in RHS."
+    );
+
+    println!(
+        "  project_equal_energies() must be disabled."
+    );
+
+    println!("============================================================");
+    println!();
+
+    u
+}

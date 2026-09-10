@@ -22,10 +22,16 @@ const NVAR: u32 = 8;
 ///
 /// The file is first written as *.tmp and atomically renamed to the requested
 /// final name, so a live Python visualizer never sees a partially-written file.
-pub fn save_data(u: &crate::field1::Field, filename: &str, _lx: f64, _ly: f64) {
+pub fn save_data(u: &crate::field1::Field, filename: &str, lx: f64, ly: f64) {
     create_dir_all("data").expect("Cannot create data directory");
 
     let final_path = format!("data/{}", filename);
+    save_data_to(u, &final_path, lx, ly);
+}
+
+/// Same writer as [`save_data`], but the caller supplies the full output
+/// path (e.g. `n40.bin` in the project root). No directory is created.
+pub fn save_data_to(u: &crate::field1::Field, final_path: &str, _lx: f64, _ly: f64) {
     let tmp_path = format!("{}.tmp", final_path);
 
     let file = File::create(&tmp_path).expect("Cannot create temporary output file");

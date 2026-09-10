@@ -305,6 +305,172 @@ Recommended verification workflow:
 5. Enable diffusion and energy exchange only after the non-diffusive case is verified.
 6. Compare density and the three temperatures against a reference solution.
 
+### Fifth-Order Spatial Accuracy Test
+
+A two-dimensional method of manufactured solutions (MMS) test is used to
+verify the spatial accuracy of the solver. The manufactured solution is based
+on the smooth accuracy test in Sec. 6.3, Eq. (6.9), of Cheng, Lei, and Shu,
+*Journal of Computational Physics* 496 (2024) 112595.
+
+The exact solution is
+
+$$
+\xi = x + y - 2t,
+$$
+$$
+\rho = 1 + 0.5\sin(\xi), \qquad u=v=1,
+$$
+
+$$
+\rho e_e = 3\left(1+0.2\sin(\xi)\right),
+$$
+
+$$
+\rho e_i = 3\left(1+0.2\cos(\xi)\right),
+$$
+
+$$
+\rho e_r = 2\left(1+0.1\sin(\xi)\right).
+$$
+
+The computational domain is
+
+$$
+[0,2\pi]\times[0,2\pi],
+$$
+
+with periodic boundary conditions in both directions. The manufactured source terms are obtained by substituting the exact solution into the governing equations.
+
+The errors are measured at \(t=0.1\). A fixed time step \(\Delta t=10^{-5}\) is used so that the temporal error from the third-order SSP-RK scheme is negligible compared with the spatial discretization error.
+
+
+| \(N\) | $\rho$ Error | Order | $\rho u$ Error | Order | $\rho v$ Error | Order | $E_e$ Error | Order | $E_i$ Error | Order | $E_r$ Error | Order |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 40  | 9.912e-07 | — | 1.182e-06 | — | 1.182e-06 | — | 2.048e-06 | — | 2.015e-06 | — | 1.404e-06 | — |
+| 80  | 2.996e-08 | 5.048 | 3.566e-08 | 5.052 | 3.566e-08 | 5.052 | 6.657e-08 | 4.943 | 6.296e-08 | 5.000 | 4.209e-08 | 5.060 |
+| 120 | 3.736e-09 | 5.135 | 4.528e-09 | 5.090 | 4.528e-09 | 5.090 | 8.838e-09 | 4.980 | 8.345e-09 | 4.984 | 5.235e-09 | 5.141 |
+| 160 | 8.735e-10 | 5.052 | 1.064e-09 | 5.036 | 1.064e-09 | 5.036 | 2.104e-09 | 4.988 | 1.984e-09 | 4.994 | 1.218e-09 | 5.067 |
+| 200 | 2.842e-10 | 5.032 | 3.470e-10 | 5.020 | 3.470e-10 | 5.020 | 6.909e-10 | 4.991 | 6.504e-10 | 4.997 | 3.956e-10 | 5.042 |
+
+All six conservative variables exhibit approximately fifth-order spatial
+convergence in the \(L^1\) norm.
+
+### Wall MMS — Near-Wall $L^\infty$ Convergence
+
+### Smooth Wall MMS Accuracy Test
+
+A two-dimensional manufactured solution is used to verify the spatial accuracy
+of the high-order wall boundary treatment.
+
+The exact solution is
+
+$$
+\rho
+=
+1 + 0.1\sin(x)\cos(y)\cos(t),
+$$
+
+$$
+u
+=
+1 + 0.2\cos(x)\cos(y)\cos(t),
+$$
+
+$$
+v
+=
+0.2\sin(x)\sin(y)\cos(t),
+$$
+
+$$
+\rho e_e
+=
+3 + 0.2\cos(x)\cos(y)\sin(t),
+$$
+
+$$
+\rho e_i
+=
+3 + 0.15\sin(x)\cos(y)\cos(t),
+$$
+
+$$
+\rho e_r
+=
+2 + 0.1\cos(2x)\cos(y)\sin(t).
+$$
+
+The conservative energy variables are defined as
+
+$$
+E_\alpha
+=
+\rho e_\alpha
++
+\frac{\rho(u^2+v^2)}{6},
+\qquad
+\alpha\in\{e,i,r\}.
+$$
+
+The computational domain is
+
+$$
+[0,2\pi]\times[0,2\pi].
+$$
+
+Periodic boundary conditions are imposed in the \(x\)-direction,
+
+$$
+x=0
+\quad\longleftrightarrow\quad
+x=2\pi,
+$$
+
+while slip-wall boundary conditions are imposed at
+$$
+y=0, \qquad y=2\pi.
+$$
+
+The manufactured velocity field satisfies the wall impermeability condition exactly, since
+$$v(x,0,t)=v(x,2\pi,t)=0,$$
+and therefore
+$$\mathbf{u}\cdot\mathbf{n}=0$$
+on both solid walls. The thermodynamic parameters are
+$$\gamma_e=\gamma_i=\frac{5}{3}, \qquad \gamma_r=\frac{4}{3},$$
+with
+$$\omega_{ei}=\omega_{er}=0, \qquad \kappa_e=\kappa_i=\kappa_r=0.$$
+
+The computational points are cell-centered,
+
+$$
+x_i=\left(i+\frac12\right)\Delta x,
+\qquad
+y_j=\left(j+\frac12\right)\Delta y,
+$$
+
+where
+
+$$
+\Delta x=\Delta y=\frac{2\pi}{N}.
+$$
+
+The errors are measured at
+$$ t=0.1, $$
+using a fixed time step
+$$
+\Delta t=10^{-5},
+$$
+
+so that the temporal discretization error is sufficiently small compared with
+the spatial discretization error.
+
+| \(N\) | $\rho$ Error | Order | $\rho u$ Error | Order | $\rho v$ Error | Order | $E_e$ Error | Order | $E_i$ Error | Order | $E_r$ Error | Order |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 40  | 2.165e-04 | — | 4.446e-04 | — | 1.412e-03 | — | 1.016e-03 | — | 1.027e-03 | — | 4.906e-04 | — |
+| 80  | 3.944e-06 | 5.779 | 5.802e-06 | 6.260 | 5.192e-06 | 8.088 | 6.607e-06 | 7.265 | 7.899e-06 | 7.022 | 4.808e-06 | 6.673 |
+| 160 | 5.415e-07 | 2.864 | 7.277e-07 | 2.995 | 8.077e-08 | 6.006 | 9.500e-07 | 2.798 | 1.135e-06 | 2.799 | 6.481e-07 | 2.891 |
+| 320 | 2.279e-08 | 4.571 | 2.293e-08 | 4.988 | 1.215e-09 | 6.054 | 2.567e-08 | 5.210 | 3.025e-08 | 5.229 | 9.612e-09 | 6.075 |
+
 ## Reference
 
 > J. Cheng and C.-W. Shu, "High order conservative finite difference WENO scheme for three-temperature radiation hydrodynamics," *Journal of Computational Physics* 517 (2024), 113304.

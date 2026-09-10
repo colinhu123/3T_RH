@@ -574,6 +574,9 @@ pub fn weno_extrapolation_pre(
     k: usize,
 ) -> [f64; 6] {
     let n = bc.normal;
+    // Same h as the slow path (`smooth_indicator`), needed for the r = 0
+    // indicator beta_0 = 2 h^2.
+    let h = (field.grid.dx * field.grid.dy).sqrt();
     let mut alpha = [[0.0; 5]; 6];
     let mut vks = [[0.0; 5]; 6];
     let mut alpha_sum = [0.0; 6];
@@ -600,16 +603,25 @@ pub fn weno_extrapolation_pre(
         }
 
         for c in 0..6 {
-            let soff = BC_S_OFF[r];
-            let mut beta = 0.0;
-            for a in 0..m {
-                let base = soff + a * m;
-                let mut acc = 0.0;
-                for b in 0..m {
-                    acc += bc.s[base + b] * data[c][b];
+            // r = 0: the paper's smoothness indicator is the CONSTANT
+            // beta_0 = 2 h^2, independent of the data (see
+            // `smooth_indicator`). A quadratic form cannot represent a
+            // constant, so `bc.s[0]` cannot be used here.
+            let beta = if r == 0 {
+                2.0 * h * h
+            } else {
+                let soff = BC_S_OFF[r];
+                let mut beta = 0.0;
+                for a in 0..m {
+                    let base = soff + a * m;
+                    let mut acc = 0.0;
+                    for b in 0..m {
+                        acc += bc.s[base + b] * data[c][b];
+                    }
+                    beta += data[c][a] * acc;
                 }
-                beta += data[c][a] * acc;
-            }
+                beta
+            };
 
             let mut vk = 0.0;
             if k <= r {
@@ -1154,10 +1166,17 @@ fn build_ilw_row1(u0: &Array1<f64>) -> Array1<f64> {
     let gr = constant::GAMMA_R - 1.0;
     let gt = gi + ge + gr; // == gamma_t - 3
 
+    // row1 = -d p / d state (evaluated at mom_n = 0), so that
+    // row1 . U^(1) = -d p / dn = 0 for a flat, source-free wall.
+    //
+    //   d p / d rho   =  g_t m_t^2 / (6 rho^2)
+    //   d p / d m_n   =  0
+    //   d p / d m_t   = -g_t m_t / (3 rho)   <-- was /(6 rho): factor 2
+    //   d p / d e_a   =  g_a
     array![
         -gt * u3.powi(2) / (6.0 * u1.powi(2)),
         0.0,
-        gt * u3 / (6.0 * u1),
+        gt * u3 / (3.0 * u1),
         -ge,
         -gi,
         -gr,
@@ -1437,12 +1456,29 @@ fn wall_value_with_fallback(
 /// High-order ILW Wall reconstruction with explicit, validated failure
 /// modes. `ORDER` is the Taylor order (0..=4); only the derivative orders
 /// up to `ORDER` are computed.
-fn try_ilw_wall_value<const ORDER: usize>(
+/// Raw ILW intermediates, exposed for diagnostics / tests.
+pub struct IlwRaw {
+    pub nearest: (isize, isize),
+    pub d: f64,
+    /// Extrapolated characteristic derivatives `v[k]` for k = 0..=ORDER.
+    pub v: [[f64; 6]; 5],
+    /// Local-frame Taylor states: `u[0] = U^(0)`, `u[1] = U^(1)`, and
+    /// `u[k] = R * v[k]` for k >= 2.
+    pub u: [[f64; 6]; 5],
+    /// Local-frame Taylor-expanded ghost (before Cartesian rotation).
+    pub u_ghost: [f64; 6],
+}
+
+/// Core ILW reconstruction returning the raw local-frame intermediates.
+///
+/// `try_ilw_wall_value` is a thin wrapper that finalizes (rotates) the
+/// ghost; the wall-accuracy tests use this to inspect `u0..u4` and `v[k]`.
+fn try_ilw_wall_raw<const ORDER: usize>(
     idx: (isize, isize),
     project: geometry::Projection,
     field: &field1::Field,
     bc_pre: Option<&GhostBC>,
-) -> Result<state::State, WallReconstructionFailure> {
+) -> Result<IlwRaw, WallReconstructionFailure> {
     const {
         assert!(ORDER <= 4, "WALL_TAYLOR_ORDER must be in 0..=4");
     }
@@ -1523,11 +1559,6 @@ fn try_ilw_wall_value<const ORDER: usize>(
     let mut rhs0 = Array1::from_vec(v[0].to_vec());
     rhs0[0] = 0.0;
     let u0 = try_solve6(&left0, &rhs0).ok_or(WallReconstructionFailure::SingularIlwSystem)?;
-    debug_assert!(
-        u0.iter().all(|x| x.is_finite()),
-        "u0 non-finite, idx={:?}",
-        idx
-    );
     if !u0.iter().all(|x| x.is_finite()) {
         return Err(WallReconstructionFailure::NonFiniteWeno);
     }
@@ -1545,57 +1576,94 @@ fn try_ilw_wall_value<const ORDER: usize>(
         return Err(WallReconstructionFailure::InvalidSoundSpeed);
     }
 
-    if ORDER == 0 {
-        return finalize_ghost(&u0, project);
-    }
-
-    // --------------------------------------------------------------------
-    // k = 1: ILW momentum row + extrapolation rows — Eq. (2.20)/(2.22)
-    // analogue. R -> infinity for flat polygon walls, so the curvature
-    // RHS term is 0.
-    // --------------------------------------------------------------------
-    let mut left1 = left.clone();
-    let row1 = build_ilw_row1(&u0);
+    let mut u = [[0.0; 6]; 5];
     for c in 0..6 {
-        left1[[0, c]] = row1[c];
-    }
-    let mut rhs1 = Array1::from_vec(v[1].to_vec());
-    rhs1[0] = 0.0; // TODO: nonzero once curved geometries are supported
-    let u1 = try_solve6(&left1, &rhs1).ok_or(WallReconstructionFailure::SingularIlwSystem)?;
-    if !u1.iter().all(|x| x.is_finite()) {
-        return Err(WallReconstructionFailure::NonFiniteDerivative);
+        u[0][c] = u0[c];
     }
 
-    // --------------------------------------------------------------------
-    // Taylor expansion to the ghost point, Eq. (2.17). project.distance
-    // is the signed normal offset D of the ghost point relative to the
-    // boundary foot point x0.
-    // --------------------------------------------------------------------
     let d = project.distance;
     let mut u_ghost = u0.clone();
-    let mut coef = 1.0;
-    coef *= d;
-    u_ghost = u_ghost + coef * &u1;
 
-    if ORDER == 1 {
-        return finalize_ghost(&u_ghost, project);
-    }
-
-    // --------------------------------------------------------------------
-    // k = 2..=ORDER: pure WENO extrapolation, Eq. (2.21).
-    // No ILW / PDE substitution needed here.
-    // --------------------------------------------------------------------
-    for k in 2..=ORDER {
-        let rhs_k = Array1::from_vec(v[k].to_vec());
-        let uk = right.dot(&rhs_k);
-        if !uk.iter().all(|x| x.is_finite()) {
+    if ORDER >= 1 {
+        // ----------------------------------------------------------------
+        // k = 1: ILW momentum row + extrapolation rows — Eq. (2.20)/(2.22)
+        // analogue. R -> infinity for flat polygon walls, so the curvature
+        // RHS term is 0.
+        // ----------------------------------------------------------------
+        let mut left1 = left.clone();
+        let row1 = build_ilw_row1(&u0);
+        for c in 0..6 {
+            left1[[0, c]] = row1[c];
+        }
+        let mut rhs1 = Array1::from_vec(v[1].to_vec());
+        rhs1[0] = 0.0; // TODO: nonzero once curved geometries are supported
+        let u1 = try_solve6(&left1, &rhs1).ok_or(WallReconstructionFailure::SingularIlwSystem)?;
+        if !u1.iter().all(|x| x.is_finite()) {
             return Err(WallReconstructionFailure::NonFiniteDerivative);
         }
-        coef *= d / (k as f64);
-        u_ghost = u_ghost + coef * &uk;
+        for c in 0..6 {
+            u[1][c] = u1[c];
+        }
+
+        // ----------------------------------------------------------------
+        // Taylor expansion to the ghost point, Eq. (2.17).
+        // ----------------------------------------------------------------
+        let mut coef = d;
+        u_ghost = u_ghost + coef * &u1;
+
+        // ----------------------------------------------------------------
+        // k = 2..=ORDER: pure WENO extrapolation, Eq. (2.21).
+        // ----------------------------------------------------------------
+        for k in 2..=ORDER {
+            let rhs_k = Array1::from_vec(v[k].to_vec());
+            let uk = right.dot(&rhs_k);
+            if !uk.iter().all(|x| x.is_finite()) {
+                return Err(WallReconstructionFailure::NonFiniteDerivative);
+            }
+            for c in 0..6 {
+                u[k][c] = uk[c];
+            }
+            coef *= d / (k as f64);
+            u_ghost = u_ghost + coef * &uk;
+        }
     }
 
+    let mut u_ghost_arr = [0.0; 6];
+    for c in 0..6 {
+        u_ghost_arr[c] = u_ghost[c];
+    }
+
+    Ok(IlwRaw {
+        nearest: nearest_idx,
+        d,
+        v,
+        u,
+        u_ghost: u_ghost_arr,
+    })
+}
+
+fn try_ilw_wall_value<const ORDER: usize>(
+    idx: (isize, isize),
+    project: geometry::Projection,
+    field: &field1::Field,
+    bc_pre: Option<&GhostBC>,
+) -> Result<state::State, WallReconstructionFailure> {
+    let raw = try_ilw_wall_raw::<ORDER>(idx, project, field, bc_pre)?;
+    let u_ghost = Array1::from_vec(raw.u_ghost.to_vec());
     finalize_ghost(&u_ghost, project)
+}
+
+/// Diagnostic entry point: run the full 4th-order ILW reconstruction and
+/// return the raw local-frame intermediates. Used by the wall-accuracy
+/// tests only.
+#[allow(dead_code)]
+pub fn ilw_wall_raw_probe(
+    idx: (isize, isize),
+    project: geometry::Projection,
+    field: &field1::Field,
+    bc_pre: Option<&GhostBC>,
+) -> Option<IlwRaw> {
+    try_ilw_wall_raw::<4>(idx, project, field, bc_pre).ok()
 }
 
 pub fn set_ghost_point_value(

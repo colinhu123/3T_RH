@@ -14,6 +14,12 @@ mod source;
 mod state;
 mod weno;
 
+#[cfg(test)]
+mod oblique_wall_test;
+
+// The old PDE driver used `Config` / `Solver` and `parse_restart_id`; they are
+// kept commented out with it above.
+
 use solver::{Config, Solver};
 
 /// Parse the optional restart id from the command line
@@ -24,18 +30,30 @@ fn parse_restart_id() -> Option<usize> {
         .map(|s| s.parse::<usize>().expect("restart id must be integer"))
 }
 
+
 fn main() {
     // Fresh: cargo run --release
     // Restart from solution_0012.bin: cargo run --release -- 12
     let cfg = Config::default();
+    let cfg = Config {
+        t_final: 0.1,
+        dt_factor: 0.9,
+        store_interval: 0.01,
+    };
     let restart_id = parse_restart_id();
 
     if restart_id.is_none() {
         io::clear_data_folder();
     }
 
-    let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::HighOrder);
-
+    //let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::HighOrder);
+    //
+    // Wall MMS resolution: override with `MMS_N=40 cargo run --release`.
+    let mms_n = std::env::var("MMS_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let mut u = init::init_mms_wall(320);
     if let Some(id) = restart_id {
         let path = format!("data/solution_{:04}.bin", id);
         io::load_data(&mut u, &path);
@@ -75,6 +93,7 @@ fn main() {
     while t < cfg.t_final - 1e-14 {
         let dt_cfl = solver.global_dt(&u);
         let mut dt = cfg.dt_factor * dt_cfl;
+        let mut dt = 1e-5;
 
         // Clip dt so the run lands exactly on output times and t_final.
         if next_store_time <= cfg.t_final && t + dt > next_store_time {
@@ -133,6 +152,7 @@ fn main() {
     bc1::print_ilw_wall_statistics();
     bc1::print_reflective_wall_statistics();
 }
+
 
 #[cfg(test)]
 mod parity {

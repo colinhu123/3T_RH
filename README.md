@@ -390,17 +390,23 @@ x=2\pi,
 $$
 
 while slip-wall boundary conditions are imposed at
-$$
-y=0, \qquad y=2\pi.
-$$
+
+$$y=0, \qquad y=2\pi.$$
 
 The manufactured velocity field satisfies the wall impermeability condition exactly, since
+
 $$v(x,0,t)=v(x,2\pi,t)=0,$$
+
 and therefore
+
 $$\mathbf{u}\cdot\mathbf{n}=0$$
+
 on both solid walls. The thermodynamic parameters are
+
 $$\gamma_e=\gamma_i=\frac{5}{3}, \qquad \gamma_r=\frac{4}{3},$$
+
 with
+
 $$\omega_{ei}=\omega_{er}=0, \qquad \kappa_e=\kappa_i=\kappa_r=0.$$
 
 The computational points are cell-centered,

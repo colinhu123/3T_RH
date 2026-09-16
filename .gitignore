@@ -21,7 +21,7 @@ n80.bin
 n120.bin
 n160.bin
 n200.bin
-convergence_test.py
+
 
 src/oblique_wall_test.rs
 

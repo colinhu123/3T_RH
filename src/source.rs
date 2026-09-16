@@ -16,6 +16,18 @@ pub fn source(s: State) -> State {
     }
 }
 
+#[inline(always)]
+pub fn rt_source(s: State)-> State {
+    State {
+        rho: 0.0,
+        mom_x: 0.0,
+        mom_y: s.rho,
+        ee: 0.0,
+        ei: s.mom_y,
+        er: 0.0,
+    }
+}
+
 
 #[inline(always)]
 pub fn mms_63_source(x: f64, y: f64, t: f64) -> State {

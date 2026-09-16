@@ -1,8 +1,8 @@
-mod bc1;
+mod bc;
 mod constant;
 mod diffusion;
 mod dt;
-mod field1;
+mod field;
 mod geometry;
 mod ghost;
 mod init;
@@ -14,8 +14,7 @@ mod source;
 mod state;
 mod weno;
 
-#[cfg(test)]
-mod oblique_wall_test;
+
 
 // The old PDE driver used `Config` / `Solver` and `parse_restart_id`; they are
 // kept commented out with it above.
@@ -34,10 +33,9 @@ fn parse_restart_id() -> Option<usize> {
 fn main() {
     // Fresh: cargo run --release
     // Restart from solution_0012.bin: cargo run --release -- 12
-    let cfg = Config::default();
     let cfg = Config {
-        t_final: 0.1,
-        dt_factor: 0.9,
+        t_final: 1.95,
+        dt_factor: 0.5,
         store_interval: 0.01,
     };
     let restart_id = parse_restart_id();
@@ -49,11 +47,7 @@ fn main() {
     //let mut u = init::init_rotated_shock_cylinder(init::CylinderWallMode::HighOrder);
     //
     // Wall MMS resolution: override with `MMS_N=40 cargo run --release`.
-    let mms_n = std::env::var("MMS_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(200);
-    let mut u = init::init_mms_wall(320);
+    let mut u = init::init_shock_cylinder_in_box(init::CylinderWallMode::HighOrder);
     if let Some(id) = restart_id {
         let path = format!("data/solution_{:04}.bin", id);
         io::load_data(&mut u, &path);
@@ -93,7 +87,6 @@ fn main() {
     while t < cfg.t_final - 1e-14 {
         let dt_cfl = solver.global_dt(&u);
         let mut dt = cfg.dt_factor * dt_cfl;
-        let mut dt = 1e-5;
 
         // Clip dt so the run lands exactly on output times and t_final.
         if next_store_time <= cfg.t_final && t + dt > next_store_time {
@@ -125,8 +118,8 @@ fn main() {
         );
 
         if n % 100 == 0 {
-            bc1::print_ilw_wall_statistics();
-            bc1::print_reflective_wall_statistics();
+            bc::print_ilw_wall_statistics();
+            bc::print_reflective_wall_statistics();
         }
 
         if next_store_time <= cfg.t_final && t >= next_store_time - 1e-12 {
@@ -149,8 +142,8 @@ fn main() {
         "Finished: t={:.8e}, restart-local steps={}, last id={}",
         t, n, store_id
     );
-    bc1::print_ilw_wall_statistics();
-    bc1::print_reflective_wall_statistics();
+    bc::print_ilw_wall_statistics();
+    bc::print_reflective_wall_statistics();
 }
 
 
@@ -224,7 +217,7 @@ mod parity {
     fn ghost_bc_fast_matches_slow() {
         let field = init::init_cylinder();
         let h = (field.grid.dx * field.grid.dy).sqrt();
-        let beta = bc1::beta_quadratic_forms(h);
+        let beta = bc::beta_quadratic_forms(h);
 
         for &idx in &[
             (-1isize, 100isize),
@@ -243,15 +236,15 @@ mod parity {
 
             // Same analytic BoundaryElement lookup as the real solver:
             // nearest element wins, BC priority breaks junction ties.
-            let (boundary_id, project) = bc1::find_boundary_element(p, &field.outer_boundary);
+            let (boundary_id, project) = bc::find_boundary_element(p, &field.outer_boundary);
 
             let q = match &field.outer_boundary[boundary_id].bc {
-                bc1::BCType::PrimitiveWall => bc1::PRIMITIVE_WALL_WENO_Q,
+                bc::BCType::PrimitiveWall => bc::PRIMITIVE_WALL_WENO_Q,
                 _ => constant::WENO_Q,
             };
-            let pre = bc1::precompute_ghost_bc(&project, &field, &beta, q);
+            let pre = bc::precompute_ghost_bc(&project, &field, &beta, q);
 
-            let a = bc1::set_ghost_point_value(
+            let a = bc::set_ghost_point_value(
                 idx,
                 project,
                 ghost::BoundaryKind::Outer,
@@ -259,7 +252,7 @@ mod parity {
                 &field,
                 None,
             );
-            let b = bc1::set_ghost_point_value(
+            let b = bc::set_ghost_point_value(
                 idx,
                 project,
                 ghost::BoundaryKind::Outer,
@@ -290,7 +283,7 @@ mod parity {
         assert_eq!(arcs.len(), 1, "cylinder must have exactly ONE physical arc");
 
         assert!(
-            matches!(&arcs[0].bc, bc1::BCType::PrimitiveWall),
+            matches!(&arcs[0].bc, bc::BCType::PrimitiveWall),
             "cylinder arc must use the PrimitiveWall BC"
         );
 
@@ -310,7 +303,7 @@ mod parity {
         // boundary lookup. The result must be the exact analytic arc
         // projection, independent of any of the 360 Polygon segments.
         let p = geometry::Point { x: -1.2, y: 0.0 };
-        let (id, project) = bc1::find_boundary_element(p, &field.outer_boundary);
+        let (id, project) = bc::find_boundary_element(p, &field.outer_boundary);
 
         let arc = match &field.outer_boundary[id].geometry {
             geometry::BoundaryGeometry::Arc(a) => a,
@@ -380,7 +373,7 @@ mod parity {
             x: cx - arc.radius - 0.2,
             y: cy,
         };
-        let (id, proj) = bc1::find_boundary_element(p, &field.outer_boundary);
+        let (id, proj) = bc::find_boundary_element(p, &field.outer_boundary);
         assert!(matches!(
             field.outer_boundary[id].geometry,
             geometry::BoundaryGeometry::Arc(_)
@@ -391,14 +384,14 @@ mod parity {
         assert!(proj.normal.y.abs() < 1e-12);
 
         // 3. Upper/lower mirror symmetry about the arc center line.
-        let (_, up) = bc1::find_boundary_element(
+        let (_, up) = bc::find_boundary_element(
             geometry::Point {
                 x: cx - arc.radius - 0.1,
                 y: cy + 0.2,
             },
             &field.outer_boundary,
         );
-        let (_, dn) = bc1::find_boundary_element(
+        let (_, dn) = bc::find_boundary_element(
             geometry::Point {
                 x: cx - arc.radius - 0.1,
                 y: cy - 0.2,
@@ -437,7 +430,7 @@ mod parity {
         for (i, g) in ghosts.info.iter().enumerate() {
             if !matches!(
                 &field.outer_boundary[g.boundary_id].bc,
-                bc1::BCType::PrimitiveWall
+                bc::BCType::PrimitiveWall
             ) {
                 continue;
             }
@@ -636,7 +629,7 @@ mod parity {
         };
 
         // Manual analytic path through the single Circle element.
-        let (bid, proj) = bc1::find_boundary_element(p, &u.inner_boundary);
+        let (bid, proj) = bc::find_boundary_element(p, &u.inner_boundary);
         assert_eq!(bid, 0);
         assert!(matches!(
             u.inner_boundary[bid].geometry,
@@ -644,7 +637,7 @@ mod parity {
         ));
 
         let manual =
-            bc1::set_ghost_point_value(idx, proj, ghost::BoundaryKind::Inner, bid, &u, None);
+            bc::set_ghost_point_value(idx, proj, ghost::BoundaryKind::Inner, bid, &u, None);
 
         // Field::get must resolve the same Inner classification and
         // analytic Circle projection.

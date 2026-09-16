@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use crate::constant;
 use crate::diffusion;
 use crate::dt;
-use crate::field1::Field;
+use crate::field::Field;
 use crate::ghost::{self, GhostGrid};
 use crate::noncon;
 use crate::source;
@@ -343,8 +343,6 @@ pub(crate) fn l(u: &Field, ghosts: &mut GhostGrid, s: &mut Scratch) {
             let x = u.grid.x(i as isize);
             let y = u.grid.y(j as isize);
 
-            let mms_term = source::wall_mms_source(x, y, u.time);
-
             let mut dif_term = State::new();
             if constant::DIFFUSION_ACTIVE {
                 let dif_x = state::update(dfx[lin], dfx[lin + ny]).scalar_prod(-1.0 / (dx * dx));
@@ -359,7 +357,6 @@ pub(crate) fn l(u: &Field, ghosts: &mut GhostGrid, s: &mut Scratch) {
                 .add(nc_y)
                 .add(source_term)
                 .add(dif_term)
-                .add(mms_term);
         });
     }
 }

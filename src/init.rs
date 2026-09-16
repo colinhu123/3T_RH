@@ -1,5 +1,5 @@
-use crate::bc1::*;
-use crate::field1::*;
+use crate::bc::*;
+use crate::field::*;
 use crate::geometry::*;
 use crate::state::*;
 
@@ -266,7 +266,7 @@ pub fn init_cylinder() -> Field {
             Point { x: 0.0, y: -1.0 + delta },
             BCType::FarField(u_inf),
         ),
-        crate::bc1::BoundaryElement {
+        crate::bc::BoundaryElement {
             geometry: crate::geometry::BoundaryGeometry::Arc(cylinder_arc),
             bc: BCType::Wall,
         },
@@ -1470,7 +1470,7 @@ pub fn init_mms_63(n: usize) -> Field {
     // Periodic grid size.
     //
     // The periodic cell count is the grid extent along the axis (see
-    // bc1::periodic_value, which wraps with rem_euclid(nx)), so the domain
+    // bc::periodic_value, which wraps with rem_euclid(nx)), so the domain
     // is one full period of exactly n cells per axis:
     //
     //     nx = ny = n,     dx = dy = 2*pi/n
@@ -2014,6 +2014,473 @@ pub fn init_mms_wall(n: usize) -> Field {
     println!(
         "  project_equal_energies() must be disabled."
     );
+
+    println!("============================================================");
+    println!();
+
+    u
+}
+
+// ============================================================================
+// Example 5.8
+// 3-T radiation-hydrodynamic Rayleigh-Taylor instability
+//
+// Computational domain:
+//
+//     [0, 0.25] x [0, 1]
+//
+// Initial interface:
+//
+//     y = 0.5
+//
+// Heavy fluid:
+//     rho = 2,  0 <= y < 0.5
+//
+// Light fluid:
+//     rho = 1,  0.5 <= y <= 1
+//
+// Initial perturbation:
+//
+//     u = 0
+//     v = -0.025 * c_s * cos(8*pi*x)
+//
+// Three-temperature pressures:
+//
+//     p_e = p_i = p_r
+//
+//     lower:
+//         p = (2y + 1)/3
+//
+//     upper:
+//         p = (2y + 3)/6
+//
+// Boundary conditions:
+//
+//     left/right : reflective
+//
+//     bottom:
+//         rho = 2
+//         u = v = 0
+//         pe = pi = pr = 1/3
+//
+//     top:
+//         rho = 1
+//         u = v = 0
+//         pe = pi = pr = 5/6
+//
+// Paper:
+//     gamma_e = gamma_i = 5/3
+//     omega_ei = omega_er = 0
+//     kappa_e = kappa_i = kappa_r = 0
+//
+//     grid = 200 x 1200
+//     T_final = 1.95
+//
+// IMPORTANT:
+//
+// The acceleration is in the +y direction.
+//
+// The governing equations therefore also require the gravitational/
+// acceleration source:
+//
+//     S_(rho v) = rho
+//
+// and the corresponding energy source:
+//
+//     S_E = rho * v
+//
+// That source belongs in the RHS/time-evolution code, NOT here.
+// ============================================================================
+
+pub fn init_rayleigh_taylor_3t() -> Field {
+    // ========================================================================
+    // Domain
+    // ========================================================================
+
+    let xmin = 0.0_f64;
+    let xmax = 0.25_f64;
+
+    let ymin = 0.0_f64;
+    let ymax = 1.0_f64;
+
+    // ------------------------------------------------------------------------
+    // Paper grid:
+    //
+    //     200 x 1200
+    //
+    // Here these are interpreted as the number of Cartesian grid points,
+    // consistent with GridInfo::new(nx, ny, ...).
+    // ------------------------------------------------------------------------
+
+    let nx = 200_usize;
+    let ny = 1200_usize;
+
+    let dx = (xmax - xmin) / ((nx - 1) as f64);
+    let dy = (ymax - ymin) / ((ny - 1) as f64);
+
+    let grid = GridInfo::new(
+        nx,
+        ny,
+        dx,
+        dy,
+        xmin,
+        ymin,
+    );
+
+    // ========================================================================
+    // Boundary states
+    // ========================================================================
+
+    // Bottom:
+    //
+    //     rho = 2
+    //     u = v = 0
+    //     pe = pi = pr = 1/3
+    //
+    // Use the solver's own primitive -> conservative conversion.
+    let bottom_state = State::primi2con(
+        2.0,
+        0.0,
+        0.0,
+        1.0 / 3.0,
+        1.0 / 3.0,
+        1.0 / 3.0,
+    );
+
+    // Top:
+    //
+    //     rho = 1
+    //     u = v = 0
+    //     pe = pi = pr = 5/6
+    let top_state = State::primi2con(
+        1.0,
+        0.0,
+        0.0,
+        5.0 / 6.0,
+        5.0 / 6.0,
+        5.0 / 6.0,
+    );
+
+    // ========================================================================
+    // Rectangle
+    //
+    // Counter-clockwise ordering:
+    //
+    //        p01 ---------------- p11
+    //         |                    |
+    //         |                    |
+    //         |                    |
+    //        p00 ---------------- p10
+    //
+    // Boundary ordering:
+    //
+    //     p00 -> p10 : bottom
+    //     p10 -> p11 : right
+    //     p11 -> p01 : top
+    //     p01 -> p00 : left
+    //
+    // This is the same CCW convention used by line_element().
+    // ========================================================================
+
+    let p00 = Point {
+        x: xmin,
+        y: ymin,
+    };
+
+    let p10 = Point {
+        x: xmax,
+        y: ymin,
+    };
+
+    let p11 = Point {
+        x: xmax,
+        y: ymax,
+    };
+
+    let p01 = Point {
+        x: xmin,
+        y: ymax,
+    };
+
+    // ========================================================================
+    // Physical outer boundary
+    // ========================================================================
+    //
+    // Paper:
+    //
+    //     left/right = reflective
+    //     bottom     = prescribed constant state
+    //     top        = prescribed constant state
+    //
+    // For the two vertical sides use ReflectiveWall, since the paper calls
+    // these "reflective boundary conditions".
+    // ========================================================================
+
+    let outer_elements = vec![
+        // --------------------------------------------------------------------
+        // Bottom:
+        //
+        // rho = 2
+        // u = v = 0
+        // pe = pi = pr = 1/3
+        // --------------------------------------------------------------------
+        line_element(
+            p00,
+            p10,
+            BCType::Constant(bottom_state),
+        ),
+
+        // --------------------------------------------------------------------
+        // Right:
+        //
+        // reflective
+        // --------------------------------------------------------------------
+        line_element(
+            p10,
+            p11,
+            BCType::ReflectiveWall,
+        ),
+
+        // --------------------------------------------------------------------
+        // Top:
+        //
+        // rho = 1
+        // u = v = 0
+        // pe = pi = pr = 5/6
+        // --------------------------------------------------------------------
+        line_element(
+            p11,
+            p01,
+            BCType::Constant(top_state),
+        ),
+
+        // --------------------------------------------------------------------
+        // Left:
+        //
+        // reflective
+        // --------------------------------------------------------------------
+        line_element(
+            p01,
+            p00,
+            BCType::ReflectiveWall,
+        ),
+    ];
+
+    // No inner boundary.
+    let inner_elements = Vec::new();
+
+    // ========================================================================
+    // Construct field
+    // ========================================================================
+
+    let mut u = Field::from_boundaries(
+        grid,
+        outer_elements,
+        inner_elements,
+        State::new(),
+        0.0,
+    );
+
+    // ========================================================================
+    // Initial condition
+    //
+    // Eq. (5.8)
+    //
+    // lower:
+    //
+    //     rho = 2
+    //     u   = 0
+    //     v   = -0.025 c_s cos(8*pi*x)
+    //
+    //     pe = pi = pr = (2y+1)/3
+    //
+    // upper:
+    //
+    //     rho = 1
+    //     u   = 0
+    //     v   = -0.025 c_s cos(8*pi*x)
+    //
+    //     pe = pi = pr = (2y+3)/6
+    //
+    // IMPORTANT:
+    //
+    // c_s is obtained from State::cs().
+    //
+    // We first construct a zero-velocity thermodynamic state, evaluate
+    // State::cs(), then construct the actual perturbed state.
+    //
+    // This guarantees that the initialization uses exactly the same
+    // sound-speed definition as the rest of the solver.
+    // ========================================================================
+
+    let pi_const = std::f64::consts::PI;
+
+    for i in 0..nx {
+        for j in 0..ny {
+            let idx = (
+                i as isize,
+                j as isize,
+            );
+
+            if !u.is_in_domain(idx) {
+                continue;
+            }
+
+            let x = grid.x(idx.0);
+            let y = grid.y(idx.1);
+
+            // ================================================================
+            // Density and hydrostatic three-temperature pressure
+            // ================================================================
+
+            let (rho, p) = if y < 0.5 {
+                // ------------------------------------------------------------
+                // Heavy fluid
+                //
+                //     rho = 2
+                //     p_e = p_i = p_r = (2y+1)/3
+                // ------------------------------------------------------------
+
+                (
+                    2.0_f64,
+                    (2.0 * y + 1.0) / 3.0,
+                )
+            } else {
+                // ------------------------------------------------------------
+                // Light fluid
+                //
+                //     rho = 1
+                //     p_e = p_i = p_r = (2y+3)/6
+                // ------------------------------------------------------------
+
+                (
+                    1.0_f64,
+                    (2.0 * y + 3.0) / 6.0,
+                )
+            };
+            let base_state = State::primi2con(
+                rho,
+                0.0,
+                0.0,
+                p,
+                p,
+                p,
+            );
+
+            let cs = base_state.cs();
+
+
+            let ux = 0.0_f64;
+
+            let uy =
+                -0.025
+                * cs
+                * (8.0 * pi_const * x).cos();
+
+            // ================================================================
+            // Final conservative state
+            // ================================================================
+
+            let state = State::primi2con(
+                rho,
+                ux,
+                uy,
+                p,
+                p,
+                p,
+            );
+
+            u.set(
+                idx,
+                state,
+            );
+        }
+    }
+
+    // ========================================================================
+    // Diagnostics
+    // ========================================================================
+
+    println!();
+    println!("============================================================");
+    println!("3-T RAYLEIGH-TAYLOR INSTABILITY");
+    println!("Example 5.8");
+    println!("============================================================");
+
+    println!(
+        "grid: nx={}, ny={}",
+        nx,
+        ny,
+    );
+
+    println!(
+        "dx = {:.16e}",
+        dx,
+    );
+
+    println!(
+        "dy = {:.16e}",
+        dy,
+    );
+
+    println!(
+        "domain = [{:.8},{:.8}] x [{:.8},{:.8}]",
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+    );
+
+    println!();
+
+    println!("Initial interface:");
+    println!("  y = 0.5");
+
+    println!();
+
+    println!("Lower/heavy fluid:");
+    println!("  rho = 2");
+    println!("  pe = pi = pr = (2*y + 1)/3");
+
+    println!();
+
+    println!("Upper/light fluid:");
+    println!("  rho = 1");
+    println!("  pe = pi = pr = (2*y + 3)/6");
+
+    println!();
+
+    println!("Initial velocity:");
+    println!("  u = 0");
+    println!("  v = -0.025 * cs * cos(8*pi*x)");
+    println!("  cs is evaluated using State::cs()");
+
+    println!();
+
+    println!("Boundary conditions:");
+    println!("  left   = ReflectiveWall");
+    println!("  right  = ReflectiveWall");
+    println!("  bottom = Constant(rho=2, u=v=0, pe=pi=pr=1/3)");
+    println!("  top    = Constant(rho=1, u=v=0, pe=pi=pr=5/6)");
+
+    println!();
+
+    println!("Paper parameters:");
+    println!("  gamma_e = gamma_i = 5/3");
+    println!("  omega_ei = omega_er = 0");
+    println!("  kappa_e = kappa_i = kappa_r = 0");
+
+    println!();
+
+    println!("Acceleration:");
+    println!("  direction = +y");
+    println!("  magnitude = 1");
+    println!("  RHS must include momentum/energy source terms.");
+
+    println!();
+
+    println!("Recommended final time:");
+    println!("  T_final = 1.95");
 
     println!("============================================================");
     println!();

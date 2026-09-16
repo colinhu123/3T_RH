@@ -160,9 +160,9 @@ impl State {
             rho: rho,
             mom_x: rho * u,
             mom_y: rho * v,
-            ee: rho * ee1 + kinetic_share,
-            ei: rho * ei1 + kinetic_share,
-            er: rho * er1 + kinetic_share,
+            ee: rho*ee1 + kinetic_share,
+            ei: rho*ei1 + kinetic_share,
+            er: rho*er1 + kinetic_share,
         }
     }
 

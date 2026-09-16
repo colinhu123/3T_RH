@@ -25,7 +25,7 @@ U_t + dF1/dx + dF2/dy
 
 where `F1` and `F2` are the conservative convection fluxes, `N` contains the non-conservative pressure combinations, `G1` and `G2` are the electron/ion/radiation diffusion fluxes, and `S` contains the electron-ion and electron-radiation energy exchange terms.
 
-This is the same operator structure assembled in `l()` in `main.rs`: conservative x/y flux divergences, non-conservative x/y contributions, source terms, and diffusion in both directions are combined to form the semi-discrete right-hand side.
+This is the same operator structure assembled in `l()` in `solver.rs`: conservative x/y flux divergences, non-conservative x/y contributions, source terms, and diffusion in both directions are combined to form the semi-discrete right-hand side.
 
 ## Simulation Results
 
@@ -92,7 +92,7 @@ u^(n+1) = 1/3 u^n + 2/3 u2 + 2 dt/3 L(u2)
 
 In the code this is implemented in `rk3_ssp()`.
 
-The global time step is `dt = 0.8 * dt_cfl`, where `dt_cfl` is the minimum over all fluid cells of `dt::get_local_dt()` (which includes advection, diffusion and exchange-term eigenvalue estimates, scaled by `LAMBDA = 0.5`). The step is clipped so the simulation lands exactly on output times and `t_final`.
+The global time step is `dt = dt_factor * dt_cfl`, where `dt_factor = 0.5` is set by the current driver (`main.rs`) and `dt_cfl` is the minimum over all fluid cells of `dt::get_local_dt()` (which includes advection, diffusion and exchange-term eigenvalue estimates, scaled by `LAMBDA = 0.5`). The step is clipped so the simulation lands exactly on output times and `t_final`.
 
 ## Geometry and boundary conditions
 
@@ -129,11 +129,12 @@ initializers never describe a boundary twice, and the legacy per-polygon-side
 
 Ghost values are recomputed in parallel (Rayon) once per RK stage in `GhostGrid::update_values_parallel()`. All ghosts are first-stage-independent, so the update is data-parallel.
 
-### Boundary conditions (`bc1.rs`)
+### Boundary conditions (`bc.rs`)
 
 | BCType | Description |
 |---|---|
 | `Wall` | High-order ILW: no-penetration constraint on the momentum row, characteristic WENO extrapolation for the other rows, 4th-order Taylor expansion to the ghost point. |
+| `PrimitiveWall` | High-order ILW wall specialized to the local Euler primitive variables `[rho, u_n, u_t, p]` (Euler-equivalent benchmark). Selected by `CylinderWallMode::Primitive`. |
 | `ReflectiveWall` | Geometric reflection of the nearest interior state with normal momentum flipped. |
 | `FarField(state)` | Characteristic BC: outgoing characteristics from WENO extrapolation, incoming characteristics from the freestream state. Becomes supersonic inflow/outflow automatically. |
 | `NonReflectiveOutflow` | Non-reflecting outlet: outgoing characteristics extrapolated, incoming set to zero. Uses the same precomputed `GhostBC` fast path as `FarField`/`Outflow`. |
@@ -146,45 +147,55 @@ The high-order machinery (`weno_extrapolation()`) follows Tan, Wang, Shu, and Ni
 
 ## Current test problem in `main.rs`
 
-The current executable is the **Mach-3 flow past the front half of a circular cylinder** (`init::init_cylinder()`):
+The current executable is a **Mach-3 moving shock interacting with a full circular cylinder inside a rectangular box** (`init::init_shock_cylinder_in_box(init::CylinderWallMode::HighOrder)`):
 
 ```text
-domain      : x in [-3, 0], y in [-6, 6]
-obstacle    : half-disk x^2 + y^2 < 1, x <= 0  (part of the outer polygon)
-grid        : nx = 121, ny = 481, dx = dy = 1/40
-freestream  : rho = 1, p = 1, M = 3  (splits: ee = ei = er)
-t_final     : 10.0
-output      : every dt_store = 0.05
-dt          : 0.8 * dt_cfl
+domain      : x in [-4, 20], y in [-5, 5]
+obstacle    : full circle, center (0, 0.0125), R = 1  (analytic Circle, fluid outside)
+grid        : nx = 961, ny = 401, dx = dy = 1/40
+shock       : M = 3, initially at x = -1.10
+              x <= -1.10 : post-shock state
+              x >  -1.10 : pre-shock state (rho = 1, p = 1, u = v = 0)
+t_final     : 1.95
+output      : every store_interval = 0.01
+dt          : 0.5 * dt_cfl
 ```
 
-The cylinder wall is a single analytic `CircularArc` boundary element with the high-order ILW `Wall` BC; the 360 polygon segments that approximate the arc remain only as the domain classifier / fluid mask. All outer straight sides use `FarField` (the left side `x = -3` is supersonic inflow).
+Boundary conditions:
 
-Other initializers in `init.rs` include `init_shock_cylinder_in_box(wall)` (the full cylinder inside a rectangular box, with `CylinderWallMode::{Reflective, HighOrder, Primitive}`), `init_rotated_shock_cylinder(wall)`, `init_planar_shock_channel()`, `init_forward_facing_step_rotated()`, and `init_double_mach()` (the paper's double-Mach-reflection benchmark).
+- inner circle: high-order ILW `Wall` (through `CylinderWallMode::HighOrder`);
+- bottom (`y = -5`) and top (`y = 5`): `ReflectiveWall`;
+- right (`x = 20`): `ZerothOrder`;
+- left (`x = -4`): `Constant(post-shock state)`.
+
+The 360 polygon segments that approximate the circle remain only as the domain classifier / fluid mask; the analytic `Circle` element is the authoritative wall geometry. The wall mode is selectable through `CylinderWallMode::{Reflective, HighOrder, Primitive}` (`ReflectiveWall`, `Wall`, `PrimitiveWall` respectively); `Reflective` is a safe low-order startup from which one may restart the same geometry with a high-order mode.
+
+Other initializers in `init.rs` include `init_cylinder()` (Mach-3 flow past the front half of a cylinder, with `FarField` outer sides), `init_rotated_shock_cylinder(wall)`, `init_planar_shock_channel()`, `init_forward_facing_step_rotated()`, `init_rayleigh_taylor_3t()` (the paper's three-temperature Rayleigh-Taylor case), `init_mms_63(n)` / `init_mms_wall(n)` (manufactured-solution tests, see [Accuracy and verification](#accuracy-and-verification)), and `init_double_mach()` (the paper's double-Mach-reflection benchmark).
 
 ## Project layout
 
 ```text
 .
 └── src/
-    ├── main.rs          grid/driver setup, spatial operator l(), SSP-RK3, time loop, output
+    ├── main.rs          driver: Config, time loop, restart/output, parity tests
+    ├── solver.rs        semi-discrete operator l(), SSP-RK3, Solver/Scratch buffers, global dt
     ├── state.rs         State representation, pressure splits, physical fluxes, arithmetic
-    ├── weno.rs          WENO stencil, Roe-average eigen-decomposition, characteristic WENO5 reconstruction
+    ├── weno.rs          WENO stencil, Roe-average eigen-decomposition, characteristic WENO5 reconstruction, positivity limiter
     ├── noncon.rs        non-conservative pressure term (6th-order derivative + upwind jumps)
     ├── diffusion.rs     diffusion flux (6-point derivative of temperature)
-    ├── source.rs        electron-ion / electron-radiation energy exchange
+    ├── source.rs        electron-ion / electron-radiation energy exchange, RT acceleration and MMS sources
     ├── dt.rs            local time-step estimate
     ├── constant.rs      physical and numerical constants
     ├── geometry.rs      points, vectors, projections, polygons, analytic boundaries (line/arc/circle)
-    ├── field1.rs        GridInfo + Field with polygon-defined fluid region and analytic boundary elements
+    ├── field.rs        GridInfo + Field with polygon-defined fluid region and analytic boundary elements
     ├── ghost.rs         GhostGrid: static ghost layout, parallel per-stage updates
-    ├── bc1.rs           boundary conditions (ILW wall, WENO extrapolation, far-field, LODI, ...)
-    ├── init.rs          initial conditions (cylinder, shock-cylinder-in-box, double Mach reflection, ...)
+    ├── bc.rs           boundary conditions (ILW wall, WENO extrapolation, far-field, LODI, ...)
+    ├── init.rs          initial conditions (cylinder, shock-cylinder-in-box, Rayleigh-Taylor, MMS, ...)
     ├── io.rs            binary output/restart writer and reader
     └── monitor.rs       per-step diagnostics / RHS residual norms -> data/monitor.csv
 ```
 
-`bc.rs` and `field.rs` are legacy rectangular-grid variants that are no longer wired into the build (`main.rs` declares `bc1`/`field1` instead).
+The current boundary-condition and field modules are `bc.rs` and `field.rs` (the earlier rectangular-grid variants of the same names have been removed); `main.rs` declares `bc`/`field`.
 
 ## Build and run
 
@@ -216,7 +227,7 @@ Test coverage includes:
 
 - WENO (`weno.rs`): eigen-decomposition (`L * R = I` for x/y), characteristic round-trip, constant-state flux preservation, WENO5 convergence order on a smooth profile.
 - noncon (`noncon.rs`): constant-state and zero-velocity vanishing, direction sensitivity, wrapper consistency.
-- bc1 (`bc1.rs`): polynomial least-squares reproduction, derivative extraction, paper stencil `E_r` cardinality/structure on vertical and horizontal walls, constant-state characteristic extrapolation and final ghost reconstruction, ILW wall robustness and analytic-element BC resolution at junctions.
+- bc (`bc.rs`): polynomial least-squares reproduction, derivative extraction, paper stencil `E_r` cardinality/structure on vertical and horizontal walls, constant-state characteristic extrapolation and final ghost reconstruction, ILW wall robustness and analytic-element BC resolution at junctions.
 - geometry (`geometry.rs`): analytic line/arc/circle projection and polygon classification.
 - ghost (`ghost.rs`): stencil-offset bookkeeping.
 - state (`state.rs`): primitive-to-conservative conversion.
@@ -286,15 +297,18 @@ DEFAULT_EPS = 1e-12
 KAPPA_E = KAPPA_I = KAPPA_R = 0   (no diffusion)
 OMEGA_EI = OMEGA_ER = 0           (no energy exchange)
 CVE = CVI = 1, A = 1
-GAMMA_E = GAMMA_I = GAMMA_R = 1.4
-LAMBDA = 0.5, WENO_Q = 10.0, PHI = 5.0
+GAMMA_E = GAMMA_I = 5/3, GAMMA_R = 4/3
+LAMBDA = 0.5, WENO_Q = 2.0, PHI = 5.0
+EPS_LIMITER = 1e-13, PP_W = 1/12, MAX_ITER = 60, PP_SWITCH = false
 ```
 
-With these settings the code reduces to the 3-T Euler equations; diffusion and exchange terms are in place but inactive.
+With these settings the code reduces to the 3-T Euler equations; diffusion and exchange terms are in place but inactive. `WENO_Q` is used only by the boundary extrapolation in `bc.rs` (the interior WENO5 reconstruction uses the standard `q = 2`), `PHI = 5.0` is the low-dissipation sound-speed cap used by `reconstruction_fast()` in `weno.rs`, and the positivity-preserving limiter is compiled in but disabled (`PP_SWITCH = false`).
 
 ## Accuracy and verification
 
 The reference paper reports fifth-order spatial accuracy and third-order SSP Runge-Kutta time discretization for its finite-difference WENO construction.
+
+> **Note on the MMS tests.** The current spatial operator `l()` in `solver.rs` assembles only the conservative fluxes, non-conservative terms, the physical source (`source::source`, active only when `SOURCE_ACTIVE`) and diffusion. The manufactured source terms `mms_63_source` / `wall_mms_source` are defined in `source.rs` but are **not** currently added to the RHS, so `init_mms_63` / `init_mms_wall` only initialize the fields and print a reminder. The convergence tables below are the results obtained with those source terms enabled; reproducing them requires re-adding the MMS source to `l()`.
 
 Recommended verification workflow:
 

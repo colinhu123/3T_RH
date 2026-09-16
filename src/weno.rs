@@ -730,14 +730,7 @@ impl Stencil6 {
         let a3 = (u1.abs()).max(u2.abs());
         let a4 = (u1.abs()).max(u2.abs());
         let a5 = ((u1 + cs1).abs()).max((u2 + cs2).abs());
-        /*
-        let a0 = lambda[0].abs();
-        let a1 = lambda[1].abs();
-        let a2 = lambda[2].abs();
-        let a3 = lambda[3].abs();
-        let a4 = lambda[4].abs();
-        let a5 = lambda[5].abs();
-        */
+        
         let mut f_plus_stencil = [state::State::new(); 6];
         let mut f_minus_stencil = [state::State::new(); 6];
 

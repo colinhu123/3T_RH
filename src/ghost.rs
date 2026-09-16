@@ -1,8 +1,8 @@
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-use crate::bc1;
-use crate::field1::Field;
+use crate::bc;
+use crate::field::Field;
 use crate::geometry::{self, Projection};
 use crate::state::{Derived, State};
 
@@ -25,7 +25,7 @@ pub struct GhostInfo {
     pub boundary_id: usize,
     /// Precomputed WENO-extrapolation data (only for Wall / Outflow /
     /// FarField / NonReflectiveOutflow ghosts).
-    pub bc: Option<Box<bc1::GhostBC>>,
+    pub bc: Option<Box<bc::GhostBC>>,
 }
 
 #[derive(Debug)]
@@ -55,7 +55,7 @@ impl GhostGrid {
         let mut lookup = HashMap::with_capacity(indices.len());
 
         let h = (field.grid.dx * field.grid.dy).sqrt();
-        let beta_forms = bc1::beta_quadratic_forms(h);
+        let beta_forms = bc::beta_quadratic_forms(h);
 
         for idx in indices {
             let id = info.len();
@@ -184,7 +184,7 @@ impl GhostGrid {
     pub fn update_values(&mut self, field: &Field, _t: f64) {
         for id in 0..self.info.len() {
             let g = &self.info[id];
-            let result = bc1::set_ghost_point_value(
+            let result = bc::set_ghost_point_value(
                 g.idx,
                 g.project,
                 g.boundary,
@@ -201,7 +201,7 @@ impl GhostGrid {
     ///
     /// Each ghost is reconstructed once for the current RK stage, using
     /// its precomputed BC data. Derived quantities are filled in the same
-    /// pass. Fail immediately if bc1 produces a non-finite ghost state.
+    /// pass. Fail immediately if bc produces a non-finite ghost state.
     pub fn update_values_parallel(&mut self, field: &Field) {
         let info = &self.info;
 
@@ -215,7 +215,7 @@ impl GhostGrid {
             .for_each(|(id, (value, dvalue))| {
                 let g = &info[id];
 
-                let result = bc1::set_ghost_point_value(
+                let result = bc::set_ghost_point_value(
                     g.idx,
                     g.project,
                     g.boundary,
@@ -225,7 +225,7 @@ impl GhostGrid {
                 );
 
                 // ----------------------------------------------------
-                // bc1 must NEVER return NaN / Inf.
+                // bc must NEVER return NaN / Inf.
                 // ----------------------------------------------------
 
                 if !result.rho.is_finite()
@@ -340,25 +340,25 @@ fn build_ghost_info(
 
     // Analytic physical boundary lookup: exact P0 / n / D come from the
     // selected BoundaryElement (Line or Arc), never from Polygon sides.
-    let (boundary_id, project) = bc1::find_boundary_element(p, elements);
+    let (boundary_id, project) = bc::find_boundary_element(p, elements);
 
-    let nearest_idx = bc1::find_nearest_grid_point(project, field);
+    let nearest_idx = bc::find_nearest_grid_point(project, field);
 
     // Precompute the heavy per-stage extrapolation data for BC types that
     // use it. Cheap BCs (Constant/ReflectiveWall/ZerothOrder/Periodic/...)
     // skip it entirely. The ANALYTIC Projection above is what feeds the
     // WENO stencil geometry / regression matrices.
     let bc_pre = match &elements[boundary_id].bc {
-        bc1::BCType::Wall
-        | bc1::BCType::PrimitiveWall
-        | bc1::BCType::Outflow { .. }
-        | bc1::BCType::NonReflectiveOutflow
-        | bc1::BCType::FarField(_) => {
+        bc::BCType::Wall
+        | bc::BCType::PrimitiveWall
+        | bc::BCType::Outflow { .. }
+        | bc::BCType::NonReflectiveOutflow
+        | bc::BCType::FarField(_) => {
             // PrimitiveWall uses the benchmark boundary WENO exponent
             // (q = 10 for the Mach-3 cylinder, Tan et al. 2012);
             // all other boundary types keep the global exponent.
             let q = match &elements[boundary_id].bc {
-                bc1::BCType::PrimitiveWall => bc1::PRIMITIVE_WALL_WENO_Q,
+                bc::BCType::PrimitiveWall => bc::PRIMITIVE_WALL_WENO_Q,
                 _ => crate::constant::WENO_Q,
             };
 
@@ -373,10 +373,10 @@ fn build_ghost_info(
             // stencil cannot be formed keeps the pre-stage slow path
             // (bc_pre = None) instead of aborting the build.
             let pre = match &elements[boundary_id].bc {
-                bc1::BCType::Wall | bc1::BCType::NonReflectiveOutflow => {
-                    bc1::try_precompute_ghost_bc(&project, field, beta_forms, q)
+                bc::BCType::Wall | bc::BCType::NonReflectiveOutflow => {
+                    bc::try_precompute_ghost_bc(&project, field, beta_forms, q)
                 }
-                _ => Some(bc1::precompute_ghost_bc(&project, field, beta_forms, q)),
+                _ => Some(bc::precompute_ghost_bc(&project, field, beta_forms, q)),
             };
 
             pre.map(Box::new)

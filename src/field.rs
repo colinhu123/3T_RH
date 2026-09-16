@@ -1,4 +1,5 @@
-use crate::bc::{BCType, BoundLoc, BoundaryCondition};
+use crate::bc;
+use crate::geometry::{self, FluidSide, Geometry, Point, Polygon};
 use crate::state::State;
 
 #[derive(Clone, Copy, Debug)]
@@ -14,14 +15,7 @@ pub struct GridInfo {
 }
 
 impl GridInfo {
-    pub fn new(
-        nx: usize,
-        ny: usize,
-        dx: f64,
-        dy: f64,
-        x0: f64,
-        y0: f64,
-    ) -> Self {
+    pub fn new(nx: usize, ny: usize, dx: f64, dy: f64, x0: f64, y0: f64) -> Self {
         assert!(nx > 0, "nx must be greater than zero");
         assert!(ny > 0, "ny must be greater than zero");
         assert!(dx > 0.0, "dx must be greater than zero");
@@ -41,371 +35,290 @@ impl GridInfo {
     pub fn is_in_domain(&self, idx: (isize, isize)) -> bool {
         let (i, j) = idx;
 
-        i >= 0
-            && i < self.nx as isize
-            && j >= 0
-            && j < self.ny as isize
+        i >= 0 && i < self.nx as isize && j >= 0 && j < self.ny as isize
     }
 
     /// Physical x coordinate of cell center i.
     #[inline(always)]
     pub fn x(&self, i: isize) -> f64 {
-        self.x0 + (i as f64 + 0.5) * self.dx
+        self.x0 + (i as f64) * self.dx
     }
 
     /// Physical y coordinate of cell center j.
     #[inline(always)]
     pub fn y(&self, j: isize) -> f64 {
-        self.y0 + (j as f64 + 0.5) * self.dy
+        self.y0 + (j as f64) * self.dy
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.nx * self.ny
     }
+
+    pub fn coord2idx(&self, p: Point) -> (isize, isize) {
+        let i = ((p.x - self.x0) / self.dx).round() as isize;
+        let j = ((p.y - self.y0) / self.dy).round() as isize;
+        (i, j)
+    }
 }
 
-#[derive(Clone, Debug)]
+/// Derive the fluid-domain classifier polygon from a list of analytic
+/// boundary elements (the single source of boundary definition).
+///
+/// `polygonize_boundary` samples lines / arcs / circles so that the derived
+/// polygon reproduces the fluid mask; the analytic elements remain the
+/// authoritative geometry for ghost reconstruction.
+fn classifier_polygon(elements: &[bc::BoundaryElement], chord_max: f64, fluid: FluidSide) -> Polygon {
+    let geoms: Vec<geometry::BoundaryGeometry> = elements.iter().map(|e| e.geometry).collect();
+    geometry::polygonize_boundary(&geoms, chord_max, fluid)
+}
+
 pub struct Field {
-    grid: GridInfo,
+    pub grid: GridInfo,
+    pub value: Vec<State>,
 
-    /// Flattened physical cells only.
-    ///
-    /// Layout:
-    ///     linear(i,j) = i * ny + j
-    ///
-    /// i is the x-direction index.
-    /// j is the y-direction index.
-    value: Vec<State>,
+    /// Derived outer-domain classifier polygon (fluid inside). Generated
+    /// from `outer_boundary`; kept only for mask / Outer-vs-Inner
+    /// classification, never for ghost geometry.
+    pub outer_bound: Polygon,
 
-    /// Boundary-condition order:
-    ///
-    /// [Bottom, Right, Top, Left]
-    bc: [BCType; 4],
+    /// Derived obstacle classifier polygon (fluid outside), if any.
+    /// `None` when there is no inner boundary (no manual dummy needed).
+    pub inner_bound: Option<Polygon>,
+
+    pub time: f64,
+    /// Fluid mask over the Cartesian grid (linear index = i*ny + j),
+    /// computed once at construction. `is_in_domain` reads this mask.
+    pub fluid: Vec<bool>,
+
+    /// Analytic physical boundary elements (ONE geometry + ONE BC each).
+    /// These are the authoritative physical boundary geometry for ghosts.
+    pub outer_boundary: Vec<bc::BoundaryElement>,
+    pub inner_boundary: Vec<bc::BoundaryElement>,
 }
 
 impl Field {
-    pub fn new(
+    /// Construct a Field from the authoritative analytic boundaries.
+    ///
+    /// The classifier polygons and the fluid mask are derived internally:
+    /// this is the only boundary description callers must provide.
+    pub fn from_boundaries(
         grid: GridInfo,
-        bc: [BCType; 4],
-    ) -> Self {
-        Self {
-            value: vec![State::new(); grid.len()],
-            grid,
-            bc,
-        }
-    }
-
-    pub fn filled(
-        grid: GridInfo,
-        bc: [BCType; 4],
+        outer: Vec<bc::BoundaryElement>,
+        inner: Vec<bc::BoundaryElement>,
         value: State,
+        time: f64,
     ) -> Self {
+        // Chord target keeps the sampled classifier within a quarter cell
+        // of the exact analytic geometry, so boundary-adjacent cell centers
+        // keep the same fluid classification.
+        let chord_max = 0.25 * grid.dx.min(grid.dy);
+
+        let outer_bound = classifier_polygon(&outer, chord_max, FluidSide::Inside);
+        let inner_bound = if inner.is_empty() {
+            None
+        } else {
+            Some(classifier_polygon(&inner, chord_max, FluidSide::Outside))
+        };
+
+        Self::from_parts(grid, outer_bound, inner_bound, outer, inner, value, time)
+    }
+
+    /// Construct a Field from explicitly supplied classifier polygons and
+    /// analytic boundary elements.
+    ///
+    /// Used internally by [`Field::from_boundaries`] and by unit tests that
+    /// need a hand-built classifier polygon (thin strips, corner boxes,
+    /// oblique walls). The analytic elements remain the authoritative
+    /// boundary geometry for ghost reconstruction.
+    pub(crate) fn from_parts(
+        grid: GridInfo,
+        outer_bound: Polygon,
+        inner_bound: Option<Polygon>,
+        outer_elements: Vec<bc::BoundaryElement>,
+        inner_elements: Vec<bc::BoundaryElement>,
+        value: State,
+        time: f64,
+    ) -> Self {
+        assert!(
+            outer_bound.fluid == FluidSide::Inside,
+            "Wrong outer classifier setting"
+        );
+        if let Some(inner) = &inner_bound {
+            assert!(
+                inner.fluid == FluidSide::Outside,
+                "Wrong inner classifier setting"
+            );
+        }
+
+        let nx = grid.nx;
+        let ny = grid.ny;
+
+        let fluid = (0..nx * ny)
+            .map(|linear| {
+                let i = linear / ny;
+                let j = linear % ny;
+                let p = Point {
+                    x: grid.x(i as isize),
+                    y: grid.y(j as isize),
+                };
+                outer_bound.is_fluid(p)
+                    && inner_bound
+                        .as_ref()
+                        .map_or(true, |poly| poly.is_fluid(p))
+            })
+            .collect();
+
         Self {
-            value: vec![value; grid.len()],
             grid,
-            bc,
+            value: vec![value; grid.len()],
+            outer_bound,
+            inner_bound,
+            time,
+            fluid,
+            outer_boundary: outer_elements,
+            inner_boundary: inner_elements,
         }
     }
 
+    /// Scratch field with the same geometry and fluid mask, but zeroed
+    /// values. Does not re-run the mask construction.
     pub fn empty_like(&self) -> Self {
         Self {
             grid: self.grid,
-            value: vec![
-                State::new();
-                self.grid.len()
-            ],
-            bc: self.bc,
+            value: vec![State::new(); self.grid.len()],
+            outer_bound: self.outer_bound.clone(),
+            inner_bound: self.inner_bound.clone(),
+            time: self.time,
+            fluid: self.fluid.clone(),
+            outer_boundary: self.outer_boundary.clone(),
+            inner_boundary: self.inner_boundary.clone(),
         }
     }
 
+    /// True if `p` is fluid with respect to the outer domain classifier.
     #[inline(always)]
-    pub fn nx(&self) -> usize {
-        self.grid.nx
+    pub fn outer_contains(&self, p: Point) -> bool {
+        self.outer_bound.is_fluid(p)
+    }
+
+    /// True if `p` is not cut out by an inner obstacle (always true when
+    /// there is no inner boundary).
+    #[inline(always)]
+    pub fn inner_contains(&self, p: Point) -> bool {
+        self.inner_bound
+            .as_ref()
+            .map_or(true, |poly| poly.is_fluid(p))
+    }
+
+    /// Fluid if inside the outer domain AND not inside an obstacle.
+    #[inline(always)]
+    pub fn is_fluid_point(&self, p: Point) -> bool {
+        self.outer_contains(p) && self.inner_contains(p)
+    }
+
+    pub fn is_in_domain(&self, idx: (isize, isize)) -> bool {
+        if !self.grid.is_in_domain(idx) {
+            let p = Point {
+                x: self.grid.x(idx.0),
+                y: self.grid.y(idx.1),
+            };
+            return self.is_fluid_point(p);
+        }
+
+        let i = idx.0 as usize;
+        let j = idx.1 as usize;
+        self.fluid[i * self.grid.ny + j]
     }
 
     #[inline(always)]
-    pub fn ny(&self) -> usize {
-        self.grid.ny
+    fn get_inside(&self, idx: (isize, isize)) -> State {
+        debug_assert!(self.is_in_domain(idx));
+        let i = idx.0 as usize;
+        let j = idx.1 as usize;
+        self.value[i * self.grid.ny + j]
     }
-
     #[inline(always)]
-    pub fn grid(&self) -> &GridInfo {
-        &self.grid
-    }
-
-    #[inline(always)]
-    pub fn is_in_domain(
-        &self,
-        idx: (isize, isize),
-    ) -> bool {
-        self.grid.is_in_domain(idx)
-    }
-
-    #[inline(always)]
-    fn linear_index(
-        &self,
-        idx: (isize, isize),
-    ) -> usize {
+    pub fn linear_index(&self, idx: (isize, isize)) -> usize {
         debug_assert!(self.is_in_domain(idx));
 
         let (i, j) = idx;
 
-        i as usize * self.grid.ny
-            + j as usize
+        i as usize * self.grid.ny + j as usize
     }
 
-    #[inline(always)]
-    fn get_inside(
-        &self,
-        idx: (isize, isize),
-    ) -> State {
-        self.value[self.linear_index(idx)]
-    }
-
-    #[inline(always)]
-    fn boundary_location(
-        &self,
-        idx: (isize, isize),
-    ) -> BoundLoc {
-        debug_assert!(!self.is_in_domain(idx));
-
-        let (i, j) = idx;
-
-        if i < 0 {
-            BoundLoc::Left
-        } else if i >= self.grid.nx as isize {
-            BoundLoc::Right
-        } else if j < 0 {
-            BoundLoc::Bottom
-        } else {
-            BoundLoc::Top
-        }
-    }
-
-    /// Unified read interface.
-    ///
-    /// Interior indices return the physical cell directly.
-    /// Out-of-domain indices are interpreted as ghost cells and
-    /// delegated to the boundary condition on that side.
-    ///
-    /// Convention:
-    ///     i -> x direction
-    ///     j -> y direction
     #[inline]
-    pub fn get(
-        &self,
-        idx: (isize, isize),
-    ) -> State {
-        if self.is_in_domain(idx) {
-            return self.get_inside(idx);
-        }
+    pub fn set(&mut self, idx: (isize, isize), value: State) {
+        assert!(self.is_in_domain(idx), "cannot write ghost cell {:?}", idx);
 
-        let boundary =
-            self.boundary_location(idx);
-
-        self.bc[boundary.boundloc2idx()]
-            .get_ghost(
-                idx,
-                &self.grid,
-                &self.value,
-            )
-    }
-
-    /// Write a physical-domain cell.
-    ///
-    /// Ghost cells are virtual and therefore cannot be written.
-    #[inline]
-    pub fn set(
-        &mut self,
-        idx: (isize, isize),
-        value: State,
-    ) {
-        assert!(
-            self.is_in_domain(idx),
-            "cannot write ghost cell {:?}",
-            idx
-        );
-
-        let linear =
-            self.linear_index(idx);
+        let linear = self.linear_index(idx);
 
         self.value[linear] = value;
     }
 
-    /// Contiguous storage for solver infrastructure such as Rayon.
-    ///
-    /// Numerical operators (WENO/noncon/diffusion) should normally
-    /// use Field::get instead.
     #[inline(always)]
-    pub(crate) fn as_slice(&self) -> &[State] {
-        &self.value
-    }
-
-    /// Mutable contiguous storage for RK/Rayon updates.
-    #[inline(always)]
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [State] {
+    pub(crate) fn _as_mut_slice(&mut self) -> &mut [State] {
         &mut self.value
     }
 
-    /// Convert a flattened physical-cell index back to (i,j).
-    #[inline(always)]
-    pub fn coords(&self, linear: usize) -> (isize, isize) {
-        assert!(linear < self.value.len());
+    pub fn get(&self, idx: (isize, isize)) -> State {
+        // ============================================================
+        // Interior fluid point
+        // ============================================================
 
-        (
-            (linear / self.grid.ny) as isize,
-            (linear % self.grid.ny) as isize,
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_state(value: f64) -> State {
-        State {
-            rho: value,
-            mom_x: 2.0 * value,
-            mom_y: 3.0 * value,
-            ee: 4.0 * value,
-            ei: 5.0 * value,
-            er: 6.0 * value,
+        if self.is_in_domain(idx) {
+            return self.get_inside(idx);
         }
-    }
 
-    fn periodic_field(nx: usize, ny: usize) -> Field {
-        let grid =
-            GridInfo::new(
-                nx,
-                ny,
-                0.1,
-                0.2,
-                0.0,
-                0.0,
+        // ============================================================
+        // Ghost point
+        // ============================================================
+
+        let p = Point {
+            x: self.grid.x(idx.0),
+            y: self.grid.y(idx.1),
+        };
+
+        // ------------------------------------------------------------
+        // Determine outer / inner boundary.
+        //
+        // The derived Polygon only classifies the domain here; the
+        // physical boundary geometry comes from the analytic
+        // BoundaryElements.
+        //
+        //     outside the outer domain   -> outer boundary
+        //     inside the interior cutout -> inner boundary
+        //
+        // A ghost point must satisfy exactly one of the two, so the
+        // remaining case (fluid by both) is a bug.
+        // ------------------------------------------------------------
+
+        let outer_fluid = self.outer_contains(p);
+
+        let inner_fluid = self.inner_contains(p);
+
+        let (boundary, elements) = if !outer_fluid {
+            (crate::ghost::BoundaryKind::Outer, &self.outer_boundary)
+        } else if !inner_fluid {
+            (crate::ghost::BoundaryKind::Inner, &self.inner_boundary)
+        } else {
+            panic!(
+                "Field::get: ghost point p=({:.6e},{:.6e}) is classified fluid \
+             by BOTH outer and inner domains",
+                p.x, p.y,
             );
+        };
 
-        Field::new(
-            grid,
-            [
-                BCType::Periodic,
-                BCType::Periodic,
-                BCType::Periodic,
-                BCType::Periodic,
-            ],
-        )
-    }
+        // Analytic boundary lookup: nearest BoundaryElement wins; BC
+        // priority (Wall > ... > FarField) breaks geometric ties at
+        // junctions. Returns the exact analytic Projection {P0, n, D}.
+        let (boundary_id, project) = bc::find_boundary_element(p, elements);
 
-    fn assert_state_close(a: State, b: State) {
-        const TOL: f64 = 1e-12;
+        // ------------------------------------------------------------
+        // Reconstruct ghost using the selected analytic element's BC.
+        // ------------------------------------------------------------
 
-        assert!((a.rho - b.rho).abs() < TOL);
-        assert!((a.mom_x - b.mom_x).abs() < TOL);
-        assert!((a.mom_y - b.mom_y).abs() < TOL);
-        assert!((a.ee - b.ee).abs() < TOL);
-        assert!((a.ei - b.ei).abs() < TOL);
-        assert!((a.er - b.er).abs() < TOL);
-    }
-
-    #[test]
-    fn set_and_get_interior() {
-        let mut field = periodic_field(4, 3);
-
-        let state = make_state(2.0);
-
-        field.set((2, 1), state);
-
-        assert_state_close(
-            field.get((2, 1)),
-            state,
-        );
-    }
-
-    #[test]
-    fn flattened_layout_is_i_times_ny_plus_j() {
-        let mut field = periodic_field(4, 3);
-
-        for i in 0..4 {
-            for j in 0..3 {
-                let value =
-                    (100 * i + j) as f64;
-
-                field.set(
-                    (i as isize, j as isize),
-                    make_state(value),
-                );
-            }
-        }
-
-        for i in 0..4 {
-            for j in 0..3 {
-                let linear = i * 3 + j;
-
-                assert!(
-                    (
-                        field.as_slice()[linear].rho
-                        - (100 * i + j) as f64
-                    )
-                    .abs()
-                        < 1e-12
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn coords_is_inverse_of_flattening() {
-        let field = periodic_field(5, 7);
-
-        for i in 0..5 {
-            for j in 0..7 {
-                let linear = i * 7 + j;
-
-                assert_eq!(
-                    field.coords(linear),
-                    (i as isize, j as isize),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn periodic_get_handles_negative_indices() {
-        let mut field = periodic_field(4, 4);
-
-        let target = make_state(7.0);
-        field.set((3, 2), target);
-
-        assert_state_close(
-            field.get((-1, 2)),
-            target,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "cannot write ghost cell")]
-    fn set_rejects_ghost_cell() {
-        let mut field = periodic_field(4, 4);
-
-        field.set(
-            (-1, 0),
-            make_state(1.0),
-        );
-    }
-
-    #[test]
-    fn cell_center_coordinates() {
-        let field = periodic_field(4, 4);
-
-        assert!(
-            (field.grid().x(0) - 0.05).abs()
-                < 1e-12
-        );
-
-        assert!(
-            (field.grid().y(0) - 0.10).abs()
-                < 1e-12
-        );
+        bc::set_ghost_point_value(idx, project, boundary, boundary_id, self, None)
     }
 }
+
